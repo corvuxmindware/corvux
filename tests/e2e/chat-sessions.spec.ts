@@ -61,6 +61,10 @@ test.describe("chat sessions", () => {
     // Ensure at least 2 sessions exist so groups render.
     await useCurrentSession(page, "First session");
     await page.getByTitle("New chat").click();
+    // Wait for the new session to land before expanding: `handleNewSession`
+    // closes the list once `newSession()` resolves, so expanding earlier races
+    // it and the list snaps shut on slower machines (CI).
+    await expect(page.getByText("2 chats")).toBeVisible();
     await expandSessions(page);
     // Search box visible at top of the panel.
     await expect(page.getByPlaceholder("Search chats…")).toBeVisible();
