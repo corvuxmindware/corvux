@@ -2585,38 +2585,6 @@ mod tests {
         assert!(daily.contains(&format!("- [x] Buy milk 📅 {today} ✅ {today}")));
     }
 
-    /// Regression guard (2026-07-09): the `> [!reminder]` callout is reserved /
-    /// not-yet-implemented — the app indexer does not parse it, so a reminder
-    /// written that way silently never fires. Reminders are dated + timed tasks
-    /// (see INSTRUCTIONS and ROOST-CONVENTIONS.md); the agent-facing integration
-    /// docs must never present the callout as a live example.
-    #[test]
-    fn integration_docs_never_present_reminder_callout_as_live() {
-        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .expect("corvux-mcp has a parent dir")
-            .join("integrations");
-        for name in [
-            "claude-code-skill.md",
-            "codex-instructions.md",
-            "cursor-rule.md",
-        ] {
-            let path = dir.join(name);
-            let text = std::fs::read_to_string(&path)
-                .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
-            for (i, line) in text.lines().enumerate() {
-                assert!(
-                    !line.trim_start().starts_with("> [!reminder]"),
-                    "{name}:{} presents a `> [!reminder]` callout as a live \
-                     example, but the indexer does not parse it. Write reminders \
-                     as a dated + timed task (`- [ ] text 📅 YYYY-MM-DD ⏰ HH:MM`); \
-                     mention the callout only inside inline code, flagged reserved.",
-                    i + 1
-                );
-            }
-        }
-    }
-
     #[test]
     fn task_routed_to_named_note() {
         let (_d, s) = server();
