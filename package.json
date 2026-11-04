@@ -44,13 +44,13 @@
     "@tauri-apps/plugin-updater": "^2.9.0",
     "codemirror": "^6.0.1",
     "d3": "^7.9.0",
-    "dompurify": "^3.4.12",
-    "js-yaml": "^4.3.0",
+    "dompurify": "^3.4.17",
+    "js-yaml": "^4.3.2",
     "jsqr": "^1.4.0",
     "marked": "^18.0.3",
     "mermaid": "^11.15.0",
     "qrcode-generator": "^2.0.4",
-    "solid-js": "^1.9.13"
+    "solid-js": "^1.9.18"
   },
   "pnpm": {
     "onlyBuiltDependencies": [
