@@ -1,0 +1,6 @@
+"$schema" = "schemas/schema.json"
+
+[[permission]]
+identifier = "allow-pick-folder"
+description = "Enables the pick_folder command — opens Android's SAF folder picker and returns a persisted content:// tree URI."
+commands.allow = ["pick_folder"]

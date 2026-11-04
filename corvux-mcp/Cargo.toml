@@ -1,0 +1,37 @@
+[package]
+name = "corvux-mcp"
+version = "0.2.4"
+edition = "2021"
+license = "Apache-2.0"
+description = "Local MCP server for a Corvux roost — exposes tasks, notes, capture, search, and the wiki-link graph to MCP clients (Claude Desktop, Cursor, Claude Code, etc.)"
+authors = ["Corvux Mindware"]
+
+# Standalone on purpose. This binary does NOT depend on the main `corvux`
+# crate: that crate links cozo / onnx / iroh / llama.cpp and would make a
+# tiny stdio server huge and slow to build. The markdown conventions here
+# are faithful copies of the app's parser/writer (see `conventions.rs`),
+# kept in lock-step by the tests in that module.
+[[bin]]
+name = "corvux-mcp"
+path = "src/main.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Local-date / weekday for the daily-note path + template. Matches the app
+# (daily_note.rs) which uses the user's LOCAL timezone, not UTC.
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+# Recursive vault scan for search / read / list-tasks.
+walkdir = "2"
+# Cross-process advisory locks around compare+rename. Backed by flock(2) on
+# Unix and LockFile on Windows.
+fs2 = "0.4.3"
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+opt-level = "s"
+lto = true
+strip = true
+codegen-units = 1

@@ -1,0 +1,12 @@
+# Paths the `tauri dev` file watcher must ignore.
+# Gitignore syntax; evaluated alongside .gitignore.
+#
+# When `pnpm tauri android dev` is running concurrently with desktop dev,
+# Gradle writes files into plugins/*/android/build/ every few seconds.
+# Without this file the desktop dev server restarts on every Gradle write,
+# which kills the sync engine before it can even accept a pairing.
+plugins/*/android/build/
+plugins/*/android/.gradle/
+gen/android/
+gen/apple/
+target/

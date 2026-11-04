@@ -1,0 +1,40 @@
+# Build-time environment for the bundled SQLite (via `sqlite` → `sqlite3-src`,
+# which just runs `cc::Build::new().file("sqlite3.c").compile()`). The default
+# amalgamation omits optional features, so we have to opt in to FTS5 here.
+# Without FTS5, `search_db.rs` falls back to the slow `LIKE` lane (no BM25
+# ranking, no snippets) and won't scale past a few hundred notes.
+#
+# The `cc` crate picks up the define from a CFLAGS env var. The catch is its
+# lookup ORDER for a build targeting <triple>:
+#     CFLAGS_<triple>  →  TARGET_CFLAGS  →  CFLAGS   (first match wins)
+# So a plain `CFLAGS` is the LOWEST priority. On a desktop/host build nothing
+# else sets CFLAGS, so the generic line below applies and FTS5 compiles in. But
+# on the iOS/Android cross-compile targets the generic line gets shadowed (and
+# cargo's non-`force` `[env]` won't override a value the xcode/gradle build
+# already exported), so the device builds silently shipped WITHOUT FTS5 — which
+# is exactly what the iPhone diagnostic showed.
+#
+# Fix: set the define on the highest-priority key — `CFLAGS_<triple>` — for each
+# cross target, with `force = true` so nothing can shadow it. This is purely
+# ADDITIVE: `cc` still computes its own `-arch`/`-isysroot`/min-version flags
+# from the target triple, and sqlite3.c needs no other special flags, so forcing
+# this one define can't break the cross build.
+#
+# `SQLITE_ENABLE_FTS5` is kept as forward-compat: a newer `sqlite3-src` adds a
+# loop that reads any `SQLITE_*` env var directly; once we bump onto it the
+# CFLAGS lines can be dropped.
+[env]
+# Host / desktop builds (cc falls through to the generic key).
+CFLAGS = "-DSQLITE_ENABLE_FTS5=1"
+SQLITE_ENABLE_FTS5 = "1"
+
+# iOS targets — device + simulators.
+CFLAGS_aarch64-apple-ios = { value = "-DSQLITE_ENABLE_FTS5=1", force = true }
+CFLAGS_aarch64-apple-ios-sim = { value = "-DSQLITE_ENABLE_FTS5=1", force = true }
+CFLAGS_x86_64-apple-ios = { value = "-DSQLITE_ENABLE_FTS5=1", force = true }
+
+# Android targets.
+CFLAGS_aarch64-linux-android = { value = "-DSQLITE_ENABLE_FTS5=1", force = true }
+CFLAGS_armv7-linux-androideabi = { value = "-DSQLITE_ENABLE_FTS5=1", force = true }
+CFLAGS_i686-linux-android = { value = "-DSQLITE_ENABLE_FTS5=1", force = true }
+CFLAGS_x86_64-linux-android = { value = "-DSQLITE_ENABLE_FTS5=1", force = true }

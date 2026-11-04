@@ -1,0 +1,978 @@
+@import "tailwindcss";
+
+/*
+ * Dark theme — charcoal-purple (tinted dark, not flat black)
+ *
+ * The base colors carry a subtle violet undertone so the surface reads as
+ * "warm dark" rather than gray. Borders use a low-opacity white overlay
+ * instead of a hard gray line — softer dividers, more cohesive surfaces.
+ */
+@theme {
+  --color-bg-primary: #1a1a24;
+  --color-bg-secondary: #15151e;
+  --color-bg-tertiary: #0f0f17;
+  --color-bg-hover: rgba(203, 166, 247, 0.06);
+  --color-bg-active: rgba(203, 166, 247, 0.12);
+  /*
+   * Text selection. Deliberately NOT --color-bg-active: that is a 12% hover
+   * tint meant to whisper under a pointer, and reusing it for selection left
+   * highlighted text nearly indistinguishable from unselected text. Selection
+   * has to answer "what did I just grab?" at a glance, so it runs ~2.5x the
+   * hover tint. Kept translucent (not a solid fill) so syntax colors and
+   * markdown styling still read through it.
+   *
+   * `-inactive` is the same selection once focus moves elsewhere — still
+   * legible, clearly subordinate to the focused one.
+   */
+  --color-selection: rgba(203, 166, 247, 0.30);
+  --color-selection-inactive: rgba(203, 166, 247, 0.16);
+  --color-text-primary: #e4e4ef;
+  --color-text-secondary: #a8a8b8;
+  --color-text-muted: #6a6a7a;
+  --color-accent: #cba6f7;
+  --color-accent-hover: #d8bcfb;
+  --color-accent-muted: #8a7aa8;
+  --color-border: rgba(255, 255, 255, 0.06);
+  --color-border-strong: rgba(255, 255, 255, 0.1);
+  --color-green: #a6e3a1;
+  --color-red: #f38ba8;
+  --color-yellow: #f9e2af;
+  --color-purple: #cba6f7;
+
+  /*
+   * Tag palette — 7 hues cycled across Properties tags so adjacent tags
+   * read as distinct. Split from the semantic colors above so light/dark
+   * themes can override contrast independently (Mocha pastels wash out on
+   * the Latte background).
+   */
+  --color-tag-1: #a6e3a1; /* green */
+  --color-tag-2: #89b4fa; /* blue */
+  --color-tag-3: #f38ba8; /* red */
+  --color-tag-4: #f9e2af; /* yellow */
+  --color-tag-5: #cba6f7; /* lavender */
+  --color-tag-6: #94e2d5; /* teal */
+  --color-tag-7: #fab387; /* peach */
+
+  /*
+   * Graph view palette — Obsidian-style muted nodes with a brighter hub accent.
+   * Split from --color-* so the graph can be tuned without touching UI chrome.
+   * Tag nodes reuse the semantic green; links use a low-alpha neutral.
+   */
+  --color-graph-note: #7f849c;
+  --color-graph-hub: #89b4fa;
+  --color-graph-tag: #a6e3a1;
+  --color-graph-label: #a6adc8;
+  --color-graph-link: rgba(88, 91, 112, 0.5);
+  --color-graph-link-dim: rgba(88, 91, 112, 0.1);
+  --color-graph-link-focus: rgba(205, 214, 244, 0.7);
+  --color-graph-stroke-focus: #cdd6f4;
+}
+
+/* Light theme — Catppuccin Latte */
+[data-theme="light"] {
+  --color-bg-primary: #eff1f5;
+  --color-bg-secondary: #e6e9ef;
+  --color-bg-tertiary: #dce0e8;
+  --color-bg-hover: rgba(136, 57, 239, 0.06);
+  --color-bg-active: rgba(136, 57, 239, 0.12);
+  /* Latte's accent is a strong purple on a near-white page — a touch less
+   * alpha than the dark themes reaches the same visibility. */
+  --color-selection: rgba(136, 57, 239, 0.28);
+  --color-selection-inactive: rgba(136, 57, 239, 0.15);
+  --color-text-primary: #4c4f69;
+  --color-text-secondary: #5c5f77;
+  --color-text-muted: #8c8fa1;
+  --color-accent: #8839ef;
+  --color-accent-hover: #7a2ed8;
+  --color-accent-muted: #9d6fcc;
+  --color-border: rgba(76, 79, 105, 0.08);
+  --color-border-strong: rgba(76, 79, 105, 0.14);
+  --color-green: #40a02b;
+  --color-red: #d20f39;
+  --color-yellow: #df8e1d;
+  --color-purple: #8839ef;
+
+  /*
+   * Light-mode tag palette — Catppuccin Latte equivalents of the dark hues.
+   * Mocha pastels (#f9e2af etc) are near-invisible against #eff1f5; these
+   * darker, saturated counterparts hold their color at 15% bg opacity.
+   */
+  --color-tag-1: #40a02b; /* green */
+  --color-tag-2: #1e66f5; /* blue */
+  --color-tag-3: #d20f39; /* red */
+  --color-tag-4: #df8e1d; /* yellow */
+  --color-tag-5: #8839ef; /* lavender */
+  --color-tag-6: #179299; /* teal */
+  --color-tag-7: #fe640b; /* peach */
+
+  /*
+   * Light-mode graph palette — darker, more saturated than the dark-mode
+   * palette so nodes read against a bright background. Link alpha is bumped
+   * up too; the dark-mode 0.5 gray vanished on #eff1f5.
+   */
+  --color-graph-note: #7c7f93;
+  --color-graph-hub: #1e66f5;
+  --color-graph-tag: #40a02b;
+  --color-graph-label: #5c5f77;
+  --color-graph-link: rgba(92, 95, 119, 0.5);
+  --color-graph-link-dim: rgba(92, 95, 119, 0.12);
+  --color-graph-link-focus: rgba(76, 79, 105, 0.75);
+  --color-graph-stroke-focus: #4c4f69;
+}
+
+/* ── Nord theme — arctic blue-gray palette by Arctic Ice Studio ─────────── */
+[data-theme="nord"] {
+  --color-bg-primary: #2e3440;
+  --color-bg-secondary: #3b4252;
+  --color-bg-tertiary: #242933;
+  --color-bg-hover: rgba(136, 192, 208, 0.08);
+  --color-bg-active: rgba(136, 192, 208, 0.16);
+  /* Nord's frost accent is low-contrast against the slate bg, so it needs a
+   * little more alpha than the other dark themes to separate. */
+  --color-selection: rgba(136, 192, 208, 0.32);
+  --color-selection-inactive: rgba(136, 192, 208, 0.17);
+  --color-text-primary: #eceff4;
+  --color-text-secondary: #d8dee9;
+  --color-text-muted: #7d8597;
+  --color-accent: #88c0d0;
+  --color-accent-hover: #8fbcbb;
+  --color-accent-muted: #81a1c1;
+  --color-border: rgba(216, 222, 233, 0.08);
+  --color-border-strong: rgba(216, 222, 233, 0.16);
+  --color-green: #a3be8c;
+  --color-red: #bf616a;
+  --color-yellow: #ebcb8b;
+  --color-purple: #b48ead;
+
+  --color-tag-1: #a3be8c;
+  --color-tag-2: #81a1c1;
+  --color-tag-3: #bf616a;
+  --color-tag-4: #ebcb8b;
+  --color-tag-5: #b48ead;
+  --color-tag-6: #8fbcbb;
+  --color-tag-7: #d08770;
+
+  --color-graph-note: #7d8597;
+  --color-graph-hub: #88c0d0;
+  --color-graph-tag: #a3be8c;
+  --color-graph-label: #d8dee9;
+  --color-graph-link: rgba(125, 133, 151, 0.4);
+  --color-graph-link-dim: rgba(125, 133, 151, 0.1);
+  --color-graph-link-focus: rgba(236, 239, 244, 0.7);
+  --color-graph-stroke-focus: #eceff4;
+}
+
+/* ── Synthwave '84 — retro neon on deep purple, après Robb Owen ─────────── */
+[data-theme="synthwave"] {
+  --color-bg-primary: #241b2f;
+  --color-bg-secondary: #2d223a;
+  --color-bg-tertiary: #1a1424;
+  --color-bg-hover: rgba(255, 126, 219, 0.10);
+  --color-bg-active: rgba(255, 126, 219, 0.18);
+  /* Synthwave runs the heaviest hover/active tints of any theme (10%/18%),
+   * so selection has to climb correspondingly to still read as a selection
+   * rather than a hover. The neon accent takes the extra alpha well. */
+  --color-selection: rgba(255, 126, 219, 0.38);
+  --color-selection-inactive: rgba(255, 126, 219, 0.20);
+  --color-text-primary: #f4eee4;
+  --color-text-secondary: #b1a8c3;
+  --color-text-muted: #6c5f85;
+  --color-accent: #ff7edb;
+  --color-accent-hover: #ffa2e5;
+  --color-accent-muted: #c96aae;
+  --color-border: rgba(255, 126, 219, 0.14);
+  --color-border-strong: rgba(255, 126, 219, 0.24);
+  --color-green: #72f1b8;
+  --color-red: #fe4450;
+  --color-yellow: #fede5d;
+  --color-purple: #ce9cff;
+
+  /* Neon-glow tag palette — all saturated, no washed pastels */
+  --color-tag-1: #72f1b8; /* mint */
+  --color-tag-2: #36f9f6; /* cyan */
+  --color-tag-3: #fe4450; /* red */
+  --color-tag-4: #fede5d; /* yellow */
+  --color-tag-5: #ce9cff; /* purple */
+  --color-tag-6: #ff7edb; /* pink */
+  --color-tag-7: #ff8b39; /* orange */
+
+  --color-graph-note: #b1a8c3;
+  --color-graph-hub: #ff7edb;
+  --color-graph-tag: #36f9f6;
+  --color-graph-label: #f4eee4;
+  --color-graph-link: rgba(177, 168, 195, 0.35);
+  --color-graph-link-dim: rgba(177, 168, 195, 0.08);
+  --color-graph-link-focus: rgba(255, 126, 219, 0.7);
+  --color-graph-stroke-focus: #ff7edb;
+}
+
+/* Synthwave signature: soft neon glow on headings + accent text. Kept
+   mild so body reading doesn't fatigue — you still feel the theme
+   without the retrowave drop-shadow becoming noise. */
+[data-theme="synthwave"] .cm-editor .cm-line.cm-md-h1,
+[data-theme="synthwave"] .cm-editor .cm-line.cm-md-h2,
+[data-theme="synthwave"] .cm-editor .cm-line.cm-md-h3 {
+  text-shadow: 0 0 8px rgba(255, 126, 219, 0.35);
+}
+[data-theme="synthwave"] .text-accent {
+  text-shadow: 0 0 6px rgba(255, 126, 219, 0.25);
+}
+
+/* ── Parchment — warm cream + indigo, editorial typography ──────────────
+   Goal: feel like a *document*, not an app. Cream background reads as
+   paper; deep indigo accent has the gravitas of fountain-pen ink. Tags
+   use saturated darks because pastels disappear against #F4EFE6.
+   Markdown headings get a serif face only inside the editor so chrome
+   stays sans-serif. */
+[data-theme="parchment"] {
+  --color-bg-primary: #f4efe6;
+  --color-bg-secondary: #ece5d5;
+  --color-bg-tertiary: #e5ddc9;
+  --color-bg-hover: rgba(59, 59, 134, 0.06);
+  --color-bg-active: rgba(59, 59, 134, 0.12);
+  /* Parchment's navy accent is dark, so it darkens rather than tints the
+   * cream page — less alpha needed, and more would muddy the paper feel. */
+  --color-selection: rgba(59, 59, 134, 0.26);
+  --color-selection-inactive: rgba(59, 59, 134, 0.14);
+  --color-text-primary: #2d2a24;
+  --color-text-secondary: #5a5347;
+  --color-text-muted: #8c8576;
+  --color-accent: #3b3b86;
+  --color-accent-hover: #4a4aa0;
+  --color-accent-muted: #6e6eb3;
+  --color-border: rgba(45, 42, 36, 0.09);
+  --color-border-strong: rgba(45, 42, 36, 0.18);
+  --color-green: #4d7c4f;
+  --color-red: #b8434e;
+  --color-yellow: #b8893e;
+  --color-purple: #6b4fa8;
+
+  /* Saturated darks — pastels wash out against cream. */
+  --color-tag-1: #4d7c4f;
+  --color-tag-2: #2e4a8a;
+  --color-tag-3: #b8434e;
+  --color-tag-4: #b8893e;
+  --color-tag-5: #6b4fa8;
+  --color-tag-6: #2e7a7a;
+  --color-tag-7: #c76a3f;
+
+  --color-graph-note: #8c8576;
+  --color-graph-hub: #2e4a8a;
+  --color-graph-tag: #4d7c4f;
+  --color-graph-label: #5a5347;
+  --color-graph-link: rgba(92, 83, 71, 0.5);
+  --color-graph-link-dim: rgba(92, 83, 71, 0.12);
+  --color-graph-link-focus: rgba(45, 42, 36, 0.75);
+  --color-graph-stroke-focus: #2d2a24;
+}
+
+/* Editorial serif on markdown headings inside the editor only.
+   System serif stack — falls back gracefully on Windows / Linux where
+   Tiempos / Source Serif Pro aren't installed. Body stays sans so
+   you don't lose density on long notes. */
+[data-theme="parchment"] .cm-editor .cm-line.cm-md-h1,
+[data-theme="parchment"] .cm-editor .cm-line.cm-md-h2,
+[data-theme="parchment"] .cm-editor .cm-line.cm-md-h3,
+[data-theme="parchment"] .cm-editor .cm-line.cm-md-h4 {
+  font-family: "Tiempos Headline", "Source Serif Pro", "Charter", "Iowan Old Style",
+    "Cambria", Georgia, serif;
+  letter-spacing: -0.01em;
+}
+
+/* ── Corvid — editorial technical, raven palette ────────────────────────
+   Direction from the 2026-05-22 design handoff. Deep cool-blue ink with
+   a single brass accent (the "raven's eye") replacing the warm-purple
+   default. Note headings get a serif face — manuscripts not database
+   rows — while UI chrome stays sans for density.
+
+   Fonts are stack-only, no @import. App is local-first; pulling fonts
+   from Google CDN on launch is a privacy regression and breaks offline
+   sessions. If we promote Corvid to default later, self-host Instrument
+   Serif + Geist + JetBrains Mono in /public/fonts and add @font-face
+   declarations — don't reach for the CDN. */
+[data-theme="corvid"] {
+  --color-bg-primary: #1f2230;
+  --color-bg-secondary: #262a39;
+  --color-bg-tertiary: #181b27;
+  --color-bg-hover: rgba(212, 162, 84, 0.08);
+  --color-bg-active: rgba(212, 162, 84, 0.16);
+  /* Brass over the blue-gray bg — the warm/cool opposition does a lot of the
+   * separation work, but Corvid's hover tint is a heavier 16%, so selection
+   * still has to clear it. */
+  --color-selection: rgba(212, 162, 84, 0.34);
+  --color-selection-inactive: rgba(212, 162, 84, 0.18);
+  --color-text-primary: #e6e3dc;
+  --color-text-secondary: #b1adaa;
+  --color-text-muted: #807d7d;
+  --color-accent: #d4a254;       /* brass — raven's eye */
+  --color-accent-hover: #e3b770;
+  --color-accent-muted: #8a6f3f;
+  --color-border: rgba(212, 162, 84, 0.10);
+  --color-border-strong: rgba(212, 162, 84, 0.18);
+  --color-green: #8fc7a0;
+  --color-red: #d97171;
+  --color-yellow: #d4b454;
+  --color-purple: #b8a888;       /* in Corvid the "purple" slot collapses
+                                    onto brass-adjacent so wiki-link pills
+                                    stay on-theme — they reference notes,
+                                    not accent CTAs. */
+
+  /* Tag palette — kept varied so adjacent tags read distinctly, but
+     pulled toward warmer / desaturated hues to live with brass. */
+  --color-tag-1: #8fc7a0; /* sage */
+  --color-tag-2: #7aa2c4; /* slate blue */
+  --color-tag-3: #d97171; /* terracotta */
+  --color-tag-4: #d4b454; /* ochre */
+  --color-tag-5: #c79bd9; /* dusk violet */
+  --color-tag-6: #7fbfb6; /* verdigris */
+  --color-tag-7: #e09a6b; /* burnt sienna */
+
+  /* Graph — brass is the dominant hub colour (signature cluster),
+     other clusters keep their hue identity from the tag palette. */
+  --color-graph-note: #7d8597;
+  --color-graph-hub: #d4a254;
+  --color-graph-tag: #8fc7a0;
+  --color-graph-label: #b1adaa;
+  --color-graph-link: rgba(125, 133, 151, 0.45);
+  --color-graph-link-dim: rgba(125, 133, 151, 0.10);
+  --color-graph-link-focus: rgba(212, 162, 84, 0.70);
+  --color-graph-stroke-focus: #e6e3dc;
+}
+
+/* Corvid editor headings — serif manuscript feel, matching Parchment's
+   pattern. UI chrome (sidebar, panels, buttons) deliberately stays sans
+   so the editor reads as a *document* against an *application*. */
+[data-theme="corvid"] .cm-editor .cm-line.cm-md-h1,
+[data-theme="corvid"] .cm-editor .cm-line.cm-md-h2,
+[data-theme="corvid"] .cm-editor .cm-line.cm-md-h3,
+[data-theme="corvid"] .cm-editor .cm-line.cm-md-h4 {
+  font-family: "Instrument Serif", "Iowan Old Style", "Charter",
+    "Source Serif Pro", Georgia, "Times New Roman", serif;
+  letter-spacing: -0.005em;
+  font-weight: 500;
+}
+/* Slightly larger H1 to lean into the editorial display feel — closer
+   to the design's "display title" size without breaking CodeMirror's
+   per-line measure (which margin would). */
+[data-theme="corvid"] .cm-editor .cm-line.cm-md-h1 {
+  font-size: 2.3em;
+  line-height: 1.25;
+}
+
+/*
+ * NOTE: do NOT add an unlayered `* { padding: 0; margin: 0 }` reset here.
+ * Tailwind v4 puts utilities in @layer utilities, and anything unlayered wins
+ * over layered rules regardless of specificity — that would silently kill
+ * every `py-*`, `px-*`, `m*-*` utility across the app. Tailwind's preflight
+ * already handles the reset (margin: 0 on body/headings, box-sizing: border-box
+ * on *, etc.), so this block is unnecessary.
+ */
+
+/*
+ * Text selection outside the editor — rendered preview, sidebar, panels,
+ * settings, note titles. Without this the browser default applies, which on
+ * the dark themes is a muted blue that barely separates from the surface.
+ *
+ * This does NOT reach inside CodeMirror. `drawSelection()` paints its own
+ * selection layer and, at Prec.highest, forces
+ * `.cm-line ::selection { background-color: transparent !important }` to stop
+ * the native highlight double-drawing over it. The editor's colors come from
+ * `.cm-selectionBackground` in `corvuxTheme` (Editor.tsx), which reads the
+ * same two tokens — so both surfaces stay in step.
+ *
+ * Background only, no `color`: forcing a selected-text color would flatten
+ * syntax highlighting, tag hues, and link colors to one shade the moment you
+ * dragged across them.
+ */
+::selection {
+  background-color: var(--color-selection);
+}
+::-moz-selection {
+  background-color: var(--color-selection);
+}
+
+:root {
+  /* --corvux-safe-area-scale trims the top/bottom shell padding below the
+     full hardware inset. 1 = exact inset (clears Dynamic Island / home
+     indicator fully); lower = tighter chrome but the top bar creeps toward
+     the status bar and content toward the home pill. Tune this one knob. */
+  --corvux-safe-area-scale: 0.8;
+  --corvux-safe-area-top: calc(env(safe-area-inset-top, 0px) * var(--corvux-safe-area-scale));
+  --corvux-safe-area-bottom: calc(env(safe-area-inset-bottom, 0px) * var(--corvux-safe-area-scale));
+  --corvux-safe-area-left: env(safe-area-inset-left, 0px);
+  --corvux-safe-area-right: env(safe-area-inset-right, 0px);
+
+  /* Mobile sizing tokens — the touch-ergonomics floor for phone chrome.
+     --mobile-touch (44px) is the iOS HIG / Android minimum tap target;
+     comfort (48px) is for primary/dense rows. Topbar/bottombar heights and
+     the sheet corner radius keep mobile surfaces consistent. These are
+     referenced by TouchIconButton, the mobile headers, and BottomSheet —
+     desktop ignores them (controls stay compact via `sm:` overrides). */
+  --mobile-topbar-h: 52px;
+  --mobile-touch: 44px;
+  --mobile-touch-comfort: 48px;
+  --mobile-bottombar-h: 56px;
+  --mobile-sheet-radius: 16px;
+}
+
+@media (pointer: coarse) {
+  :root {
+    /* Floor lowered 24px → 12px so the trimmed inset isn't clamped back up
+       on the first frames before WindowInsets propagate. */
+    --corvux-safe-area-top: max(calc(env(safe-area-inset-top, 0px) * var(--corvux-safe-area-scale)), 12px);
+  }
+}
+
+html, body, #root {
+  /* `100dvh` follows the dynamic viewport — shrinks with the keyboard so
+     the chat input never gets buried below it. Older WebViews fall back
+     to `100%` via the previous declaration. */
+  height: 100%;
+  height: 100dvh;
+  width: 100%;
+  overflow: hidden;
+  background-color: var(--color-bg-primary);
+  color: var(--color-text-primary);
+  font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  font-size: 15px;
+}
+
+/* Pin the shell so the DOCUMENT can never scroll. iOS WebKit ignores
+   `overflow: hidden` when the on-screen keyboard appears: to reveal the
+   focused caret it scrolls the whole page up, dragging the top bar off
+   under the notch (`interactive-widget=overlays-content` is Android-only —
+   iOS doesn't honour it). With the body fixed there is nothing for WebKit
+   to scroll, so it scrolls the nearest inner scroller (`.cm-scroller`)
+   instead — the editor moves, the top chrome stays put, and the editor's
+   own scroll-margins (keyboard inset) keep the caret above the keyboard.
+   Harmless on desktop (a Tauri full-window webview never scrolls anyway).
+
+   Height is driven by `--corvux-app-height` (= visualViewport.height, set in
+   keyboard-inset.ts), NOT `bottom: 0`. With the keyboard up, iOS keeps the
+   layout/`100dvh` at full-screen height, so a `bottom:0` shell would be
+   TALLER than the visible area above the keyboard — and iOS lets you
+   finger-pan that overflow, dragging the pinned top bar up. Sizing the shell
+   to exactly the visible height leaves nothing to pan, so the top bar holds.
+   Falls back to `100dvh` before the JS runs / on desktop. */
+body, #root {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: var(--corvux-app-height, 100dvh);
+}
+
+/*
+ * Android/iOS safe-area insets. Without this, the tab bar sits flush against
+ * the status bar — tapping close buttons also pulls down the notification
+ * shade because Android reserves ~48px from the top edge for system gestures.
+ * We pad #root so every panel (tabs, sidebar header, status bar) respects the
+ * physical cutouts and edge gestures. `viewport-fit=cover` in index.html
+ * activates these env() values.
+ *
+ * `max(env(...), 0px)` is the explicit fallback shape: on platforms that
+ * don't expose insets the value collapses to 0 (no extra padding on
+ * desktop). On Android the WebView occasionally reports 0 for the first
+ * frame or two before WindowInsets propagate — the previous behavior
+ * was a 3-5s flash where chat content rendered under the status bar
+ * before snapping into place. Touch devices get a small `--mobile-min-top`
+ * floor (24px) so the header never overlaps the system clock during that
+ * window; desktop browsers stay at 0.
+ */
+#root {
+  padding-top: var(--corvux-safe-area-top);
+  padding-bottom: var(--corvux-safe-area-bottom);
+  padding-left: var(--corvux-safe-area-left);
+  padding-right: var(--corvux-safe-area-right);
+  box-sizing: border-box;
+}
+
+/* Prevent touch callouts / long-press selection UI from hijacking the app */
+html, body {
+  -webkit-touch-callout: none;
+  -webkit-tap-highlight-color: transparent;
+  overscroll-behavior: none;
+}
+
+/* Chat bubble markdown — minimal, inherited typography. The bubble
+   already sets text-sm + leading-relaxed; these rules just give
+   headings, lists, and code blocks visible structure inside it. */
+.markdown-body > :first-child { margin-top: 0; }
+.markdown-body > :last-child  { margin-bottom: 0; }
+.markdown-body p              { margin: 0.5em 0; }
+.markdown-body h1, .markdown-body h2, .markdown-body h3,
+.markdown-body h4, .markdown-body h5, .markdown-body h6 {
+  margin: 0.9em 0 0.4em;
+  font-weight: 600;
+  line-height: 1.25;
+}
+.markdown-body h1 { font-size: 1.25em; }
+.markdown-body h2 { font-size: 1.15em; }
+.markdown-body h3 { font-size: 1.05em; }
+.markdown-body h4, .markdown-body h5, .markdown-body h6 { font-size: 1em; color: var(--color-text-secondary); }
+.markdown-body strong { font-weight: 700; color: var(--color-text-primary); }
+.markdown-body em     { font-style: italic; }
+.markdown-body del    { text-decoration: line-through; color: var(--color-text-muted); }
+.markdown-body ul, .markdown-body ol { margin: 0.4em 0; padding-left: 1.4em; }
+.markdown-body li     { margin: 0.2em 0; }
+.markdown-body ul     { list-style: disc; }
+.markdown-body ol     { list-style: decimal; }
+.markdown-body a      { color: var(--color-accent); text-decoration: underline; text-underline-offset: 2px; }
+/* Wiki-link pills — Obsidian-style purple. Slightly tinted background +
+   no underline so they read as note references rather than external
+   URLs. Pre-processor in MarkdownView converts `[[Title]]` to
+   `<a class="wiki-link" data-target="Title">` before marked runs. */
+.markdown-body a.wiki-link {
+  color: var(--color-purple, #c4b5fd);
+  background: color-mix(in srgb, var(--color-purple, #c4b5fd) 12%, transparent);
+  border: 1px solid color-mix(in srgb, var(--color-purple, #c4b5fd) 25%, transparent);
+  border-radius: 4px;
+  padding: 0 4px;
+  text-decoration: none;
+  font-weight: 500;
+  transition: background-color 120ms, border-color 120ms;
+}
+.markdown-body a.wiki-link:hover {
+  background: color-mix(in srgb, var(--color-purple, #c4b5fd) 22%, transparent);
+  border-color: color-mix(in srgb, var(--color-purple, #c4b5fd) 50%, transparent);
+}
+.markdown-body code   {
+  background: var(--color-bg-tertiary);
+  border: 1px solid var(--color-border);
+  border-radius: 4px;
+  padding: 0.05em 0.35em;
+  font-family: 'JetBrains Mono', 'Fira Code', ui-monospace, monospace;
+  font-size: 0.9em;
+}
+.markdown-body pre    {
+  background: var(--color-bg-tertiary);
+  border: 1px solid var(--color-border);
+  border-radius: 6px;
+  padding: 0.6em 0.8em;
+  margin: 0.5em 0;
+  overflow-x: auto;
+}
+.markdown-body pre > code { background: transparent; border: 0; padding: 0; font-size: 0.85em; }
+.markdown-body blockquote {
+  border-left: 3px solid var(--color-accent-muted);
+  margin: 0.5em 0;
+  padding: 0 0.8em;
+  color: var(--color-text-secondary);
+}
+.markdown-body hr     { border: 0; border-top: 1px solid var(--color-border); margin: 0.8em 0; }
+.markdown-body table  { border-collapse: collapse; margin: 0.5em 0; font-size: 0.9em; }
+.markdown-body th, .markdown-body td {
+  border: 1px solid var(--color-border);
+  padding: 0.3em 0.6em;
+  text-align: left;
+}
+.markdown-body th     { background: var(--color-bg-tertiary); }
+/* GFM task-list checkboxes inside the assistant bubble — read-only. */
+.markdown-body input[type="checkbox"] { margin-right: 0.4em; vertical-align: middle; }
+
+/* Fluid content width — fills the pane edge to edge. Gutters scale
+   with viewport (16px floor on phones, up to 64px on big monitors)
+   so text never glues to the bezels but the column expands as wide
+   as the window allows. */
+.content-container {
+  width: 90%;
+  margin: 0 auto;
+  padding-left: clamp(16px, 4vw, 64px);
+  padding-right: clamp(16px, 4vw, 64px);
+}
+
+/* Mobile: tighter gutters so text isn't squeezed against the bezels
+   while still leaving breathing room. clamp() above already shrinks
+   gutters on narrow viewports, but we floor them lower on phones. */
+@media (max-width: 640px) {
+  .content-container {
+    padding-left: 12px;
+    padding-right: 12px;
+  }
+}
+
+/* CodeMirror overrides for seamless integration. Width centering is
+   intentionally NOT done here — putting `width: 90%` on .cm-editor
+   was confusing CodeMirror's internal height/coord measurement
+   (clicks landed on lines 2–3 below the visual target). The column
+   constraint is now applied to the React wrapper around <Editor>
+   in App.tsx instead, which leaves CM's measure pipeline untouched. */
+.cm-editor {
+  height: 100%;
+  font-size: 16px;
+  line-height: 1.7;
+}
+
+/*
+ * Prose font by default — matches Obsidian's document feel. Monospace is
+ * re-asserted below only on code nodes (.cm-md-inline-code / .cm-md-codeblock),
+ * so `` `code` `` and fenced blocks still render in the coder font.
+ */
+.cm-editor .cm-scroller {
+  padding: 8px 0;
+  font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+}
+
+/* Editor content has no horizontal padding — the .content-container
+   wrapper around <Editor> in App.tsx supplies the gutters, matching
+   the Properties card above pixel-for-pixel. Bottom padding stays so
+   the floating MobileBottomBar doesn't clip the last lines of a note. */
+@media (max-width: 640px) {
+  .cm-editor .cm-content {
+    /* 80px clears the floating MobileBottomBar's height; + the bottom
+       safe-area inset because the bar is docked at `safe-area + 10px`, so
+       on a home-indicator device its top sits ~(safe-area) higher than the
+       80px alone accounts for — without this the last line lands behind the
+       bar. The keyboard inset adds scroll room so the caret can clear the
+       on-screen keyboard (interactive-widget=overlays-content). The format
+       bar inset covers MobileFormatBar, which is also `position: fixed` and
+       overlays the editor in BOTH its states — parked above the bottom bar,
+       or docked on top of the keyboard (where it sits above the keyboard
+       inset, so it needs its own allowance either way). All extra room sits
+       BELOW the content, so growing it never moves visible text. */
+    padding-bottom: calc(
+      80px + var(--corvux-safe-area-bottom, 0px) + var(--corvux-keyboard-inset, 0px) +
+        var(--corvux-format-bar-inset, 0px)
+    );
+  }
+}
+
+.cm-editor.cm-focused {
+  outline: none;
+}
+
+/* ── Live-preview markdown styling ─────────────────────────────────────── */
+
+/*
+ * Headings — sized and weighted like Obsidian. Keep spacing on measured
+ * line padding, never margins, so CodeMirror's click geometry stays correct.
+ */
+.cm-editor .cm-line.cm-md-h1 {
+  font-size: 2em;
+  font-weight: 700;
+  line-height: 1.3;
+  letter-spacing: -0.01em;
+  padding-bottom: 0.08em;
+}
+.cm-editor .cm-line.cm-md-h2 {
+  font-size: 1.6em;
+  font-weight: 700;
+  line-height: 1.3;
+  padding-bottom: 0.1em;
+}
+.cm-editor .cm-line.cm-md-h3 {
+  font-size: 1.3em;
+  font-weight: 600;
+  line-height: 1.35;
+  padding-bottom: 0.08em;
+}
+.cm-editor .cm-line.cm-md-h4 {
+  font-size: 1.12em;
+  font-weight: 600;
+  line-height: 1.4;
+  padding-bottom: 0.06em;
+}
+.cm-editor .cm-line.cm-md-h5 { font-size: 1em; font-weight: 600; }
+.cm-editor .cm-line.cm-md-h6 {
+  font-size: 0.92em;
+  font-weight: 600;
+  color: var(--color-text-secondary);
+}
+
+/*
+ * Compact inactive blank markdown separator lines. A normal empty CodeMirror
+ * row is a full body line, which makes common markdown like `## Heading`
+ * followed by a blank line read too loose in live preview.
+ */
+.cm-editor .cm-line.cm-md-blank {
+  line-height: 1;
+}
+.cm-editor .cm-line.cm-md-codeblock.cm-md-blank {
+  line-height: var(--editor-line-height, 1.7);
+}
+
+/*
+ * Force heading text to primary color, overriding the stacked syntax
+ * highlighters (defaultHighlightStyle + oneDarkHighlightStyle) which paint
+ * ATXHeading tokens red/yellow. Obsidian renders headings in the body
+ * foreground colour; we match that here, targeting both the .tok-heading
+ * tokens that CodeMirror emits and our own .cm-md-h* line classes.
+ */
+.cm-editor .cm-line.cm-md-h1,
+.cm-editor .cm-line.cm-md-h2,
+.cm-editor .cm-line.cm-md-h3,
+.cm-editor .cm-line.cm-md-h4,
+.cm-editor .cm-line.cm-md-h5,
+.cm-editor .cm-line.cm-md-h1 *,
+.cm-editor .cm-line.cm-md-h2 *,
+.cm-editor .cm-line.cm-md-h3 *,
+.cm-editor .cm-line.cm-md-h4 *,
+.cm-editor .cm-line.cm-md-h5 * {
+  color: var(--color-text-primary);
+}
+.cm-editor .cm-line.cm-md-h6,
+.cm-editor .cm-line.cm-md-h6 * {
+  color: var(--color-text-secondary);
+}
+/* Belt-and-braces: CodeMirror tags tokens with .tok-heading1..6 too. */
+.cm-editor .tok-heading,
+.cm-editor .tok-heading1,
+.cm-editor .tok-heading2,
+.cm-editor .tok-heading3,
+.cm-editor .tok-heading4,
+.cm-editor .tok-heading5 {
+  color: var(--color-text-primary) !important;
+}
+
+/* Properties — long text values (description, summary, etc.) get a 3-line
+   clamp so a multi-paragraph description can't dominate the viewport on
+   mobile. Edit-mode swaps to a real <input>, so clamp is display-only. */
+.prop-value-clamp {
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: normal;
+  word-break: break-word;
+}
+
+/* Inline emphasis */
+.cm-editor .cm-md-strong { font-weight: 700; }
+.cm-editor .cm-md-emphasis { font-style: italic; }
+.cm-editor .cm-md-strike {
+  text-decoration: line-through;
+  color: var(--color-text-muted);
+}
+
+/* Inline code */
+.cm-editor .cm-md-inline-code {
+  font-family: 'JetBrains Mono', 'Fira Code', 'Cascadia Code', monospace;
+  font-size: 0.9em;
+  background: var(--color-bg-secondary);
+  border: 1px solid var(--color-border);
+  padding: 1px 5px;
+  border-radius: 4px;
+  color: var(--color-accent);
+}
+
+/* Fenced code blocks — line-level so the whole block gets one tone */
+.cm-editor .cm-line.cm-md-codeblock {
+  font-family: 'JetBrains Mono', 'Fira Code', 'Cascadia Code', monospace;
+  font-size: 0.9em;
+  background: var(--color-bg-secondary);
+  padding-left: 12px;
+  padding-right: 12px;
+}
+
+/*
+ * Language label on the first content line of a fenced code block. The
+ * `data-lang` attribute is set by the live-preview extension; the CSS
+ * pulls it out via `attr()` and pins it to the top-right corner. Only
+ * renders when the attribute is present (code blocks without a language
+ * tag don't get the class at all, so no stray empty label).
+ */
+.cm-editor .cm-line.cm-md-codeblock-start {
+  position: relative;
+}
+.cm-editor .cm-line.cm-md-codeblock-start::before {
+  content: attr(data-lang);
+  position: absolute;
+  right: 10px;
+  top: 4px;
+  color: var(--color-text-muted);
+  font-size: 10px;
+  font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  pointer-events: none;
+  opacity: 0.7;
+}
+
+/*
+ * Blockquote — border on the left, muted text. A box-shadow stand-in for the
+ * left border avoids messing with CodeMirror's per-line padding math.
+ */
+.cm-editor .cm-line.cm-md-blockquote {
+  box-shadow: inset 3px 0 0 var(--color-accent-muted);
+  padding-left: 14px;
+  color: var(--color-text-secondary);
+  font-style: italic;
+}
+
+/*
+ * Horizontal rule: a thin divider drawn on the line's baseline. Keeping the
+ * natural line-height is important — collapsing it to 1px would squash the
+ * gutter cell and make the adjacent line numbers collide.
+ *
+ * IMPORTANT: never use `margin` on a .cm-line. CodeMirror measures line
+ * heights via getBoundingClientRect, which excludes margins, so any margin
+ * here turns into invisible vertical space that drifts the height map and
+ * breaks click-to-position below the rule. Use padding only — same trick
+ * the blockquote rule uses with box-shadow instead of border-left.
+ */
+.cm-editor .cm-line.cm-md-hr {
+  border-bottom: 1px solid var(--color-border-strong);
+  padding-top: 0.4em;
+  padding-bottom: 0.4em;
+}
+
+/* Toast slide-in animation */
+@keyframes slide-in {
+  from {
+    opacity: 0;
+    transform: translateX(20px);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0);
+  }
+}
+
+.animate-slide-in {
+  animation: slide-in 0.2s ease-out;
+}
+
+/* Scrollbar styling */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--color-bg-active);
+  border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: var(--color-text-muted);
+}
+
+/* ---- Inline audio player (replaces native <audio controls> in note embeds) ---- */
+/* Lives in global.css because the player is rendered into a CodeMirror widget
+ * via Solid's render() — the CSS doesn't reach it through scoped styles. */
+.corvux-audio {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 10px 12px;
+  padding-right: 36px; /* room for the X */
+  border-radius: 10px;
+  background: linear-gradient(
+    180deg,
+    color-mix(in srgb, var(--color-bg-secondary) 96%, transparent),
+    color-mix(in srgb, var(--color-bg-secondary) 88%, transparent)
+  );
+  border: 1px solid color-mix(in srgb, var(--color-border) 80%, transparent);
+  max-width: 100%;
+  font-family: var(--editor-font-family);
+}
+.corvux-audio-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.corvux-audio-play {
+  flex: 0 0 auto;
+  width: 32px;
+  height: 32px;
+  border: 0;
+  border-radius: 999px;
+  background: var(--color-accent, #e06c75);
+  color: white;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: transform 120ms, background 120ms, box-shadow 120ms;
+  box-shadow: 0 1px 4px color-mix(in srgb, var(--color-accent, #e06c75) 30%, transparent);
+}
+.corvux-audio-play:hover {
+  transform: scale(1.06);
+}
+.corvux-audio-play:active {
+  transform: scale(0.96);
+}
+.corvux-audio-play:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+.corvux-audio-track {
+  position: relative;
+  flex: 1 1 auto;
+  height: 32px;
+  cursor: pointer;
+  user-select: none;
+  border-radius: 4px;
+}
+.corvux-audio-bars,
+.corvux-audio-skeleton {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  gap: 1px;
+}
+.corvux-audio-bar,
+.corvux-audio-skeleton-bar {
+  flex: 1 1 0;
+  min-width: 1px;
+  border-radius: 1px;
+  transition: background-color 80ms;
+}
+/* Reversed palette per user pref: upcoming (unplayed) gets the accent so
+ * the bar reads as "what's ahead"; played fades to muted. */
+.corvux-audio-bar-upcoming {
+  background-color: color-mix(in srgb, var(--color-accent, #e06c75) 80%, transparent);
+}
+.corvux-audio-bar-played {
+  background-color: color-mix(in srgb, var(--color-text-muted, #888) 45%, transparent);
+}
+.corvux-audio-skeleton-bar {
+  height: 30%;
+  background-color: color-mix(in srgb, var(--color-text-muted, #888) 25%, transparent);
+}
+.corvux-audio-time {
+  flex: 0 0 auto;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  color: var(--color-text-muted);
+  font-family: var(--editor-font-family);
+  min-width: 76px;
+  text-align: right;
+}
+.corvux-audio-caption {
+  font-size: 11px;
+  color: var(--color-text-muted);
+  word-break: break-all;
+  padding-left: 42px; /* align with the track, past the play button */
+}
+.corvux-audio-delete {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--color-text-muted);
+  cursor: pointer;
+  border-radius: 4px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  opacity: 0.55;
+  transition: opacity 120ms, color 120ms, background 120ms;
+}
+.corvux-audio-delete:hover {
+  opacity: 1;
+  color: var(--color-danger, #e06c75);
+  background: var(--color-bg-hover);
+}

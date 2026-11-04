@@ -1,0 +1,6 @@
+"$schema" = "schemas/schema.json"
+
+[[permission]]
+identifier = "allow-acquire"
+description = "Allows acquiring the Android WifiManager.MulticastLock."
+commands.allow = ["acquire"]

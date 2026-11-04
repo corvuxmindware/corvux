@@ -1,0 +1,29 @@
+{
+  "_README": "Shared golden corpus: same markdown fixtures, same expected OPEN tasks, asserted by BOTH the app parser (src-tauri/src/parser/checkboxes.rs::parse_tasks_in_note) and the MCP parser (corvux-mcp/src/conventions.rs::parse_open_tasks). Both parse with note_date=None and today fixed at 2026-06-11. Convention 0.3: a checkbox is a TASK when it has a date context (an inline 📅, a ⏰, or living in a dated note via frontmatter `date:`/daily-note filename). The DUE date (`due` below) comes only from an inline 📅 or a lone ⏰ (→ today); a checkbox that is a task only because the note carries a `date:` is a visible task with NO due date (`due` = \"\"). Each entry: `contains` = a distinctive fragment of the open task's text; `due` = the resolved due date (YYYY-MM-DD) or \"\" if none. Keep keys starting with `_` as metadata, not fixtures.",
+  "_today": "2026-06-11",
+  "simple.md": [
+    { "contains": "Review architecture doc", "due": "" }
+  ],
+  "due.md": [
+    { "contains": "Stand-up call", "due": "2026-05-02" },
+    { "contains": "Reply to Ravi", "due": "2026-05-03" }
+  ],
+  "code_fence.md": [
+    { "contains": "real task", "due": "" }
+  ],
+  "frontmatter_region.md": [
+    { "contains": "task one", "due": "" }
+  ],
+  "frontmatter_tasks.md": [
+    { "contains": "Review architecture", "due": "2026-05-02" },
+    { "contains": "Reply to Ravi", "due": "" }
+  ],
+  "bullets.md": [
+    { "contains": "starred", "due": "" },
+    { "contains": "plused", "due": "" }
+  ],
+  "lone_time.md": [
+    { "contains": "Standup", "due": "2026-06-11" }
+  ],
+  "tasks_off.md": []
+}

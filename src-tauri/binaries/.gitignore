@@ -1,0 +1,5 @@
+# Sidecar binaries are built by `pnpm sidecar` (scripts/build-sidecar.mjs),
+# staged here for Tauri's externalBin bundling at `tauri build` time.
+# Build artifacts — not committed.
+*
+!.gitignore

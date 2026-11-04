@@ -1,0 +1,101 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+    <!-- CHANGE_WIFI_MULTICAST_STATE is required for mDNS (Phase 2 discovery). -->
+    <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
+    <!-- NEARBY_WIFI_DEVICES is required on Android 13+ for local-network peer ops;
+         neverForLocation tells the OS we don't derive location from WiFi scans. -->
+    <uses-permission
+        android:name="android.permission.NEARBY_WIFI_DEVICES"
+        android:usesPermissionFlags="neverForLocation"
+        tools:targetApi="33" />
+
+    <!-- Phase 2.1 slice 6: scheduled task notifications. POST_NOTIFICATIONS
+         is contributed by tauri-plugin-notification's manifest fragment, but
+         the alarm-side permission needs explicit declaration here.
+
+         We declare ONLY SCHEDULE_EXACT_ALARM, NOT USE_EXACT_ALARM. Google
+         Play restricts USE_EXACT_ALARM to apps whose *core* function is an
+         alarm clock / calendar / reminder app; Corvux is a knowledge tool
+         with a reminders feature, so shipping it risks listing rejection.
+         (Audit 2026-06-08 — see roost "Android Bugs Found".)
+
+         Behaviour without USE_EXACT_ALARM, by OS version:
+           • Android 12 (SDK 31-32): SCHEDULE_EXACT_ALARM is granted at
+             install → `canScheduleExactAlarms()` is true → exact alarms.
+           • Android 13+ (SDK 33+): the user grants "Alarms & reminders" in
+             Settings. Until they do, tauri-plugin-notification's
+             `TauriNotificationManager` (it checks `canScheduleExactAlarms()`)
+             falls back to `setAndAllowWhileIdle` — the reminder still fires,
+             just within a Doze maintenance window (approximate, not silent).
+         This keeps reminders working everywhere with zero Play-policy risk. -->
+    <uses-permission android:name="android.permission.SCHEDULE_EXACT_ALARM" />
+
+    <!-- Voice-memo capture (Locked Decision #11: user-initiated PTT only).
+         Triggered by the in-app recorder sheet; runtime prompt is handled by
+         the OS the first time getUserMedia({audio:true}) is called in the
+         WebView. No background mic, no continuous capture.
+
+         MODIFY_AUDIO_SETTINGS is a normal/install-time permission — Tauri's
+         RustWebChromeClient.onPermissionRequest bundles it with RECORD_AUDIO
+         when it sees AUDIO_CAPTURE. If we omit it from the manifest the
+         request returns false for that entry and Tauri's callback flips the
+         whole grant to "denied", surfacing as `NotAllowedError` in
+         getUserMedia. Declared here so the WebView can request both atomically. -->
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
+    <uses-feature android:name="android.hardware.microphone" android:required="false" />
+
+    <!-- QR-scan pairing: scanning the cross-network pairing code via the
+         camera. Same mechanism as RECORD_AUDIO above — the OS runtime prompt
+         fires the first time getUserMedia({video:true}) runs in the WebView,
+         and Tauri's RustWebChromeClient.onPermissionRequest maps the WebKit
+         VIDEO_CAPTURE request to this CAMERA permission. camera is
+         required="false" so the app still installs on camera-less devices
+         (paste-the-code remains the fallback). -->
+    <uses-permission android:name="android.permission.CAMERA" />
+    <uses-feature android:name="android.hardware.camera" android:required="false" />
+    <uses-feature android:name="android.hardware.camera.autofocus" android:required="false" />
+
+    <!-- allowBackup=false: Corvux is local-first and privacy-first. The
+         app-private dir holds the AES-GCM-encrypted API keys AND their HKDF
+         seed, plus the sync identity / TLS private keys. With Auto Backup on
+         (the default), Android would copy all of that to the user's Google
+         Drive — and seed + ciphertext together make the "encryption" trivially
+         reversible. Disabling backup keeps secrets on-device only. The roost
+         itself is the user's own markdown folder (or a SAF tree they picked),
+         not app-private data, so this does not touch their notes.
+         (Audit 2026-06-08.) -->
+    <application
+        android:icon="@mipmap/ic_launcher"
+        android:label="@string/app_name"
+        android:theme="@style/Theme.corvux"
+        android:allowBackup="false"
+        android:fullBackupContent="false"
+        android:usesCleartextTraffic="${usesCleartextTraffic}">
+        <activity
+            android:configChanges="orientation|keyboardHidden|keyboard|screenSize|locale|smallestScreenSize|screenLayout|uiMode"
+            android:launchMode="singleTask"
+            android:label="@string/main_activity_title"
+            android:name=".MainActivity"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <provider
+          android:name="androidx.core.content.FileProvider"
+          android:authorities="${applicationId}.fileprovider"
+          android:exported="false"
+          android:grantUriPermissions="true">
+          <meta-data
+            android:name="android.support.FILE_PROVIDER_PATHS"
+            android:resource="@xml/file_paths" />
+        </provider>
+    </application>
+</manifest>

@@ -1,0 +1,6 @@
+"$schema" = "schemas/schema.json"
+
+[[permission]]
+identifier = "allow-resume-access"
+description = "Enables the resume_access command — re-acquires scoped access for a previously picked folder from its persisted bookmark."
+commands.allow = ["resume_access"]

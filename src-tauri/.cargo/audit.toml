@@ -1,0 +1,39 @@
+# cargo-audit configuration.
+#
+# Run from this directory: `cargo audit`.
+
+[advisories]
+# Advisories we have reviewed and consciously accept, with rationale. Each entry
+# MUST cite why it is not exploitable in this build and how it will be retired.
+ignore = [
+    # RUSTSEC-2026-0041 — lz4_flex 0.10.0: decompressing INVALID lz4 data can
+    # leak uninitialized/reused-buffer memory (CVSS 8.2).
+    #
+    # Why accepted for now:
+    #   * Transitive-only, pinned deep under the graph DB:
+    #       corvux -> cozo 0.7.6 -> swapvec 0.3.0 -> lz4_flex ^0.10.0
+    #     swapvec 0.3.0 hard-requires `^0.10.0`; the fix exists only in
+    #     >=0.11.6, so it CANNOT be bumped without upgrading cozo (Locked
+    #     Decision #1 — the DB; a major-bump mid-release is a bigger risk than
+    #     this advisory) or force-patching swapvec.
+    #   * NOT in the network/sync path. The only lz4 decompressor is inside
+    #     cozo's own on-disk storage, which decompresses data THIS app wrote to
+    #     an app-private database dir — never attacker-controlled input off the
+    #     wire. The "invalid data" precondition therefore requires local disk
+    #     corruption, not a remote attacker.
+    #   * Impact is an info-leak into a buffer we already own, not RCE.
+    #
+    # Retirement (scoped 2026-07-11, tracked separately from the sync release):
+    # this is NOT a simple bump — the `cozo` crate is ABANDONED at 0.7.6, so
+    # there is no newer `cozo` that pulls swapvec >=0.4 / lz4_flex >=0.11.6. The
+    # only maintained continuations are `cozo-ce` (community edition, currently
+    # 0.7.13-ALPHA) and `mnestic` (fork, 0.11.x). A test-swap to cozo-ce further
+    # hit a hard native-link conflict: cozo-ce pulls `sqlite 0.36 -> sqlite3-sys
+    # 0.17`, which collides with our direct `sqlite = "0.32"` (Cargo.toml) — two
+    # packages linking `sqlite3`. So retiring this advisory means migrating the
+    # graph DB to a fork/alpha AND bumping the direct `sqlite` crate 0.32->0.36
+    # (breaking API changes in the SQLite/FTS content layer). That is a
+    # DB-stack migration project of its own, not a release fix — deliberately
+    # deferred (Locked Decision #1). When it lands, delete this entry.
+    "RUSTSEC-2026-0041",
+]

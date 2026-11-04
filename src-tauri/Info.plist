@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Shared Apple Info.plist additions. Tauri auto-discovers this file next to
+  tauri.conf.json and MERGES it into the generated bundle Info.plist — for the
+  macOS desktop bundle AND (alongside Info.ios.plist) the iOS build.
+
+  These two TCC usage strings are the macOS counterpart to the entitlements in
+  Entitlements.plist: under Hardened Runtime, mic/camera need BOTH the
+  entitlement and a usage string or the OS silently denies the request on a
+  signed build. iOS already declares identical strings in
+  gen/apple/corvux_iOS/Info.plist, so the wording here is kept byte-identical —
+  the shared-file merge is a no-op on iOS and adds the strings on macOS.
+
+  (ITSAppUsesNonExemptEncryption — the held iOS export-compliance key — also
+  belongs in this file once legal decides; it is harmless on the macOS
+  Developer-ID build. See docs/ios-todo.md P0.)
+-->
+<plist version="1.0">
+<dict>
+	<key>NSCameraUsageDescription</key>
+	<string>Corvux uses the camera only when you tap "Scan QR code" to pair a device for sync. It reads the pairing code shown on your other device — nothing is recorded or saved.</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>Corvux uses your microphone only when you tap the voice-memo button. The recording is saved as an attachment in your vault. No background or always-on listening.</string>
+</dict>
+</plist>

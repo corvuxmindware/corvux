@@ -1,0 +1,269 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  # Manual trigger — lets a run be kicked off from the Actions tab without
+  # a dummy commit (useful after the workflow has been manually disabled
+  # and re-enabled).
+  workflow_dispatch:
+
+env:
+  # Skip ort's auto-download of ONNX Runtime binaries during cargo check —
+  # CI runners don't have GPU and don't need to actually run the model. The
+  # download adds ~80s per job for code that's only type-checked here.
+  ORT_DYLIB_PATH: /tmp/ort-skip
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  rust:
+    name: Rust (clippy + test)
+    # Pick Linux for the canonical run — the keyring/ort/llama-cpp-2 stack
+    # exercises every platform-specific cfg the codebase has, so a Linux
+    # build catches the most cross-target regressions per minute. Windows
+    # and macOS jobs would pile on ~15 min each for the same coverage that
+    # local cargo check already provides during development.
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Linux Tauri prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libgtk-3-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libsoup-3.0-dev \
+            libssl-dev \
+            pkg-config
+
+      - name: Install stable Rust + clippy
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Cache cargo registry + target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            src-tauri/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('src-tauri/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      # The `corvux` crate declares `externalBin: ["binaries/corvux-mcp"]` in
+      # tauri.conf.json, so tauri-build's codegen aborts unless the sidecar
+      # exists for the host triple — this fires on plain `cargo clippy`/`test`,
+      # not just `tauri build`. The app's `beforeBuildCommand` (`pnpm sidecar`)
+      # only runs under `pnpm tauri build`, which CI doesn't invoke, so stage
+      # it here.
+      - name: Stage corvux-mcp sidecar (externalBin)
+        run: |
+          cargo build --release --manifest-path corvux-mcp/Cargo.toml
+          TRIPLE=$(rustc -vV | sed -n 's/^host: //p')
+          mkdir -p src-tauri/binaries
+          cp corvux-mcp/target/release/corvux-mcp "src-tauri/binaries/corvux-mcp-${TRIPLE}"
+
+      - name: cargo fmt --check
+        working-directory: src-tauri
+        run: cargo fmt --all -- --check
+
+      - name: cargo clippy
+        working-directory: src-tauri
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: cargo test
+        working-directory: src-tauri
+        run: cargo test --lib
+
+      # Standalone integration targets are not executed by `cargo test --lib`.
+      # Keep platform bundle metadata, graph indexing, and sync invariants in
+      # the release gate instead of merely compiling them under clippy.
+      - name: cargo test (integration suites)
+        working-directory: src-tauri
+        run: >-
+          cargo test
+          --test graph_indexing
+          --test ios_bundle_config
+          --test macos_bundle_config
+          --test sync_invariants
+          --test windows_bundle_config
+
+      # corvux-mcp is a standalone crate (its own Cargo.lock, not a workspace
+      # member of src-tauri), so the steps above never lint or test it — they
+      # only build it as a release sidecar. Hold the helper to the same bar:
+      # fmt + clippy (-D warnings) + tests. The conventions.rs tests are what
+      # keep its markdown parser/writer in lock-step with the app, so running
+      # them on every PR is the point, not a nicety.
+      - name: corvux-mcp fmt --check
+        working-directory: corvux-mcp
+        run: cargo fmt --all -- --check
+
+      - name: corvux-mcp clippy
+        working-directory: corvux-mcp
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: corvux-mcp test
+        working-directory: corvux-mcp
+        run: cargo test
+
+      # 2026-05-24 audit (supply chain): run cargo-audit on every PR.
+      # Installed via `cargo install` rather than a marketplace action so
+      # the toolchain stays pinned.
+      #
+      # Default deny level is `vulnerability` — we don't `--deny warnings`
+      # because the maintenance noise (unmaintained `gtk-rs` bindings
+      # transitively dragged in by Tauri's GTK3 webview on Linux) would
+      # otherwise gate every PR on a non-exploitable issue we can't fix
+      # until Tauri ships a GTK4 stack.
+      #
+      # `--ignore` entries are advisories we CAN'T patch — the fix lives
+      # upstream (forking iroh / cozo / Tauri is not on the table). Review
+      # on every iroh / cozo / Tauri bump and drop the ignore once the dep
+      # is fixed. Anything with a reachable fix is bumped in Cargo.lock
+      # instead of being ignored.
+      #
+      # 2026-07-07 review:
+      #   - FIXED (bumped, not ignored): crossbeam-epoch 0.9.18 → 0.9.20
+      #     (RUSTSEC-2026-0204, invalid-pointer deref in fmt::Pointer) and
+      #     anyhow 1.0.102 → 1.0.103 (RUSTSEC-2026-0190, unsound
+      #     downcast_mut). Both semver-compatible patch bumps.
+      #   - DROPPED: RUSTSEC-2026-0119 / -0120 (hickory-proto / -net).
+      #     iroh is now 1.0.1 → hickory-resolver 0.26.1 (patched); both
+      #     advisories are gone from the tree, so the ignores were dead.
+      #
+      # Still ignored (upstream-blocked):
+      # - RUSTSEC-2026-0041 (lz4_flex): cozo 0.7.6 → swapvec 0.3 →
+      #   lz4_flex 0.10. Only used for cozo's internal swapfile temp
+      #   compression — never decompresses attacker-controlled bytes.
+      #   Fix lands when swapvec/cozo bumps.
+      # - RUSTSEC-2024-0429 (glib, unsound VariantStrIter): Linux-only.
+      #   atk/gtk 0.18 → tray-icon → Tauri 2.11's GTK3 webview pins the
+      #   whole gtk-rs 0.18 stack; glib is NOT in the macOS/Windows/
+      #   Android/iOS dep graphs at all (verified via `cargo tree -i glib
+      #   --target aarch64-apple-ios` → empty). Unfixable until Tauri moves
+      #   to a GTK4 stack; we never touch VariantStrIter.
+      # - RUSTSEC-2026-0186 (memmap2 0.5.10, unchecked pointer offset):
+      #   cozo 0.7.6 → graph 0.3.1 → graph_builder 0.4.1 pins
+      #   `memmap2 = "0.5.10"`. The fix is >=0.9.11 — semver-incompatible
+      #   with graph_builder's ^0.5, so unreachable without cozo bumping
+      #   graph_builder. The mmap'd-file input path the advisory covers is
+      #   unused: cozo builds its graphs in memory.
+      - name: cargo audit (security advisories)
+        working-directory: src-tauri
+        run: |
+          cargo install cargo-audit --locked || true
+          cargo audit \
+            --ignore RUSTSEC-2026-0041 \
+            --ignore RUSTSEC-2024-0429 \
+            --ignore RUSTSEC-2026-0186
+
+      # 2026-05-24 audit (S-01 + updater integrity): assert the signed
+      # updater config didn't silently drift to plaintext or empty
+      # pubkey. Cheap structural check against tauri.conf.json.
+      - name: updater config sanity
+        run: |
+          ENDPOINT=$(jq -r '.plugins.updater.endpoints[0] // ""' src-tauri/tauri.conf.json)
+          PUBKEY=$(jq -r '.plugins.updater.pubkey // ""' src-tauri/tauri.conf.json)
+          if [[ -z "$ENDPOINT" || "$ENDPOINT" != https://* ]]; then
+            echo "::error::updater endpoint missing or not https: $ENDPOINT"
+            exit 1
+          fi
+          if [[ -z "$PUBKEY" ]]; then
+            echo "::error::updater pubkey is empty"
+            exit 1
+          fi
+          echo "updater config OK: endpoint=$ENDPOINT (pubkey present)"
+
+  frontend:
+    name: Frontend (tsc + vitest)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      # No `version:` — pnpm/action-setup reads the pinned version from the
+      # root package.json `packageManager` field (pnpm@10.33.0). Specifying
+      # both here errors with ERR_PNPM_BAD_PM_VERSION on a mismatch.
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+          cache-dependency-path: pnpm-lock.yaml
+
+      - name: pnpm install
+        run: pnpm install --frozen-lockfile
+
+      - name: Release version consistency
+        run: pnpm release:version:check
+
+      - name: TypeScript check
+        run: npx tsc --noEmit
+
+      - name: Vitest unit tests
+        run: pnpm test
+
+      # 2026-05-24 audit (supply chain): fail on high/critical npm
+      # advisories in production deps. Dev-only vulnerabilities (test
+      # runners, build tools) are surfaced by `pnpm audit` separately
+      # when needed; production is the gate that ships to users.
+      - name: pnpm audit --prod
+        run: pnpm audit --prod --audit-level=high
+
+      # 2026-05-24 audit (Q-06): main app chunk size budget. The
+      # production build groups everything not split out into a
+      # `dist/assets/index-*.js` chunk that drives startup time.
+      # Originally ~1.34 MB minified against a 1.5 MB budget. Heavy
+      # chunks (mermaid-parser, cytoscape, katex) already split out via
+      # their existing lazy imports.
+      #
+      # 2026-07-03: the graph-correctness batch (wiki-link resolution,
+      # GraphView, link-autocomplete — commits 6c46709..a4a02d2) added
+      # real feature code to the main chunk and crossed 1.5 MB (measured
+      # 1,543,887 bytes at a4a02d2, confirmed via a clean build at that
+      # commit — unrelated to any sync-side change landing the same day).
+      # 2026-07-13: modal surfaces now load on demand, reducing the main chunk
+      # from ~1.59 MB to ~1.26 MB. The reusable script keeps a 1.30 MiB gate
+      # with enough headroom for normal minifier drift while preventing the
+      # former startup regression from returning.
+      - name: bundle size budget
+        run: |
+          pnpm build
+          pnpm bundle:check
+
+  e2e:
+    name: E2E (Playwright, browser-mock)
+    # Browser-mock mode only — Vite's dev server routes Tauri `invoke`
+    # through the mock layer, so this needs no Rust build. The Playwright
+    # config boots `pnpm dev` itself (webServer block) and a shared fixture
+    # seeds an open roost. Wired into CI 2026-06-30 so the suite can't
+    # silently rot again (it had drifted to 100% red, undetected, because
+    # nothing ran it).
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+          cache-dependency-path: pnpm-lock.yaml
+
+      - name: pnpm install
+        run: pnpm install --frozen-lockfile
+
+      - name: Install Playwright Chromium
+        run: pnpm exec playwright install --with-deps chromium
+
+      - name: Playwright e2e
+        run: pnpm test:e2e

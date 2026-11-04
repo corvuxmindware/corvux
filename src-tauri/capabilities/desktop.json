@@ -1,0 +1,10 @@
+{
+  "$schema": "https://raw.githubusercontent.com/nicegui-org/nicegui/main/nicegui/json_schemas/tauri-v2/capability.json",
+  "identifier": "desktop",
+  "description": "Desktop-only permissions. The auto-updater plugin (`tauri-plugin-updater`) is not available on Android/iOS — Tauri's mobile targets don't bundle the updater binary, so referencing `updater:default` in the cross-platform capability breaks `cargo build --target aarch64-linux-android`. Splitting the capability per-platform keeps updater-driven release flow on desktop while letting the mobile builds compile.",
+  "platforms": ["linux", "windows", "macOS"],
+  "windows": ["main"],
+  "permissions": [
+    "updater:default"
+  ]
+}

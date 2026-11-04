@@ -1,0 +1,13 @@
+# Copy this file to `key.properties` (same folder) and fill in real values.
+# `key.properties` and *.jks are gitignored — NEVER commit them.
+#
+# Generate the upload keystore first:
+#   keytool -genkeypair -v -keystore ~/keys/corvux-upload.jks \
+#     -alias corvux-upload -keyalg RSA -keysize 2048 -validity 10000 -storetype PKCS12
+#
+# Then point storeFile at that .jks (absolute path) and use the passwords you set.
+
+storeFile=/Users/you/keys/corvux-upload.jks
+storePassword=CHANGE_ME
+keyAlias=corvux-upload
+keyPassword=CHANGE_ME

@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Intentionally empty until the paid Apple Developer Program is set up.
+
+  Two entitlements need to land here once a paid provisioning profile is
+  available; adding them earlier breaks Personal-Team builds because Xcode
+  rejects entitlements the profile doesn't carry:
+
+    1. com.apple.developer.networking.multicast
+       Required for iroh / Bonjour LAN peer discovery. Without it, peer
+       devices on the same Wi-Fi are invisible to each other and sync is
+       manual-pair-only. Requires a separate written application to Apple
+       after enrolling — they approve case-by-case for apps with a
+       legitimate multicast need (mDNS / Bonjour / iroh discovery is
+       the canonical case).
+
+    2. com.apple.developer.icloud-services (optional)
+       Required only if we want to pick iCloud Drive roost folders via
+       the file picker. Local folders work without it.
+
+  See docs/ios-development.md § 6 and docs/ios-todo.md for the running
+  iOS work list. When adding either entitlement, also bump
+  ios-todo.md's "Done" section so the project journal stays accurate.
+-->
+<plist version="1.0">
+<dict/>
+</plist>

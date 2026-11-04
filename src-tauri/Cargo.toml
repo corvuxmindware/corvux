@@ -1,0 +1,429 @@
+[package]
+name = "corvux"
+version = "0.2.4"
+edition = "2021"
+license = "Apache-2.0"
+description = "AI-Native Second Brain"
+authors = ["Corvux Mindware"]
+# Disambiguate `cargo run` (used by `tauri dev`) when extra binaries like
+# `gen_vault` and `bench_vault` are present in the workspace.
+default-run = "corvux"
+# AUDIT-074 (+ 2026-06-08 follow-up): the dev tools moved OUT of `src/bin/`
+# into `tools/` and are declared as explicit `[[example]]` targets below.
+# Reason: Tauri's bundler scans `src/bin/*.rs` and tries to package each as a
+# binary — independent of cargo's bin/example split — which broke
+# `pnpm tauri build` (it looked for an unbuilt `bench_vault.exe`). Keeping them
+# out of `src/bin/` is the real fix. `autobins = false` stays as
+# belt-and-suspenders so a stray future `src/bin/*.rs` can't re-register as a
+# bundled `[[bin]]`.
+autobins = false
+
+# Required for mobile builds: Tauri's Android/iOS entry points link against a
+# cdylib from this crate, while desktop builds still produce the usual binary.
+# `_lib` suffix keeps the library artifact name from colliding with `corvux.exe`
+# on Windows.
+[lib]
+name = "corvux_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+# TODO(Q-02): `cargo test --lib` exits with STATUS_ENTRYPOINT_NOT_FOUND
+# on Windows local dev (a native dep DLL — likely ort / sqlite-bundled /
+# tauri-plugin-notification — isn't on PATH for the test binary). CI
+# (ubuntu-22.04) is unaffected. Workarounds documented in
+# `docs/dev/testing.md`.
+
+# Explicit main binary. Cannot rely on cargo's `src/main.rs` auto-discovery
+# because `autobins = false` (set in `[package]` above) turns off ALL
+# binary auto-inference. We trade auto-discovery for silencing the
+# "duplicate target" warnings emitted when `src/bin/*.rs` files clash
+# with their `[[example]]` declarations.
+[[bin]]
+name = "corvux"
+path = "src/main.rs"
+
+[lints.rust]
+# The `objc`/`objc2` `msg_send!` macros (macOS-only WebView + notification
+# code) expand to a deprecated `cfg(cargo-clippy)`, which rustc otherwise
+# flags as an unexpected cfg and fails `clippy -- -D warnings` on macOS.
+# Whitelist just that cfg — real unknown cfgs are still warned about. CI
+# (Linux) never compiles the macOS code, so this only matters locally.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("cargo-clippy"))'] }
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["macos-private-api", "tray-icon"] }
+tauri-plugin-dialog = "2"
+# Opens external URLs (http/https/mailto) in the system default browser.
+# The editor's markdown-link click handler routes through this — the older
+# `target=_blank` webview interception is unreliable on Android WebView.
+tauri-plugin-opener = "2"
+# Desktop OS notifications. Used by the Tasks notification scheduler
+# (Phase 2.1 slice 5) to fire toasts when `📅 + ⏰` tasks come due.
+# Phase 2.1 slice 6 adds the Android path via the existing Kotlin plugin
+# layer; this plugin handles desktop targets.
+tauri-plugin-notification = "2"
+# `process.relaunch()` after the updater installs a new version. Windows
+# NSIS handles relaunch in the installer itself, but macOS / Linux
+# AppImage builds want an explicit restart from JS so the API call site
+# stays uniform across platforms. Cross-platform — safe on mobile too,
+# even though we don't expose the updater UI there.
+tauri-plugin-process = "2"
+# Local-time / DST-correct conversion for the notification scheduler
+# (slice 5). chrono is already in the transitive graph via cozo's deps,
+# so this direct dep adds no compile cost — only an explicit edge.
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+# Used by the mobile notification path (slice 6) — `tauri-plugin-notification`'s
+# `Schedule::At { date }` wants a `time::OffsetDateTime`. Already in the
+# transitive graph via that plugin; adding the direct edge so the
+# `use time::OffsetDateTime` import resolves on Android/iOS builds.
+time = "0.3"
+# Local plugin: Android Storage Access Framework folder picker + document ops.
+# Lives at plugins/tauri-plugin-saf/. Desktop/iOS builds get a stub that returns
+# Error::NotAvailable; only Android actually bundles the Kotlin class.
+tauri-plugin-saf = { path = "plugins/tauri-plugin-saf" }
+# Local plugin: Android WifiManager.MulticastLock acquire/release. Without
+# this, Android filters incoming WiFi multicast packets and our mDNS
+# discovery sees zero peers. Desktop / iOS builds get a no-op stub.
+tauri-plugin-multicast-lock = { path = "plugins/tauri-plugin-multicast-lock" }
+# Local plugin: iOS UIDocumentPickerViewController folder picker + security-
+# scoped bookmark persistence. Mirrors SAF's role for the iOS platform.
+# Desktop/Android builds get a stub that returns Error::NotAvailable.
+tauri-plugin-ios-picker = { path = "plugins/tauri-plugin-ios-picker" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Serde derive support for arrays > 32 bytes. Used by the queue protocol
+# `signature: [u8; 64]` field — base serde 1.0 only auto-derives up to
+# `[T; 32]`, larger fixed-size arrays need this opt-in helper.
+serde-big-array = "0.5"
+tokio = { version = "1", features = ["full"] }
+# Structured task lifecycle for the sync engine (SYN-I4): CancellationToken +
+# TaskTracker so stop() cancels and drains every spawned task, no detached spawns.
+tokio-util = { version = "0.7", features = ["rt"] }
+# Dropping default-features avoids the `requests` feature which pulls
+# `minreq` → vulnerable rustls 0.21 / rustls-webpki 0.101 (RUSTSEC-2026-0098/99/104).
+# We never use cozo's HTTP layer; sqlite + graph algorithms is the whole surface.
+cozo = { version = "0.7", default-features = false, features = ["storage-sqlite", "graph-algo"] }
+rayon = "=1.10.0"
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "charset", "http2"] }
+# S-02: queue endpoint validator parses URLs with `url::Url` rather than
+# string-splitting on `://` and `:`. Promoted from transitive (via
+# reqwest) to direct so the queue parser is decoupled from reqwest's
+# version choice.
+url = "2"
+futures-util = "0.3"
+sqlite = { version = "0.32", features = ["bundled"] }
+async-trait = "0.1"
+sysinfo = "0.32"
+blake3 = "1"
+base64 = "0.22"
+ndarray = "0.16"
+directories = "6"
+# Cozo 0.7 exposes `Vector::F32(Array1<f32>)` using ndarray 0.15. Our ort+ONNX
+# path uses 0.16. Both versions coexist in the lockfile; this alias lets us
+# construct cozo's vectors without forcing the whole crate back to 0.15.
+ndarray_cozo = { package = "ndarray", version = "0.15" }
+tokenizers = { version = "0.23", default-features = false, features = ["onig"] }
+# Already transitively pulled in via tokenizers; promoted to a direct
+# dep so `to_rel` (commands/files.rs) can NFC-normalize both sides of
+# its prefix comparison. Without this, combining-character paths and
+# pre-composed paths that look identical compare as distinct strings.
+unicode-normalization = "0.1"
+
+# ── Sync Engine (Phase 1 — see Corvux/_sync-mvp-plan.md) ───────────
+# World-class build: production-grade from day one. Each dep is load-bearing.
+#
+# CRDT layer
+#   automerge          per-note conflict-free replicated data type; includes
+#                      built-in sync protocol (Merkle-head negotiation).
+#
+# Transport layer
+#   iroh               QUIC-based P2P transport. Same Ed25519 identity as our
+#                      device key, NAT hole-punching with relay fallback for
+#                      cross-network sync (cellular ↔ Wi-Fi). Public Number0
+#                      relays for beta; self-hosted relays in production.
+#   rustls             TLS 1.3 stack; `ring` is the audited crypto backend.
+#                      Kept for the legacy LAN-only TLS transport during
+#                      the iroh swap; remove once iroh is proven in beta.
+#   tokio-rustls       async TLS glue for tokio TCP streams.
+#   rustls-pemfile     read/write cert + key PEM files on disk.
+#   rcgen              generate a stable self-signed cert on first launch.
+#   postcard           compact binary wire format (Serde-driven, versioned).
+#
+# File watching
+#   notify             cross-platform fs events (inotify/FSEvents/ReadDirectoryChangesW).
+#   notify-debouncer-full  coalesces editor save storms into one event.
+#
+# Cryptography + identity
+#   ed25519-dalek      device identity keypair (fast signature verify).
+#   hmac + sha2        PIN challenge-response during pairing.
+#   hkdf               derive per-session keys from pairing secret.
+#   zeroize            scrub PINs / session keys from memory after use.
+#   subtle             constant-time equality comparisons for secrets.
+#
+# Diagnostics + errors
+#   tracing            structured spans + events; bridges to Tauri frontend.
+#   thiserror          typed errors with context; no String-typed errors.
+#
+# Utility
+#   rand               CSPRNG for PINs and nonces (OsRng under the hood).
+#   bytes              zero-copy framing buffers.
+#   hex                SPKI fingerprint rendering.
+#   uuid               stable transient IDs (e.g. change-batch correlation).
+automerge = "0.8"
+# iroh 1.0 (upgraded from 0.98.2 on 2026-07-03). The 0.98→1.0 API surface we
+# use (Endpoint::builder(presets::N0), EndpointAddr/EndpointId, RelayMode,
+# home_relay_status) is unchanged — compiles + clippy clean. The Android JNI
+# contract (ndk_context, satisfied by `android_context.rs`) is also unchanged
+# in 1.0. Still: re-validate pairing/handshake + the Android build on-device
+# after this bump (transport-layer change). Pin to a tested minor before
+# tracking further 1.x releases.
+iroh = { version = "1", default-features = false, features = ["tls-ring"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "logging", "tls12"] }
+rustls-pemfile = "2"
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "logging", "tls12"] }
+rcgen = "0.13"
+postcard = { version = "1", features = ["alloc"] }
+notify = "8"
+notify-debouncer-full = "0.7"
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+# Ephemeral X25519 for per-reconnect forward secrecy in the pairing handshake
+# (H-2/H-3). One-shot EphemeralSecret per handshake, mixed into the session key.
+x25519-dalek = "2"
+hmac = "0.12"
+sha2 = "0.10"
+hkdf = "0.12"
+zeroize = { version = "1", features = ["derive"] }
+subtle = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+thiserror = "1"
+rand = "0.8"
+bytes = "1"
+hex = "0.4"
+uuid = { version = "1", features = ["v4", "serde"] }
+# AES-256-GCM for encrypting API keys at rest on mobile. Desktop uses the
+# OS keychain (keyring crate); mobile doesn't have that, so we encrypt the
+# key material before writing it to settings.json. The encryption key is
+# derived via HKDF from a random seed stored in app-private storage.
+aes-gcm = "0.10"
+# XChaCha20-Poly1305 for the sync app-layer envelope. Wraps every
+# post-handshake `Message` with a per-pair session subkey (HKDF off the
+# pairing `SessionSecret`). The 24-byte XChaCha nonce lets us pick fresh
+# random nonces per frame without collision risk at any practical volume,
+# which matters for the planned store-and-forward queue: a peer reconnecting
+# after days offline still gets unique nonces without state.
+chacha20poly1305 = "0.10"
+
+# Myers-diff algorithm used by the markdown↔Automerge round-trip to turn an
+# external edit into a minimal splice-op sequence (preserves CRDT merge
+# quality when other devices edited the same region).
+similar = "2"
+# LAN peer discovery. Pure-Rust mDNS/DNS-SD (Bonjour) — broadcasts this
+# device's sync service on `_corvux-sync._tcp.local.` and browses for
+# others. Cross-platform. On Android the OS filters incoming multicast
+# unless a WifiManager.MulticastLock is held; that lock is acquired/
+# released around a sync session via `tauri-plugin-multicast-lock`
+# (see commands/sync.rs::discover_acquire_lock), so mobile↔desktop
+# discovery works — NOT desktop-only. (Comment corrected 2026-06-08.)
+mdns-sd = { version = "0.19", default-features = false, features = ["async"] }
+
+# ── Type generation (Rust → TypeScript) ─────────────────────────────
+# Pinned to exact 2.0.0-rc.21: tauri-specta is still pre-1.0 and minor RC
+# bumps reshape the macro API. We regenerate `src/lib/bindings.ts` on
+# every dev build under #[cfg(debug_assertions)], and `cargo test`
+# enforces the checked-in bindings.ts stays in sync.
+specta = { version = "=2.0.0-rc.25", features = ["serde_json"] }
+specta-typescript = "=0.0.12"
+tauri-specta = { version = "=2.0.0-rc.25", features = ["derive", "typescript"] }
+
+[dev-dependencies]
+proptest = "1"
+tokio = { version = "1", features = ["full", "test-util"] }
+tempfile = "3"
+# Microbenchmarks. Use `cargo bench` to run; results live in
+# `target/criterion/`. Bench files live under `benches/`.
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "graph_queries"
+harness = false
+
+# Desktop-only native deps: llama.cpp and ONNX Runtime don't cross-compile
+# cleanly through the Android NDK without a lot of glue (prebuilt binary
+# dispatch, ABI routing). Mobile builds stub these out — cloud AI only on phone.
+#
+# `keyring` is also desktop-only — on Android/iOS the settings file already
+# lives in app-private storage protected by the OS sandbox, so the extra
+# round-trip to a Keystore service isn't worth the cross-compile cost.
+#
+# `tauri-plugin-updater` is upstream-desktop-only (Win/macOS/Linux). Android
+# distribution goes through APK side-loads (and eventually Play Store);
+# iOS goes through TestFlight / App Store. Mobile builds get no updater
+# plugin at all — the IPC commands just won't exist on those targets, and
+# the frontend store cfg-checks `isTauri` + platform before invoking.
+[target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
+# `ort` (ONNX Runtime) removed with the embeddings subsystem (Stage-2
+# teardown). It was used only by the deleted `ai/onnx.rs` embedding path;
+# its `download-binaries` feature also pulled in `onnxruntime.dll`, whose
+# absence at exe startup tripped STATUS_ENTRYPOINT_NOT_FOUND on Windows.
+llama-cpp-2 = "0.1"
+encoding_rs = "0.8"
+keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service"] }
+tauri-plugin-updater = "2"
+# Desktop-only "launch at login" registration. Registers Corvux with the
+# OS startup mechanism (Windows registry Run key / macOS LaunchAgent /
+# Linux XDG autostart). Mobile has no equivalent concept — the plugin is
+# not registered on Android/iOS, and the `launch_at_startup` reconcile in
+# lib.rs compiles to a no-op there.
+tauri-plugin-autostart = "2"
+# Single-instance guard. On a second desktop launch, focuses the running
+# window instead of spawning a second process that would collide on the
+# roost OS-lock (the ROOST_OPEN_FAIL "already open in another instance"
+# error). Desktop-only: mobile sandboxes already guarantee one process,
+# and the plugin isn't built for those targets.
+tauri-plugin-single-instance = "2"
+
+# macOS only: tiny ObjC FFI to flip WKWebView's private `mediaDevicesEnabled`
+# preference. Without it, `navigator.mediaDevices` is `undefined` on desktop
+# macOS (confirmed via dev-console error 2026-05-26). Tauri's
+# `macOSPrivateApi: true` flag only enables transparency + fullscreen — it
+# does NOT touch the media-capture WebKit flags. `objc` is small enough that
+# pulling cocoa in for NSString is overkill; we use C-string literals.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc = "0.2"
+# Modern UserNotifications framework (UNUserNotificationCenter) for desktop
+# notifications. The plugin's notify-rust/mac-notification-sys path uses the
+# legacy NSUserNotification API, which never prompts for permission and is
+# unreliable on macOS 26+. See src/notification_macos.rs.
+objc2 = "0.6"
+objc2-foundation = "0.3"
+block2 = "0.6"
+objc2-user-notifications = { version = "0.3", features = [
+    "UNUserNotificationCenter",
+    "UNNotificationContent",
+    "UNNotificationRequest",
+    "UNNotificationSound",
+    "UNNotificationTrigger",
+    "block2",
+] }
+
+# iOS-only ObjC FFI: set NSURLIsExcludedFromBackupKey on the dirs holding our
+# secrets + device sync identity so a device iCloud/Finder backup can't carry
+# them to another device. The iOS analogue of Android allowBackup="false".
+# See src/ios_backup.rs.
+[target.'cfg(target_os = "ios")'.dependencies]
+objc = "0.2"
+
+# Cross-platform advisory file locking. Used to acquire an exclusive lock
+# on `<vault>/.corvux/.lock` when a vault is opened — flock(LOCK_EX|LOCK_NB)
+# on Unix, LockFileEx on Windows. Stops two Corvux instances from racing
+# writes against the same vault. Mobile (Android/iOS) targets don't link it:
+# their app-private sandbox already guarantees a single-process owner.
+
+# Windows-only: set the process AppUserModelID at startup so OS toasts are
+# attributed to "Corvux" instead of the parent shell (PowerShell in `tauri
+# dev`). Production NSIS installs register the AUMID at install time, so
+# this manual call only matters for development. Already a transitive dep
+# via tauri-winrt-notification; pinning the version keeps the feature
+# graph stable.
+#
+# IMPORTANT: target.'cfg(...)'.dependencies blocks must live AFTER the
+# main `[dependencies]` block. Putting one in the middle silently routes
+# every subsequent dep declaration into that target table — that's how
+# slice 6's first Android build failed: `tauri-plugin-saf` and friends
+# became Windows-only, vanished from the Android dep graph, and their
+# permission manifests stopped being discovered.
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.58", features = ["Win32_UI_Shell", "Win32_Foundation", "Win32_Storage_FileSystem", "Win32_Storage_Packaging_Appx"] }
+
+# Android-only: initialize the global `ndk_context` (JavaVM + Application
+# context) from `MulticastLockPlugin.load()` via a small JNI shim
+# (`src/android_context.rs`). Tauri V2's Android flow never runs tao's
+# `create()` — which would normally set it — so iroh's network monitor
+# panics ("android context was not initialized") on the first sync endpoint
+# build, and `panic = "abort"` takes the whole process down. See
+# tauri-apps/tauri#13267. Both crates are already in the tree transitively;
+# declaring them directly just lets us call the init API.
+[target.'cfg(target_os = "android")'.dependencies]
+jni = "0.21"
+ndk-context = "0.1"
+
+[features]
+default = []
+# Enables Tauri's WebView devtools (Inspect Element / network panel).
+# OFF by default so release builds can't be opened with DevTools by end users.
+# Turn on for local dev:  cargo tauri dev --features devtools
+# CI/release should never set this flag.
+devtools = ["tauri/devtools"]
+gpu-cuda   = ["llama-cpp-2/cuda"]
+gpu-metal  = ["llama-cpp-2/metal"]
+gpu-vulkan = ["llama-cpp-2/vulkan"]
+
+# Standalone dev tools. Kept OUT of `src/bin/` (they live in `tools/`) because
+# Tauri's bundler scans `src/bin/*.rs` and tries to package each as a binary,
+# independent of cargo's bin/example split — that's what broke `pnpm tauri
+# build` (it looked for an unbuilt `bench_vault.exe`). Explicit `[[example]]`
+# paths below. Run with `cargo run --example gen_vault`.
+[[example]]
+name = "gen_vault"
+path = "tools/gen_vault.rs"
+
+[[example]]
+name = "bench_vault"
+path = "tools/bench_vault.rs"
+
+# Regenerate `src/lib/bindings.ts` from the tauri-specta builder.
+# Run with: cargo run --example gen_bindings  (from src-tauri/).
+# Also exercised by the `specta_bridge::tests::bindings_are_up_to_date`
+# CI guard added in C11.
+[[example]]
+name = "gen_bindings"
+path = "tools/gen_bindings.rs"
+
+[profile.release]
+panic = "abort"
+codegen-units = 1
+lto = true
+opt-level = "s"
+strip = true
+
+# Android debug builds at the default opt-level=0 are unusably slow at
+# runtime: Automerge CRDT ops, CozoDB Datalog, and the sync handshake
+# all compile to millions of un-inlined iterator chains. Bumping to
+# opt-level=1 for us and opt-level=3 for dependencies gives ~3x runtime
+# speed on the phone with only ~20% first-build time overhead; incremental
+# edits stay fast because deps are built once. Desktop dev gets the same
+# treatment — small price, noticeable snappiness.
+#
+# `debug = false` + `strip = "symbols"` is what cuts the on-device .so
+# from ~500 MB to ~40 MB. Cargo's default `dev` profile emits full
+# debuginfo which gets baked into libcorvux_lib.so and bloats the APK
+# absurdly — desktop crashes still show line-numbered panics through the
+# Rust panic handler; actual step-debugging happens through IDE-managed
+# builds that override these flags anyway.
+[profile.dev]
+opt-level = 1
+debug = false
+strip = "symbols"
+
+[profile.dev.package."*"]
+opt-level = 3
+debug = false
+
+# Pin wmi's `windows` and `windows-core` to 0.61 so they unify with tauri's
+# windows 0.61.3 (otherwise wmi's wide ">=0.59,<0.63" range splits: cargo
+# resolves wmi's `windows` to 0.61 but `windows-core` to 0.62 — because
+# netwatch holds windows 0.62 — and wmi's IWbemObjectSink macros fail to
+# compile against the mixed family). Vendored copy of upstream wmi 0.18.4
+# with only the version constraints in its Cargo.toml tightened — source
+# untouched. Drop this patch when wmi upstream ships a narrower range or
+# when tauri moves to windows 0.62.
+[patch.crates-io]
+wmi = { path = "vendor/wmi-0.18.4" }
+# Vendored copy of tauri-plugin-notification 2.3.3 with one Swift fix: its
+# NotificationHandler.toActiveNotification force-unwrapped an in-memory map on
+# notification TAP, crashing the app whenever a reminder fired after the
+# process was killed (the normal case). Source otherwise untouched. Drop this
+# when upstream makes that lookup safe (still broken on v2 as of 2026-06-14).
+tauri-plugin-notification = { path = "vendor/tauri-plugin-notification" }

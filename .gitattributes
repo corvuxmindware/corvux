@@ -1,0 +1,43 @@
+# Normalize line endings — repo is checked out on both WSL (LF) and Windows (CRLF).
+# Default: auto-detect text, store LF in repo, check out LF on all platforms.
+* text=auto eol=lf
+
+# Windows-only scripts must stay CRLF.
+*.bat       text eol=crlf
+*.cmd       text eol=crlf
+*.ps1       text eol=crlf
+
+# Unix shell scripts and gradle wrapper must stay LF.
+*.sh        text eol=lf
+gradlew     text eol=lf
+
+# Binary — never touch.
+*.png       binary
+*.jpg       binary
+*.jpeg      binary
+*.gif       binary
+*.ico       binary
+*.icns      binary
+*.webp      binary
+*.pdf       binary
+*.zip       binary
+*.gz        binary
+*.tar       binary
+*.7z        binary
+*.jar       binary
+*.aar       binary
+*.apk       binary
+*.aab       binary
+*.keystore  binary
+*.jks       binary
+*.so        binary
+*.dylib     binary
+*.dll       binary
+*.exe       binary
+*.wasm      binary
+*.onnx      binary
+*.gguf      binary
+*.bin       binary
+*.db        binary
+*.sqlite    binary
+*.sqlite3   binary

@@ -1,0 +1,19 @@
+# pnpm 10 reads overrides + build-script approvals from here instead of
+# package.json.
+
+allowBuilds:
+  esbuild: true
+
+onlyBuiltDependencies:
+  - esbuild
+
+# Security overrides for transitive deps whose direct parents haven't
+# updated yet. Drop these when:
+#   - postcss: vite (currently 6.4.2) moves past 8.5.10. Vite 7/8 already
+#     bundles postcss 8.5.10+.
+#   - uuid: mermaid releases a build whose uuid range moves past 11.1.0.
+# Caret on uuid keeps us inside v11 — bare ">=11.1.1" lets pnpm jump to
+# v14 which changes API surface mermaid hasn't been tested against.
+overrides:
+  postcss: ">=8.5.10"
+  uuid: "^11.1.1"

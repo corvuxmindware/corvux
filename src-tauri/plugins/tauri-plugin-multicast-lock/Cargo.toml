@@ -1,0 +1,23 @@
+[package]
+name = "tauri-plugin-multicast-lock"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Corvux-internal plugin: acquire/release Android WifiManager.MulticastLock so mDNS multicast traffic isn't filtered"
+publish = false
+# Required by tauri-plugin build: must match package.name so the plugin
+# manifest (permissions, mobile bindings) is attached to this crate.
+links = "tauri-plugin-multicast-lock"
+
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]
+tauri = { version = "2" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+log = "0.4"
+
+[build-dependencies]
+tauri-plugin = { version = "2.5", features = ["build"] }

@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover, user-scalable=no" />
+    <script>
+      // `interactive-widget=overlays-content` makes Android's virtual keyboard
+      // OVERLAY the page instead of resizing the layout viewport. This is the
+      // fix for the "text bobs up and down while typing" bug: under the old
+      // `resizes-content`, every keyboard-height tick (the GBoard suggestion
+      // strip toggling, the open/close animation) re-evaluated `100dvh`,
+      // reflowed the whole app, and forced CodeMirror to re-measure + re-scroll
+      // the active line. Overlaying keeps the layout viewport fixed, so nothing
+      // reflows on keyboard geometry changes. The trade-off — content can sit
+      // behind the keyboard — is handled per-surface via `visualViewport`: the
+      // editor adds a bottom scroll margin (lib/keyboard-inset.ts) and the chat
+      // composer pins itself to the visible rectangle (Chat/ChatPanel.tsx).
+      // Chromium WebViews (Android) accept the directive; WebKit (iOS / macOS)
+      // logs a "not recognized" warning, so inject only on Android.
+      if (/Android/i.test(navigator.userAgent)) {
+        document
+          .querySelector('meta[name="viewport"]')
+          .setAttribute(
+            "content",
+            "width=device-width, initial-scale=1.0, viewport-fit=cover, user-scalable=no, interactive-widget=overlays-content",
+          );
+      }
+    </script>
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta name="theme-color" content="#1a1a24" media="(prefers-color-scheme: dark)" />
+    <meta name="theme-color" content="#eff1f5" media="(prefers-color-scheme: light)" />
+    <link rel="icon" type="image/png" href="/corvux-logo-dark.png" media="(prefers-color-scheme: dark)" />
+    <link rel="icon" type="image/png" href="/corvux-logo-light.png" media="(prefers-color-scheme: light)" />
+    <title>Corvux</title>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script src="/src/index.tsx" type="module"></script>
+  </body>
+</html>

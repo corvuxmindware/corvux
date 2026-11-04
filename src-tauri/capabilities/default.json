@@ -1,0 +1,34 @@
+{
+  "$schema": "https://raw.githubusercontent.com/nicegui-org/nicegui/main/nicegui/json_schemas/tauri-v2/capability.json",
+  "identifier": "default",
+  "description": "Default (cross-platform) capabilities for Corvux. The fs plugin is not registered and no fs:* permissions are granted — every roost read/write goes through a Rust IPC command (commands/files.rs), which enforces RoostFs path scoping. The renderer cannot reach disk except via those IPC commands. Do not add fs:* permissions without an audit. Mobile-only plugin permissions (saf, multicast-lock, ios-picker) live in mobile.json; desktop-only ones live in desktop.json.",
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    "dialog:default",
+    "dialog:allow-open",
+    "dialog:allow-save",
+    "dialog:allow-ask",
+    {
+      "identifier": "opener:allow-open-url",
+      "allow": [
+        { "url": "https://*" },
+        { "url": "http://*" },
+        { "url": "mailto:*" }
+      ]
+    },
+    "notification:default",
+    "notification:allow-notify",
+    "notification:allow-is-permission-granted",
+    "notification:allow-request-permission",
+    "notification:allow-register-action-types",
+    "notification:allow-register-listener",
+    "process:default",
+    "process:allow-restart",
+    "core:window:allow-minimize",
+    "core:window:allow-maximize",
+    "core:window:allow-unmaximize",
+    "core:window:allow-close",
+    "core:window:allow-start-dragging"
+  ]
+}

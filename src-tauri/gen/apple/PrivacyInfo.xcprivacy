@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Apple privacy manifest. Required for App Store submission since 2024-05-01:
+  App Store Connect rejects builds that use a "required reason" API without
+  declaring the reason here.
+
+  Corvux is local-first and collects nothing, so the data-type / tracking
+  arrays are empty. The two accessed-API categories below come from the
+  framework layer, not feature code:
+
+    * FileTimestamp (C617.1) — the Tauri fs plugin reads file modification
+      times while indexing the roost. Declared per Tauri's iOS guidance.
+    * UserDefaults (CA92.1) — WKWebView / wry read NSUserDefaults belonging
+      to this app only.
+
+  If a future build trips an ITMS-91053 warning naming another category
+  (e.g. DiskSpace E174.1, SystemBootTime 35F9.1), add it here with the
+  matching reason code.
+-->
+<plist version="1.0">
+<dict>
+	<key>NSPrivacyTracking</key>
+	<false/>
+	<key>NSPrivacyTrackingDomains</key>
+	<array/>
+	<key>NSPrivacyCollectedDataTypes</key>
+	<array/>
+	<key>NSPrivacyAccessedAPITypes</key>
+	<array>
+		<dict>
+			<key>NSPrivacyAccessedAPIType</key>
+			<string>NSPrivacyAccessedAPICategoryFileTimestamp</string>
+			<key>NSPrivacyAccessedAPITypeReasons</key>
+			<array>
+				<string>C617.1</string>
+			</array>
+		</dict>
+		<dict>
+			<key>NSPrivacyAccessedAPIType</key>
+			<string>NSPrivacyAccessedAPICategoryUserDefaults</string>
+			<key>NSPrivacyAccessedAPITypeReasons</key>
+			<array>
+				<string>CA92.1</string>
+			</array>
+		</dict>
+	</array>
+</dict>
+</plist>

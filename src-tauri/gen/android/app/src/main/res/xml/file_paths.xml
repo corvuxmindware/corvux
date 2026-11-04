@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  FileProvider roots. Scoped to a dedicated `shared/` subfolder rather
+  than the stock template's `path="."`, which exposed the ENTIRE external-
+  files dir and the ENTIRE cache dir to any app handed a granted content://
+  URI. Corvux has no share-out / ACTION_SEND feature and none of its own
+  code calls this provider (the roost uses SAF content:// trees, a separate
+  mechanism), so narrowing the scope can't break a used feature — it just
+  bounds what a future grant could ever vend. If a share-out feature is
+  added later, stage the file under cache/shared or files/shared and
+  re-verify on device. (Audit 2026-06-08, LOW-8.)
+-->
+<paths xmlns:android="http://schemas.android.com/apk/res/android">
+  <external-path name="my_images" path="shared/" />
+  <cache-path name="my_cache_images" path="shared/" />
+</paths>

@@ -1,0 +1,12 @@
+{
+  "$schema": "https://raw.githubusercontent.com/nicegui-org/nicegui/main/nicegui/json_schemas/tauri-v2/capability.json",
+  "identifier": "mobile",
+  "description": "Mobile-only (Android + iOS) capabilities for Corvux. Holds the permissions for the mobile-only plugins: tauri-plugin-saf (Android Storage Access Framework folder picker + document ops), tauri-plugin-multicast-lock (Android WifiManager.MulticastLock for mDNS sync discovery), and tauri-plugin-ios-picker (iOS UIDocumentPicker + security-scoped bookmarks). These plugins are registered on all platforms (desktop builds get no-op stubs), but only mobile actually invokes them — so they're scoped here instead of the cross-platform default capability. Audit 2026-06-08, LOW-10.",
+  "platforms": ["android", "iOS"],
+  "windows": ["main"],
+  "permissions": [
+    "saf:default",
+    "multicast-lock:default",
+    "ios-picker:default"
+  ]
+}

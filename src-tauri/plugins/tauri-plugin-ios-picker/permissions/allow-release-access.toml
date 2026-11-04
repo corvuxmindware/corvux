@@ -1,0 +1,6 @@
+"$schema" = "schemas/schema.json"
+
+[[permission]]
+identifier = "allow-release-access"
+description = "Enables the release_access command — drops scoped access for a previously resumed folder."
+commands.allow = ["release_access"]

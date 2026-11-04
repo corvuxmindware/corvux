@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  macOS Hardened Runtime entitlements (Developer ID direct download).
+
+  Deliberately minimal. Corvux ships UNSANDBOXED on macOS — the App Sandbox
+  would break the corvux-mcp sidecar, sync, and filesystem access (the same
+  reason we ship Developer ID direct, not the Mac App Store). So there is NO
+  com.apple.security.app-sandbox here.
+
+  The only two entitlements are the device-access pair the in-app WebKit media
+  features need under Hardened Runtime (without them the OS denies the request
+  on a signed/notarized build even though it works in unsigned dev):
+    - audio-input : the voice-memo recorder (getUserMedia audio)
+    - camera      : the sync QR-pairing scanner (getUserMedia video)
+  Both also require the matching NSMicrophone/NSCamera usage strings — see
+  src-tauri/Info.plist.
+
+  Do NOT add com.apple.security.cs.* (allow-jit / allow-unsigned-executable-memory
+  / disable-library-validation / allow-dyld-environment-variables): JavaScript JIT
+  runs in the OS's own sandboxed WebContent process, not the host app, so the host
+  needs none of them. Adding them weakens the Hardened Runtime for no reason.
+-->
+<plist version="1.0">
+<dict>
+	<key>com.apple.security.device.audio-input</key>
+	<true/>
+	<key>com.apple.security.device.camera</key>
+	<true/>
+</dict>
+</plist>

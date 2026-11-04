@@ -1,0 +1,2 @@
+- [ ] Stand-up call 📅 2026-05-02 ⏰ 10:00
+- [ ] Reply to Ravi 📅 2026-05-03
