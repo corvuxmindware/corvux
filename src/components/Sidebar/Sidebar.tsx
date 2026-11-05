@@ -4,6 +4,7 @@ import { tabStore } from "../../stores/tabs";
 import { graphStore } from "../../stores/graph";
 import { syncStatusStore } from "../../stores/sync";
 import { commands, unwrap } from "../../lib/invoke";
+import { confirmDialog } from "../../lib/confirm";
 import { errMsg } from "../../lib/error";
 import { log } from "../../lib/log";
 import { isMobile as isMobilePlatform } from "../../lib/platform";
@@ -464,7 +465,7 @@ export default function Sidebar(props: SidebarProps) {
             // Folder deletes are recursive (everything inside goes to
             // trash). Confirm before doing it — the trash recovers, but
             // a misclick on a 500-note folder is still a bad day.
-            const ok = window.confirm(
+            const ok = await confirmDialog(
               `Delete "${entry.name}" and everything inside it?\n\nThe folder is moved to .corvux-trash/ (recoverable).`,
             );
             if (!ok) return;
@@ -555,7 +556,7 @@ export default function Sidebar(props: SidebarProps) {
           // so it's recoverable from a file manager — call that out so
           // the user knows the safety net exists. Mirrors the folder-
           // delete prompt for consistency.
-          const ok = window.confirm(
+          const ok = await confirmDialog(
             `Delete "${entry.name}"?\n\nThe file is moved to .corvux-trash/ inside your roost and can be restored from your file manager.`,
           );
           if (!ok) return;

@@ -1,5 +1,6 @@
 import { createResource, createSignal, onMount, Show } from "solid-js";
 import { commands, unwrap, isTauri } from "../../lib/invoke";
+import { confirmDialog } from "../../lib/confirm";
 import { toastStore } from "../Toast/Toast";
 import { roostStore } from "../../stores/roost";
 import { isMobile } from "../../lib/platform";
@@ -80,9 +81,9 @@ export default function McpToolsSection() {
           ? "CAPTURE-ONLY access lets the AI client create captures, tasks, and reminders, but not read existing notes. Tool inputs may be sent through that client's cloud model provider."
           : "READ-ONLY access lets the AI client read every non-hidden Markdown note in this roost. Note content returned by tools may be sent to that client's cloud model provider.";
     if (
-      !window.confirm(
+      !(await confirmDialog(
         `${disclosure}\n\nCorvux will add this exact local command to Claude Desktop:\n\n${exactConfig ?? "Configuration is still loading."}\n\nContinue?`,
-      )
+      ))
     ) {
       return;
     }

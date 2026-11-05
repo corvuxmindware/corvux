@@ -1,5 +1,6 @@
 import { createSignal, onMount, onCleanup, Show } from "solid-js";
 import { commands, isTauri, unwrap } from "../../../lib/invoke";
+import { confirmDialog } from "../../../lib/confirm";
 import { log } from "../../../lib/log";
 import { isMobile } from "../../../lib/platform";
 import { lsSet, lsRemove, lsKeysWithPrefix } from "../../../lib/storage";
@@ -207,7 +208,7 @@ export default function SyncSection() {
   /// fires sync_connect (TLS path) with the now-wrong PIN, producing the
   /// `WrongPin` spam in diagnostics.
   const resetDocstore = async () => {
-    const ok = window.confirm(
+    const ok = await confirmDialog(
       "Reset all sync state on this device?\n\n" +
       "• Wipes the local Automerge / sync history.\n" +
       "• Forgets every paired device.\n" +
