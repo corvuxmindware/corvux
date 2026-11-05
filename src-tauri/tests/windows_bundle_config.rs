@@ -87,3 +87,20 @@ fn nsis_is_a_bundle_target() {
          downloads and replaces in place"
     );
 }
+
+/// Tauri 2.12 flipped `build.windows.staticVCRuntime` to default `true`
+/// (statically link the MSVC C runtime). Corvux also links C/C++ deps built
+/// against the dynamic CRT (e.g. llama.cpp via llama-cpp-sys-2), and with the
+/// static default the desktop app crashed at startup with `0x80000003`
+/// (STATUS_BREAKPOINT) before printing anything. Keep the pre-2.12 dynamic CRT
+/// until every native dep is built for the static one.
+#[test]
+fn msvc_runtime_stays_dynamic() {
+    let conf = tauri_conf();
+    assert_eq!(
+        conf["build"]["windows"]["staticVCRuntime"].as_bool(),
+        Some(false),
+        "build.windows.staticVCRuntime must be explicitly false — Tauri 2.12+ \
+         defaults it to true, which crashes Corvux at startup on Windows"
+    );
+}
