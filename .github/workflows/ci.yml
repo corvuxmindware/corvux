@@ -156,14 +156,6 @@ jobs:
       #   with graph_builder's ^0.5, so unreachable without cozo bumping
       #   graph_builder. The mmap'd-file input path the advisory covers is
       #   unused: cozo builds its graphs in memory.
-      # - RUSTSEC-2026-0367 / -0368 / -0369 / -0429 (zip 4.6.1, unsafe
-      #   symlink / permission handling in ZipArchive::extract): only
-      #   tauri-plugin-updater 2.10 uses zip, and only on Windows after
-      #   `download()` has verified the update's minisign signature against the
-      #   pinned updater pubkey — an attacker-controlled archive can't reach
-      #   extract() without our signing key. The fix (zip 9) needs
-      #   tauri-plugin-updater 2.14, which drags in a Tauri core upgrade;
-      #   drop these ignores with that upgrade.
       - name: cargo audit (security advisories)
         working-directory: src-tauri
         run: |
@@ -171,7 +163,7 @@ jobs:
           cargo audit \
             --ignore RUSTSEC-2026-0041 \
             --ignore RUSTSEC-2024-0429 \
-            --ignore RUSTSEC-2026-0186             --ignore RUSTSEC-2026-0367             --ignore RUSTSEC-2026-0368             --ignore RUSTSEC-2026-0369             --ignore RUSTSEC-2026-0429
+            --ignore RUSTSEC-2026-0186
 
       # 2026-05-24 audit (S-01 + updater integrity): assert the signed
       # updater config didn't silently drift to plaintext or empty
