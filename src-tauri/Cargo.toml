@@ -173,9 +173,9 @@ unicode-normalization = "0.1"
 automerge = "0.8"
 # iroh 1.0 (upgraded from 0.98.2 on 2026-07-03). The 0.98→1.0 API surface we
 # use (Endpoint::builder(presets::N0), EndpointAddr/EndpointId, RelayMode,
-# home_relay_status) is unchanged — compiles + clippy clean. The Android JNI
-# contract (ndk_context, satisfied by `android_context.rs`) is also unchanged
-# in 1.0. Still: re-validate pairing/handshake + the Android build on-device
+# home_relay_status) is unchanged — compiles + clippy clean. iroh reads the
+# Android context via ndk_context, which tao (Tauri >= 2.12) initializes in
+# the Activity's onCreate. Still: re-validate pairing/handshake + the Android build on-device
 # after this bump (transport-layer change). Pin to a tested minor before
 # tracking further 1.x releases.
 iroh = { version = "1", default-features = false, features = ["tls-ring"] }
@@ -336,18 +336,6 @@ objc = "0.2"
 # permission manifests stopped being discovered.
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.58", features = ["Win32_UI_Shell", "Win32_Foundation", "Win32_Storage_FileSystem", "Win32_Storage_Packaging_Appx"] }
-
-# Android-only: initialize the global `ndk_context` (JavaVM + Application
-# context) from `MulticastLockPlugin.load()` via a small JNI shim
-# (`src/android_context.rs`). Tauri V2's Android flow never runs tao's
-# `create()` — which would normally set it — so iroh's network monitor
-# panics ("android context was not initialized") on the first sync endpoint
-# build, and `panic = "abort"` takes the whole process down. See
-# tauri-apps/tauri#13267. Both crates are already in the tree transitively;
-# declaring them directly just lets us call the init API.
-[target.'cfg(target_os = "android")'.dependencies]
-jni = "0.21"
-ndk-context = "0.1"
 
 [features]
 default = []

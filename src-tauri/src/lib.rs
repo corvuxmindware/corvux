@@ -1,9 +1,4 @@
 mod ai;
-// Android-only JNI shim that initializes the global `ndk_context` so
-// iroh's network monitor doesn't panic during sync pairing. See the
-// module docs + tauri-apps/tauri#13267.
-#[cfg(target_os = "android")]
-mod android_context;
 mod background_runtime;
 mod commands;
 // `pub` so benches/integration tests under `benches/` and `tests/` can call
