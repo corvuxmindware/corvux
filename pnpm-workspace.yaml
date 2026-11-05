@@ -17,3 +17,13 @@ onlyBuiltDependencies:
 overrides:
   postcss: ">=8.5.10"
   uuid: "^11.1.1"
+  # katex: mermaid 11 pins ^0.16.47, but the prototype-pollution fix
+  # (GHSA "KaTeX: existing prototype pollution can bypass trust
+  # restrictions") is only in 0.18.2+. Mermaid only calls
+  # `katex.renderToString(..., { output: "mathml" })`, which 0.17/0.18 did
+  # not change (0.17 changed an internal API, 0.18 prefixed CSS classes).
+  # Mermaid 12 accepts 0.18 natively but requires Safari 17.4+, which would
+  # drop iOS 14-17.3 / older macOS. Drop this override with mermaid 12.
+  # Pinned exactly: 0.18.11 is deprecated upstream ("accidentally published
+  # with breaking changes"), so a caret range would pick it up.
+  katex: "0.18.10"
