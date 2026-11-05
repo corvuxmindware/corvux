@@ -424,6 +424,8 @@ wmi = { path = "vendor/wmi-0.18.4" }
 # Vendored copy of tauri-plugin-notification 2.3.3 with one Swift fix: its
 # NotificationHandler.toActiveNotification force-unwrapped an in-memory map on
 # notification TAP, crashing the app whenever a reminder fired after the
-# process was killed (the normal case). Source otherwise untouched. Drop this
+# process was killed (the normal case). Source otherwise untouched apart from
+# android/build.gradle.kts + consumer-rules.pro, aligned to the Tauri 2.12
+# plugin template (no proguardFiles block, compilerOptions DSL). Drop this
 # when upstream makes that lookup safe (still broken on v2 as of 2026-06-14).
 tauri-plugin-notification = { path = "vendor/tauri-plugin-notification" }
