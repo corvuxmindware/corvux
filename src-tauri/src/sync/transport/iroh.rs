@@ -40,8 +40,6 @@
 //! `AsyncRead`, so the existing length-prefixed framing works without
 //! modification.
 
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-
 use async_trait::async_trait;
 use iroh::endpoint::{Connection, RecvStream, SendStream};
 use iroh::{Endpoint, EndpointAddr as NodeAddr, EndpointId as NodeId, RelayMode, SecretKey};
@@ -227,28 +225,6 @@ impl Transport for IrohTransport {
     }
 }
 
-/// Public resolvers iroh falls back to when the system resolver can't answer.
-///
-/// Some ISPs refuse queries for iroh's discovery host: Reliance Jio's resolver
-/// answers REFUSED for `dns.iroh.link` (seen 2026-11-05), so on Jio the N0
-/// pkarr publish and DNS address lookup failed on a loop and a device that
-/// changed networks could no longer be re-found. The system resolver stays
-/// first; hickory moves on to these when it refuses (verified on a Jio
-/// connection: system-only fails, system + these resolves). This resolver is
-/// only used for iroh's own relay/discovery hostnames, never for note content.
-const SYNC_DNS_FALLBACKS: [SocketAddr; 2] = [
-    SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)), 53),
-    SocketAddr::new(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)), 53),
-];
-
-/// The system DNS configuration plus [`SYNC_DNS_FALLBACKS`].
-fn sync_dns_resolver() -> iroh::dns::DnsResolver {
-    iroh::dns::DnsResolver::builder()
-        .with_system_defaults()
-        .with_nameservers(SYNC_DNS_FALLBACKS.map(|addr| (addr, iroh::dns::DnsProtocol::Udp)))
-        .build()
-}
-
 /// Build an Iroh [`Endpoint`] for this device.
 ///
 /// The endpoint is the long-lived object that owns the QUIC socket and
@@ -322,7 +298,7 @@ pub async fn build_endpoint(
         .secret_key(secret)
         .alpns(vec![SYNC_ALPN.to_vec()])
         .relay_mode(relay_mode)
-        .dns_resolver(sync_dns_resolver())
+        .dns_resolver(super::dns_fallback::sync_dns_resolver())
         .address_lookup(lan_lookup)
         .transport_config(transport_config)
         .bind()

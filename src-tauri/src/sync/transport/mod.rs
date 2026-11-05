@@ -7,6 +7,7 @@
 //! trivial — `MockTransport` is an in-memory pair of channels that behaves
 //! identically from the engine's point of view.
 
+pub mod dns_fallback;
 pub mod encrypted;
 pub mod frame;
 pub mod iroh;
