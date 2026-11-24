@@ -59,7 +59,7 @@ targets:
         # because xcodegen REWRITES that plist from these properties on any
         # regen, which would silently drop them (guarded by
         # tests/ios_bundle_config.rs).
-        ITSAppUsesNonExemptEncryption: true
+        ITSAppUsesNonExemptEncryption: false
         NSCameraUsageDescription: "Corvux uses the camera only when you tap \"Scan QR code\" to pair a device for sync. It reads the pairing code shown on your other device — nothing is recorded or saved."
         NSMicrophoneUsageDescription: "Corvux uses your microphone only when you tap the voice-memo button. The recording is saved as an attachment in your roost. No background or always-on listening."
         NSPhotoLibraryUsageDescription: "Corvux opens your photo library only when you tap \"Add image\" to embed a picture in a note. The selected image is copied into your roost as an attachment. Corvux never browses your library on its own."

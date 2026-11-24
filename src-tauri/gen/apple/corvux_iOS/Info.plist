@@ -19,7 +19,7 @@
 	<key>CFBundleVersion</key>
 	<string>25</string>
 	<key>ITSAppUsesNonExemptEncryption</key>
-	<true/>
+	<false/>
 	<key>LSRequiresIPhoneOS</key>
 	<true/>
 	<key>NSCameraUsageDescription</key>

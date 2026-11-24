@@ -12,15 +12,18 @@
   gen/apple/corvux_iOS/Info.plist, so the wording here is kept byte-identical —
   the shared-file merge is a no-op on iOS and adds the strings on macOS.
 
-  ITSAppUsesNonExemptEncryption = true (decided 2026-11-06): Corvux ships its
-  own standard crypto (XChaCha20-Poly1305 + X25519 E2E sync, rustls TLS), so
-  it is not exempt. App Store distribution excludes France until the French
-  encryption declaration is filed. Harmless on the macOS Developer-ID build.
+  ITSAppUsesNonExemptEncryption = false (revised 2026-11-07): Corvux uses only
+  standard algorithms (XChaCha20-Poly1305 + X25519 E2E sync, rustls TLS) and is
+  not distributed in France. For those answers App Store Connect's encryption
+  questionnaire requires no documents and says to declare false here; true
+  demands an export-compliance code that only exists once documents are filed.
+  Adding France later: file the French declaration, then set true plus the
+  ITSEncryptionExportComplianceCode it issues. Harmless on the macOS build.
 -->
 <plist version="1.0">
 <dict>
 	<key>ITSAppUsesNonExemptEncryption</key>
-	<true/>
+	<false/>
 	<key>NSCameraUsageDescription</key>
 	<string>Corvux uses the camera only when you tap "Scan QR code" to pair a device for sync. It reads the pairing code shown on your other device — nothing is recorded or saved.</string>
 	<key>NSMicrophoneUsageDescription</key>

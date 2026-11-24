@@ -105,12 +105,17 @@ fn ios_targets_iphone_only_until_ipad_is_a_deliberate_decision() {
     );
 }
 
-/// Export compliance (decision 2026-11-06): Corvux ships its own standard
-/// crypto (XChaCha20-Poly1305 + X25519 for E2E sync, rustls TLS), so it is
-/// NOT exempt. Declared `true`; distributed outside France until the French
-/// encryption declaration is filed. `false` would be a false declaration.
+/// Export compliance (revised 2026-11-07): Corvux uses only standard
+/// algorithms (XChaCha20-Poly1305 + X25519 for E2E sync, rustls TLS) and is
+/// not distributed in France. For exactly those answers App Store Connect's
+/// encryption questionnaire says no documents are needed and the plist should
+/// declare `false`. `true` makes the upload demand an
+/// `ITSEncryptionExportComplianceCode` that only exists after documents are
+/// filed, so build 25 was refused ("key value []", 2026-11-06). Enabling France
+/// later needs the French declaration filed first, then this flips to `true`
+/// with the code App Store Connect issues.
 #[test]
-fn ios_declares_non_exempt_encryption() {
+fn ios_declares_standard_encryption_as_exempt() {
     for rel in ["../../Info.plist", "corvux_iOS/Info.plist"] {
         let xml = fs::read_to_string(apple_dir().join(rel)).expect(rel);
         let after = xml
@@ -118,10 +123,15 @@ fn ios_declares_non_exempt_encryption() {
             .nth(1)
             .unwrap_or_else(|| panic!("{rel} lacks ITSAppUsesNonExemptEncryption"));
         assert!(
-            after.trim_start().starts_with("<true/>"),
-            "{rel}: ITSAppUsesNonExemptEncryption must be <true/>"
+            after.trim_start().starts_with("<false/>"),
+            "{rel}: ITSAppUsesNonExemptEncryption must be <false/>"
         );
     }
+    let yml = fs::read_to_string(apple_dir().join("project.yml")).expect("project.yml");
+    assert!(
+        yml.contains("ITSAppUsesNonExemptEncryption: false"),
+        "project.yml must carry ITSAppUsesNonExemptEncryption: false or a regen drops it"
+    );
 }
 
 /// Every permission prompt needs its usage string or iOS kills the app on the
