@@ -5,17 +5,20 @@
 //! which resolves the relative path against the tree via `DocumentFile`
 //! and performs the actual IO via `ContentResolver`.
 //!
-//! Slice 4 scope: `list`, `read`, `exists` only. Write/mutate methods
-//! return [`RoostError::Io("not yet implemented")`] until Slice 5 adds
-//! `writeDocument`/`createDocument`/`deleteDocument`/`renameDocument`
-//! on the Kotlin side.
+//! `trash` moves into `.corvux-trash/` with the provider's own move and
+//! falls back to copy + delete (see `super::trash`); it is never a plain
+//! permanent delete.
 
 use async_trait::async_trait;
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use tauri::{AppHandle, Runtime};
 use tauri_plugin_saf::SafExt;
 
-use super::{Entry, RoostError, RoostFs};
+use super::trash::{
+    base_name, classify_move_error, copy_to, ensure_trashable, now_secs, unique_trash_rel,
+    MoveFailure, TRASH_DIR, TRASH_LOCK,
+};
+use super::{hidden_below, validate_rel, Entry, RoostError, RoostFs};
 
 pub struct SafFs<R: Runtime> {
     tree_uri: String,
@@ -44,7 +47,10 @@ impl<R: Runtime> SafFs<R> {
 }
 
 fn map_plugin_err(e: tauri_plugin_saf::Error) -> RoostError {
-    let s = e.to_string();
+    map_plugin_err_str(e.to_string())
+}
+
+fn map_plugin_err_str(s: String) -> RoostError {
     // Best-effort: translate the most common Kotlin-side reject messages
     // back to structured variants so callers can match on them.
     if s.contains("Already exists") {
@@ -114,11 +120,12 @@ impl<R: Runtime> RoostFs for SafFs<R> {
         Ok(resp
             .entries
             .into_iter()
-            // Same filtering contract as `list` — hidden dotfiles and our
-            // trash dir are dropped. Note the trash check matches on the
-            // basename, which `name` already is, so deeply-nested names
-            // that *contain* `.corvux-trash` aren't accidentally hidden.
-            .filter(|e| !e.name.starts_with('.') && e.name != ".corvux-trash")
+            // Same contract as `list` + the default recursion: hidden
+            // entries AND everything inside hidden folders are dropped
+            // (`.corvux-trash/` holds deleted notes). The raw walk returns
+            // descendants of hidden folders too, so a name-only check
+            // leaked them.
+            .filter(|e| !hidden_below(rel_dir, &e.rel_path))
             .map(|e| Entry {
                 name: e.name,
                 rel_path: e.rel_path,
@@ -161,13 +168,85 @@ impl<R: Runtime> RoostFs for SafFs<R> {
     }
 
     async fn trash(&self, rel: &str) -> Result<(), RoostError> {
-        // SAF has no per-app trash; `renameTo` can't move across dirs, so
-        // we fall back to a hard delete. Users who want undo on Android
-        // rely on Syncthing version history or a file-manager undo. This
-        // asymmetry is documented in the trait contract comment.
-        self.app
-            .saf()
-            .delete_document(&self.tree_uri, rel)
+        // Same promise as desktop: the note or folder lands in
+        // `.corvux-trash/<ts>.<name>`. Until 2026-11-05 this was a hard
+        // delete, although the delete prompt said "recoverable".
+        let rel = validate_rel(rel)?;
+        let rel = rel.trim_end_matches('/');
+        if rel.is_empty() {
+            return Err(RoostError::Io("cannot trash the roost root".into()));
+        }
+        ensure_trashable(rel)?;
+        let saf = self.app.saf();
+        let stat = saf
+            .stat_document(&self.tree_uri, rel)
+            .map_err(map_plugin_err)?;
+        if !stat.exists {
+            return Err(RoostError::NotFound(rel.to_string()));
+        }
+        match self.mkdir(TRASH_DIR).await {
+            Ok(()) | Err(RoostError::AlreadyExists(_)) => {}
+            Err(e) => return Err(e),
+        }
+        // One trash at a time, from picking the name until the move/copy is
+        // done, so a concurrent delete can't claim the same name.
+        let _one_at_a_time = TRASH_LOCK.lock().await;
+
+        // Fast path: the storage provider moves it (a folder as one unit).
+        // If the name got taken after we checked (`exists` reads a SAF error
+        // as "free"), pick another; never copy onto someone else's name.
+        let mut attempts = 0;
+        let dest = loop {
+            let dest = unique_trash_rel(self, now_secs(), base_name(rel)).await?;
+            let err = match saf.move_document(&self.tree_uri, rel, &dest) {
+                Ok(()) => return Ok(()),
+                Err(e) => e.to_string(),
+            };
+            match classify_move_error(&err) {
+                MoveFailure::Unsupported => {
+                    tracing::info!(
+                        rel = %rel,
+                        error = %err,
+                        "saf: provider can't move into trash, copying instead"
+                    );
+                    break dest;
+                }
+                MoveFailure::NameTaken if attempts < 3 => attempts += 1,
+                MoveFailure::NameTaken | MoveFailure::Other => {
+                    return Err(map_plugin_err_str(err));
+                }
+            }
+        };
+
+        // Fallback: copy everything (the raw tree listing keeps hidden
+        // files such as `.attachments/`), and delete the original only
+        // after the whole copy succeeded.
+        let descendants: Vec<Entry> = if stat.is_dir {
+            saf.list_tree(&self.tree_uri, rel)
+                .map_err(map_plugin_err)?
+                .entries
+                .into_iter()
+                .map(|e| Entry {
+                    name: e.name,
+                    rel_path: e.rel_path,
+                    is_dir: e.is_dir,
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        if let Err(e) = copy_to(self, rel, stat.is_dir, &descendants, &dest).await {
+            // Leave no half-copied folder behind; the original is untouched.
+            // Only remove `dest` if this copy created it: otherwise it is
+            // another trashed note that happens to own the name.
+            if e.dest_claimed {
+                if let Err(cleanup) = saf.delete_document(&self.tree_uri, &dest) {
+                    tracing::debug!(dest = %dest, error = %cleanup, "saf: partial trash copy not removed");
+                }
+            }
+            return Err(e.error);
+        }
+        saf.delete_document(&self.tree_uri, rel)
             .map_err(map_plugin_err)
     }
 

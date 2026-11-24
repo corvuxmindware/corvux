@@ -98,6 +98,25 @@ impl<R: Runtime> Saf<R> {
             .map_err(Into::into)
     }
 
+    /// Move `from_rel` into another folder under the name at the end of
+    /// `to_rel`, using the storage provider's own move (no bytes pass
+    /// through the app). The destination folder must exist and the name
+    /// must be free. Fails with "Move not supported" when the provider
+    /// can't move documents; callers then copy + delete instead.
+    pub fn move_document(&self, tree_uri: &str, from_rel: &str, to_rel: &str) -> Result<()> {
+        self.0
+            .run_mobile_plugin::<SafEmpty>(
+                "moveDocument",
+                RenameArgs {
+                    tree_uri,
+                    from_rel,
+                    to_rel,
+                },
+            )
+            .map(|_| ())
+            .map_err(Into::into)
+    }
+
     pub fn mkdir(&self, tree_uri: &str, rel: &str) -> Result<()> {
         self.0
             .run_mobile_plugin::<SafEmpty>("mkdir", RelArgs { tree_uri, rel })

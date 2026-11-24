@@ -18,6 +18,7 @@ use serde::Serialize;
 use thiserror::Error;
 
 pub mod native;
+pub mod trash;
 pub mod walk;
 
 // Roost-level advisory file lock. Desktop only — mobile roosts live in
@@ -102,8 +103,10 @@ pub trait RoostFs: Send + Sync {
     /// Create a new file with initial contents. Fails if it already exists.
     async fn create(&self, rel: &str, initial: &[u8]) -> Result<(), RoostError>;
 
-    /// Move a file to a trash location (not permanent delete). Backends
-    /// pick their own trash path — the contract is only "recoverable".
+    /// Move a file or folder into `<roost>/.corvux-trash/` (never a
+    /// permanent delete): the delete prompt tells the user they can restore
+    /// it from a file manager. Every backend names the entry with
+    /// [`trash::unique_trash_rel`] (`<unix-secs>.<name>`, numbered on clash).
     async fn trash(&self, rel: &str) -> Result<(), RoostError>;
 
     async fn rename(&self, from_rel: &str, to_rel: &str) -> Result<(), RoostError>;
@@ -152,6 +155,31 @@ async fn list_recursive_via_list<T: RoostFs + Sync + ?Sized>(
     Ok(())
 }
 
+/// True when `rel_path` — an entry found while listing `rel_dir` — is a
+/// hidden (dot-prefixed) file or folder below `rel_dir`, or sits anywhere
+/// inside one. Recursive listings must drop these: `.corvux-trash/` holds
+/// deleted notes, `.corvux/` app data, `.git/`/`.obsidian/` other tools'
+/// files. Hidden segments in `rel_dir` itself don't count, so listing
+/// `.corvux/skills` on purpose still works.
+///
+/// The SAF bulk walk used to check only each entry's own name, so files
+/// inside a hidden folder (e.g. `.corvux/chat-sessions`) leaked into the
+/// Android file tree, graph, search and sync seeding.
+// Only the Android SAF backend calls this outside tests.
+#[cfg_attr(not(target_os = "android"), allow(dead_code))]
+pub(crate) fn hidden_below(rel_dir: &str, rel_path: &str) -> bool {
+    let dir = rel_dir.trim_matches('/');
+    let path = rel_path.trim_start_matches('/');
+    let below = if dir.is_empty() {
+        path
+    } else {
+        path.strip_prefix(dir)
+            .and_then(|rest| rest.strip_prefix('/'))
+            .unwrap_or(path)
+    };
+    below.split('/').any(|seg| seg.starts_with('.'))
+}
+
 /// Validate a roost-relative path. Rejects `..`, absolute paths, Windows
 /// drive prefixes, and verbatim/device prefixes. Returns the cleaned
 /// (forward-slash) form.
@@ -184,6 +212,39 @@ pub(crate) fn validate_rel(rel: &str) -> Result<String, RoostError> {
     }
 
     Ok(cleaned)
+}
+
+#[cfg(test)]
+mod hidden_below_tests {
+    use super::hidden_below;
+
+    #[test]
+    fn hides_dot_entries_and_everything_inside_them() {
+        assert!(hidden_below("", ".corvux-trash"));
+        assert!(hidden_below("", ".corvux-trash/1700000000.a.md"));
+        assert!(hidden_below("", ".corvux/chat-sessions"));
+        assert!(hidden_below("", "Notes/.obsidian/plugins/x/README.md"));
+        assert!(hidden_below("Notes", "Notes/.attachments/pic.png"));
+    }
+
+    #[test]
+    fn keeps_normal_entries() {
+        assert!(!hidden_below("", "a.md"));
+        assert!(!hidden_below("", "Daily/2026/a.md"));
+        assert!(!hidden_below("", "notes.v2/a.md"));
+        assert!(!hidden_below("", "/Daily/a.md"));
+    }
+
+    #[test]
+    fn a_hidden_listing_root_is_allowed() {
+        // Skills and agents are listed from inside `.corvux` on purpose.
+        assert!(!hidden_below(
+            ".corvux/skills",
+            ".corvux/skills/summarize.md"
+        ));
+        assert!(!hidden_below(".corvux/skills/", ".corvux/skills/sub/a.md"));
+        assert!(hidden_below(".corvux/skills", ".corvux/skills/.draft/a.md"));
+    }
 }
 
 #[cfg(test)]

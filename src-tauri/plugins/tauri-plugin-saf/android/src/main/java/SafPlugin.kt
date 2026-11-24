@@ -5,6 +5,7 @@ import android.content.Intent
 import android.net.Uri
 import android.provider.DocumentsContract
 import android.util.Base64
+import android.util.Log
 import androidx.activity.result.ActivityResult
 import androidx.documentfile.provider.DocumentFile
 import app.tauri.annotation.ActivityCallback
@@ -51,6 +52,8 @@ class RenameArgs {
     lateinit var toRel: String
 }
 
+private const val TAG = "CorvuxSaf"
+
 @TauriPlugin
 class SafPlugin(private val activity: Activity) : Plugin(activity) {
 
@@ -81,7 +84,10 @@ class SafPlugin(private val activity: Activity) : Plugin(activity) {
             try {
                 block()
             } catch (ex: Exception) {
-                invoke.reject(ex.message ?: "saf op failed")
+                // Name the exception when it has no message (e.g. an
+                // UnsupportedOperationException) — a bare "saf op failed"
+                // hid the cause of the 2026-11-05 rename/move failures.
+                invoke.reject(ex.message ?: "saf op failed: ${ex.javaClass.simpleName}")
             }
         }
     }
@@ -395,11 +401,11 @@ class SafPlugin(private val activity: Activity) : Plugin(activity) {
     }
 
     /**
-     * Delete `rel` permanently. SAF has no built-in trash; matching the
-     * NativeFs soft-trash semantics would require a cross-dir move to
-     * `.corvux-trash/`, which SAF's `renameTo` can't do (same-parent
-     * only). Callers that need undo should snapshot via the graph DB
-     * before calling — accepted Slice 5 trade-off.
+     * Delete `rel` permanently (a folder with everything inside it).
+     * Note and folder deletes from the app do NOT come here directly: the
+     * Rust trash first moves them into `.corvux-trash/` (see
+     * `moveDocument`) and only calls this to remove the original after a
+     * fallback copy has fully succeeded.
      */
     @Command
     fun deleteDocument(invoke: Invoke) {
@@ -417,8 +423,9 @@ class SafPlugin(private val activity: Activity) : Plugin(activity) {
 
     /**
      * Rename within the same parent directory. Cross-directory rename
-     * isn't supported — SAF `DocumentFile.renameTo` can only rename;
-     * moving requires a copy+delete dance that we haven't built yet.
+     * isn't supported here — SAF `DocumentFile.renameTo` can only rename.
+     * (`moveDocument` below can move between folders; it is used by the
+     * trash only so far.)
      */
     @Command
     fun renameDocument(invoke: Invoke) {
@@ -436,11 +443,101 @@ class SafPlugin(private val activity: Activity) : Plugin(activity) {
             }
             val newName = to.substringAfterLast('/')
             val doc = resolveCached(args.treeUri, root, from) ?: return@runIO invoke.reject("Not found: ${args.fromRel}")
-            if (!doc.renameTo(newName)) return@runIO invoke.reject("rename failed")
+            // The provider would otherwise pick "name (1)" on a clash.
+            if (from != to && resolveRelative(root, to) != null) {
+                return@runIO invoke.reject("Already exists: ${args.toRel}")
+            }
+            // Rename through the document URI, not `doc.renameTo`: entries
+            // warmed by `walkTreeFast` are `SingleDocumentFile`s, whose
+            // `renameTo` throws UnsupportedOperationException — every note
+            // rename on an Android folder roost failed with "saf op failed"
+            // once the tree had been listed (found on-device 2026-11-05).
+            DocumentsContract.renameDocument(activity.contentResolver, doc.uri, newName)
+                ?: return@runIO invoke.reject("rename failed")
             // Both source and destination are mutated. A rename of a
             // directory needs to invalidate descendants too, which the
             // helper handles.
             invalidateCache(args.treeUri, from)
+            invalidateCache(args.treeUri, to)
+            invoke.resolve(JSObject())
+        }
+    }
+
+    /**
+     * Move `fromRel` (file or folder) into the folder of `toRel`, then give
+     * it the name at the end of `toRel`. Uses the provider's own move
+     * (`DocumentsContract.moveDocument`, API 24+), so nothing is copied
+     * through the app and a folder moves as one unit, hidden files included.
+     *
+     * Used by the Rust trash to put deleted notes into `.corvux-trash/`.
+     * The destination folder must already exist and the name must be free.
+     * Rejects with "Move not supported" when the provider can't move; the
+     * Rust side then falls back to copy + delete. If the move works but the
+     * follow-up rename fails, the document is already safe inside the
+     * destination folder under its old name, so this still resolves.
+     */
+    @Command
+    fun moveDocument(invoke: Invoke) {
+        val args = invoke.parseArgs(RenameArgs::class.java)
+        runIO(invoke) {
+            val root = DocumentFile.fromTreeUri(activity, Uri.parse(args.treeUri))
+                ?: return@runIO invoke.reject("Cannot resolve tree URI")
+            val from = normalize(args.fromRel) ?: return@runIO invoke.reject("Invalid fromRel")
+            val to = normalize(args.toRel) ?: return@runIO invoke.reject("Invalid toRel")
+            if (from.isEmpty() || to.isEmpty()) {
+                return@runIO invoke.reject("Invalid path: cannot move the roost root")
+            }
+            val fromParentRel = from.substringBeforeLast('/', "")
+            val oldName = from.substringAfterLast('/')
+            val toParentRel = to.substringBeforeLast('/', "")
+            val newName = to.substringAfterLast('/')
+
+            val doc = resolveCached(args.treeUri, root, from)
+                ?: return@runIO invoke.reject("Not found: ${args.fromRel}")
+            val srcParent = resolveCached(args.treeUri, root, fromParentRel)
+                ?: return@runIO invoke.reject("Not found: $fromParentRel")
+            val dstParent = resolveCached(args.treeUri, root, toParentRel)
+                ?: return@runIO invoke.reject("Not found: $toParentRel")
+            if (!dstParent.isDirectory) {
+                return@runIO invoke.reject("Not a directory: $toParentRel")
+            }
+            // Walk from the root rather than `dstParent.findFile`: cached
+            // entries are `SingleDocumentFile`s, which can't list children.
+            if (resolveRelative(root, to) != null) {
+                return@runIO invoke.reject("Already exists: ${args.toRel}")
+            }
+            // The provider moves under the OLD name, then we rename. If that
+            // in-between name is already taken (e.g. a stray
+            // `.corvux-trash/a.md` from a failed rename), the provider would
+            // refuse — report it as unsupported so Rust copies to the final
+            // name instead of retrying forever.
+            if (oldName != newName && resolveRelative(root, joinRel(toParentRel, oldName)) != null) {
+                return@runIO invoke.reject("Move not supported: $oldName already in $toParentRel")
+            }
+
+            val resolver = activity.contentResolver
+            var moveError: String? = null
+            val moved: Uri? = try {
+                DocumentsContract.moveDocument(resolver, doc.uri, srcParent.uri, dstParent.uri)
+            } catch (e: Exception) {
+                moveError = e.message ?: e.javaClass.simpleName
+                null
+            }
+            if (moved == null) {
+                return@runIO invoke.reject("Move not supported: ${moveError ?: "provider returned no document"}")
+            }
+            // The source path (and everything under it) is gone now.
+            invalidateCache(args.treeUri, from)
+            invalidateCache(args.treeUri, joinRel(toParentRel, oldName))
+
+            if (newName != oldName) {
+                try {
+                    DocumentsContract.renameDocument(resolver, moved, newName)
+                        ?: Log.w(TAG, "moveDocument: moved to $toParentRel but rename to $newName returned null")
+                } catch (e: Exception) {
+                    Log.w(TAG, "moveDocument: moved to $toParentRel but rename to $newName failed: ${e.message}")
+                }
+            }
             invalidateCache(args.treeUri, to)
             invoke.resolve(JSObject())
         }

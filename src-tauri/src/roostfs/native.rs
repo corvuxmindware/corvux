@@ -6,12 +6,12 @@
 //! `<root>/.corvux-trash/`.
 
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
 
+use super::trash::{ensure_trashable, now_secs, unique_trash_rel, TRASH_DIR, TRASH_LOCK};
 use super::{validate_rel, Entry, RoostError, RoostFs};
 
 pub struct NativeFs {
@@ -328,6 +328,7 @@ impl RoostFs for NativeFs {
     }
 
     async fn trash(&self, rel: &str) -> Result<(), RoostError> {
+        ensure_trashable(&validate_rel(rel)?)?;
         let src = self.safe_resolve(rel).await?;
         if !src.exists() {
             return Err(RoostError::NotFound(rel.to_string()));
@@ -338,17 +339,20 @@ impl RoostFs for NativeFs {
         // outside would have `fs::rename(&src, &dest)` move the user's
         // file out of the roost. The user thinks they deleted a note;
         // the attacker now has a copy at their chosen destination.
-        let trash_dir = self.safe_resolve(".corvux-trash").await?;
+        let trash_dir = self.safe_resolve(TRASH_DIR).await?;
         fs::create_dir_all(&trash_dir).await?;
         let name = src
             .file_name()
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_else(|| "unnamed".to_string());
-        let ts = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        let dest = trash_dir.join(format!("{ts}.{name}"));
+        // A free name, so two same-named notes deleted in the same second
+        // don't collide: `rename` onto an existing file silently replaces
+        // it (Unix and Windows), which lost the earlier trashed copy. The
+        // lock keeps a concurrent delete from picking the same name before
+        // this rename lands.
+        let _one_at_a_time = TRASH_LOCK.lock().await;
+        let dest_rel = unique_trash_rel(self, now_secs(), &name).await?;
+        let dest = self.safe_resolve(&dest_rel).await?;
         fs::rename(&src, &dest).await?;
         Ok(())
     }
@@ -468,6 +472,100 @@ mod tests {
         assert!(!fs.exists("a.md").await.unwrap());
         let trash = std::fs::read_dir(dir.path().join(".corvux-trash")).unwrap();
         assert_eq!(trash.count(), 1);
+    }
+
+    /// Two same-named notes from different folders, deleted back to back
+    /// (same second): both must survive in the trash. Before the shared
+    /// unique-name helper, the second `rename` replaced the first on Unix.
+    #[tokio::test]
+    async fn trash_keeps_both_same_named_files() {
+        let (dir, fs) = fresh();
+        fs.write_atomic("Daily/a.md", b"daily").await.unwrap();
+        fs.write_atomic("Work/a.md", b"work").await.unwrap();
+        fs.trash("Daily/a.md").await.unwrap();
+        fs.trash("Work/a.md").await.unwrap();
+        let mut bodies: Vec<Vec<u8>> = std::fs::read_dir(dir.path().join(".corvux-trash"))
+            .unwrap()
+            .map(|e| std::fs::read(e.unwrap().path()).unwrap())
+            .collect();
+        bodies.sort();
+        assert_eq!(bodies, vec![b"daily".to_vec(), b"work".to_vec()]);
+    }
+
+    #[tokio::test]
+    async fn trash_moves_whole_folder_with_hidden_files() {
+        let (dir, fs) = fresh();
+        fs.write_atomic("Proj/a.md", b"a").await.unwrap();
+        fs.write_atomic("Proj/.attachments/p.png", b"png")
+            .await
+            .unwrap();
+        fs.trash("Proj").await.unwrap();
+        assert!(!fs.exists("Proj").await.unwrap());
+        let entries: Vec<_> = std::fs::read_dir(dir.path().join(".corvux-trash"))
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .collect();
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0]
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .ends_with(".Proj"));
+        assert_eq!(
+            std::fs::read(entries[0].join(".attachments/p.png")).unwrap(),
+            b"png"
+        );
+    }
+
+    /// Two same-named notes trashed CONCURRENTLY (not one after the other):
+    /// both must survive. Without `TRASH_LOCK` both pick `<ts>.a.md` and the
+    /// second rename silently replaces the first.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_trash_of_same_named_files_keeps_both() {
+        let (dir, fs) = fresh();
+        let fs = std::sync::Arc::new(fs);
+        let mut names = Vec::new();
+        for i in 0..8 {
+            let rel = format!("F{i}/a.md");
+            fs.write_atomic(&rel, format!("note {i}").as_bytes())
+                .await
+                .unwrap();
+            names.push(rel);
+        }
+        let tasks: Vec<_> = names
+            .into_iter()
+            .map(|rel| {
+                let fs = fs.clone();
+                tokio::spawn(async move { fs.trash(&rel).await })
+            })
+            .collect();
+        for t in tasks {
+            t.await.unwrap().unwrap();
+        }
+        let mut bodies: Vec<String> = std::fs::read_dir(dir.path().join(".corvux-trash"))
+            .unwrap()
+            .map(|e| std::fs::read_to_string(e.unwrap().path()).unwrap())
+            .collect();
+        bodies.sort();
+        let expected: Vec<String> = (0..8).map(|i| format!("note {i}")).collect();
+        assert_eq!(bodies, expected);
+    }
+
+    #[tokio::test]
+    async fn trash_refuses_the_trash_itself() {
+        let (_d, fs) = fresh();
+        fs.write_atomic("a.md", b"x").await.unwrap();
+        fs.trash("a.md").await.unwrap();
+        assert!(fs.trash(".corvux-trash").await.is_err());
+        let inside = std::fs::read_dir(_d.path().join(".corvux-trash"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .file_name();
+        let inside_rel = format!(".corvux-trash/{}", inside.to_string_lossy());
+        assert!(fs.trash(&inside_rel).await.is_err());
+        assert!(fs.exists(&inside_rel).await.unwrap(), "trashed note kept");
     }
 
     #[tokio::test]
