@@ -11,6 +11,7 @@ use notify_debouncer_full::{new_debouncer, DebounceEventResult, Debouncer, Recom
 use tracing::warn;
 
 use super::registry::{self, SubagentRegistry};
+use crate::ai::skills::roost_scan;
 
 const DEBOUNCE: Duration = Duration::from_millis(300);
 
@@ -46,7 +47,8 @@ pub fn spawn_watcher(
     .map_err(|e| format!("notify debouncer failed: {e}"))?;
 
     if let Some(dir) = roost_dir.as_deref() {
-        if dir.exists() {
+        // AT-5: only attach to a folder that stays inside the roost.
+        if roost_scan::definitions_dir_exists(dir, "agents") {
             debouncer
                 .watch(dir, RecursiveMode::Recursive)
                 .map_err(|e| format!("watch roost agents: {e}"))?;
@@ -79,7 +81,11 @@ pub fn spawn_default_watcher(
     let roost_dir = roost_root.map(registry::roost_agents_dir);
     let global_dir = registry::global_agents_dir();
     if let Some(ref dir) = roost_dir {
-        let _ = std::fs::create_dir_all(dir);
+        // Through the roost filesystem (AT-5): a raw `create_dir_all` followed a
+        // `.corvux` link out of the roost. A read-only roost is fine.
+        if let Err(e) = roost_scan::ensure_definitions_dir(dir, "agents") {
+            tracing::debug!(error = %e, "subagent: not creating the roost agents folder");
+        }
     }
     spawn_watcher(registry, roost_dir, global_dir)
 }

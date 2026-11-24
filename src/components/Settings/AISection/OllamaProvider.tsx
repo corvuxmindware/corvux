@@ -19,8 +19,22 @@ import { errMsg, isSecurityCancel } from "../../../lib/error";
 import { confirmDialog } from "../../../lib/confirm";
 import { settingsStore } from "../../../stores/settings";
 import { toastStore } from "../../Toast/Toast";
+import { reportProviderSaveFailure } from "./saveOutcome";
 
 const DEFAULT_BASE_URL = "http://localhost:11434";
+
+/** True when an address carries `user:password@`. A value saved by an older
+ *  version may; the backend keeps using it as saved (so existing setups don't
+ *  break) but refuses to save a NEW address in that shape, so the panel says so
+ *  instead of leaving the user to find out from a failed save. */
+export function urlHasCredentials(url: string): boolean {
+  try {
+    const u = new URL(url.trim());
+    return u.username !== "" || u.password !== "";
+  } catch {
+    return false;
+  }
+}
 
 function formatBytes(bytes: number): string {
   if (bytes === 0) return "0 B";
@@ -59,9 +73,14 @@ export default function OllamaProvider() {
       const result = await unwrap(commands.listOllamaModels(base, apiKey || null));
       setOllamaModels(result);
     } catch (e) {
-      const msg = errMsg(e);
-      setOllamaModelsError(msg);
       setOllamaModels([]);
+      if (isSecurityCancel(e)) {
+        // The user said no to the "send a request to this host?" dialog: a
+        // choice, not a fetch failure. No amber "Couldn't fetch" line.
+        toastStore.show("Cancelled. No request was sent.", "info");
+        return;
+      }
+      setOllamaModelsError(errMsg(e));
     } finally {
       setOllamaModelsLoading(false);
     }
@@ -79,6 +98,12 @@ export default function OllamaProvider() {
       // we know Ollama is reachable right now.
       if (result.ok) void refreshOllamaModels();
     } catch (e) {
+      if (isSecurityCancel(e)) {
+        // Declined the native "send a test request?" dialog: nothing was sent
+        // and nothing failed, so no red ✗ result.
+        toastStore.show("Cancelled. No test request was sent.", "info");
+        return;
+      }
       const msg = errMsg(e);
       setOllamaTest({
         ok: false,
@@ -128,13 +153,8 @@ export default function OllamaProvider() {
       setOllamaTest(null);
       setTimeout(() => setOllamaSaved(false), 2000);
     } catch (e) {
-      if (isSecurityCancel(e)) {
-        revertInputsToStored();
-        toastStore.show("Cancelled. Nothing was changed.", "info");
-        return;
-      }
-      const msg = errMsg(e);
-      setOllamaSaveError(msg);
+      // A declined confirmation snaps the form back; a real error is inline.
+      if (reportProviderSaveFailure(e, setOllamaSaveError)) revertInputsToStored();
     }
   }
 
@@ -147,7 +167,7 @@ export default function OllamaProvider() {
       setOllamaKeyInput("");
       setOllamaTest(null);
     } catch (e) {
-      setOllamaSaveError(errMsg(e));
+      reportProviderSaveFailure(e, setOllamaSaveError);
     }
   }
 
@@ -188,6 +208,14 @@ export default function OllamaProvider() {
             {ollamaTesting() ? "Testing…" : "Test"}
           </button>
         </div>
+        <Show when={urlHasCredentials(ollamaBaseInput())}>
+          <div class="mt-1.5 text-xs text-amber-400" role="note">
+            This address contains a username and password. It still works as
+            saved, but they are stored as plain text, and a new address with
+            credentials can't be saved. To change it, enter the address without
+            them (and add a token under Advanced if your proxy accepts one).
+          </div>
+        </Show>
         <div class="flex items-center justify-between mt-1.5">
           <a
             href="https://ollama.com/download"

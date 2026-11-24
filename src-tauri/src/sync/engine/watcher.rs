@@ -142,12 +142,32 @@ impl ChangeSender {
     }
 }
 
+/// Owned, cloneable handle that lets a task OTHER than the intake loop ask for
+/// another rescan (the engine runs the overflow reconcile off the loop, so it
+/// can no longer call `ChangeReceiver::request_rescan` when a pass fails).
+#[derive(Clone)]
+pub(crate) struct RescanRequester(std::sync::Arc<Overflow>);
+
+impl RescanRequester {
+    pub(crate) fn request(&self) {
+        self.0
+            .pending
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.0.notify.notify_one();
+    }
+}
+
 impl ChangeReceiver {
     pub(crate) fn request_rescan(&self) {
         self.overflow
             .pending
             .store(true, std::sync::atomic::Ordering::Release);
         self.overflow.notify.notify_one();
+    }
+
+    /// A handle for requesting a rescan from another task. See [`RescanRequester`].
+    pub(crate) fn rescan_requester(&self) -> RescanRequester {
+        RescanRequester(self.overflow.clone())
     }
 
     pub(crate) async fn recv(&mut self) -> Option<WatcherEvent> {

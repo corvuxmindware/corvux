@@ -100,7 +100,12 @@ describe("AllowedAiProviders", () => {
 describe("consentLabel", () => {
   it("labels every consent id shape the backend produces", () => {
     expect(consentLabel("anthropic")).toBe("Anthropic (Claude)");
+    // Older grants (before AK-8 the id had no scheme or port) still read well…
     expect(consentLabel("ollama:localhost")).toBe("Ollama at localhost");
+    // …and the current `ollama:<scheme>://<host>:<port>` form shows the origin.
+    expect(consentLabel("ollama:http://localhost:11434")).toBe(
+      "Ollama at http://localhost:11434",
+    );
     expect(consentLabel("ollama:ollama.com")).toBe("Ollama Cloud (ollama.com)");
   });
 });

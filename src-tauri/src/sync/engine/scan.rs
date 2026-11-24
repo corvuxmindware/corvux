@@ -112,6 +112,10 @@ impl SyncEngine {
                     },
                     Err(_) => continue,
                 };
+                // Read under the note lock: the file is on disk right now. This
+                // is the "known to have been on disk" evidence a later overflow
+                // reconcile requires before it may tombstone the note.
+                self.inner.disk_seen.mark(&note);
                 let transaction = {
                     let note = note.clone();
                     super::util::store_task(self.inner.doc_store.clone(), _note_guard.clone(), move |store| {
@@ -255,106 +259,121 @@ impl SyncEngine {
 
         let mut restored = 0usize;
         for note in paths {
-            // Serialize the missing-check → doc read → disk write against a
-            // concurrent adopt/local-save for this note, so we never render a
-            // stale doc over a file another path is actively writing. See
-            // `note_locks`.
-            let _note_guard = self.inner.note_locks.lock(&note).await;
-            let exists = match self.note_exists_on_disk(&note).await {
-                Ok(b) => b,
-                Err(e) => {
-                    warn!(note = %note, error = %e, "recover_missing_files: existence check failed — skipping");
-                    continue;
-                }
-            };
-            if exists {
-                continue;
+            if self.recover_missing_note(&note).await {
+                restored += 1;
             }
-
-            let (text, md_hash) = {
-                let store = store_arc.lock().await;
-                let doc = match store.load_or_create(&note) {
-                    Ok(d) => d,
-                    Err(e) => {
-                        warn!(note = %note, error = %e, "recover_missing_files: load_or_create failed — skipping");
-                        continue;
-                    }
-                };
-                // CRITICAL: a tombstone is "missing from disk" by definition
-                // (the file was trashed on delete). Recovering it would
-                // resurrect every deleted note on the next pass. Skip
-                // deleted docs — the file is supposed to be gone.
-                match doc.is_deleted() {
-                    Ok(true) => continue,
-                    Ok(false) => {}
-                    Err(e) => {
-                        warn!(note = %note, error = %e, "recover_missing_files: is_deleted check failed — skipping");
-                        continue;
-                    }
-                }
-                let text = match doc.render() {
-                    Ok(t) => t,
-                    Err(e) => {
-                        warn!(note = %note, error = %e, "recover_missing_files: render failed — skipping");
-                        continue;
-                    }
-                };
-                let md_hash = match doc.md_hash() {
-                    Ok(h) => h,
-                    Err(e) => {
-                        warn!(note = %note, error = %e, "recover_missing_files: md_hash failed — skipping");
-                        continue;
-                    }
-                };
-                (text, md_hash)
-            };
-            if text.is_empty() {
-                // A doc that renders empty is EITHER a legitimately empty note
-                // (the user cleared it) OR a divergent/corrupt CRDT object
-                // whose real text is trapped in a *losing* Automerge text
-                // object and is invisible to `render()` — the dual-text-object
-                // artifact that also makes such notes uneditable. Tell them
-                // apart by md_hash: an intentionally-empty note hashes the
-                // empty string.
-                //
-                // - Legit empty  → recover it (restoring the file is correct).
-                // - Divergent    → writing an empty file would cement the data
-                //   loss, so refuse AND surface it loudly instead of the
-                //   previous silent `continue` that dropped notes without a
-                //   trace.
-                if md_hash != crate::sync::crdt::sha256_text("") {
-                    warn!(
-                        note = %note,
-                        "recover_missing_files: doc renders EMPTY but md_hash says it holds content — likely a divergent CRDT object (dual text object). NOT writing an empty file over it; note left in the docstore for inspection/repair."
-                    );
-                    continue;
-                }
-                info!(note = %note, "recover_missing_files: restoring legitimately-empty note to disk");
-            }
-
-            // CREATE-ONLY. "Missing" came from an existence probe that can be
-            // wrong (on Android a swallowed provider failure used to read as
-            // "absent"); overwriting then replaced a real note — and any edit
-            // made in another app, which never reaches this stored copy — with
-            // the stale CRDT render. If anything is there now, leave it.
-            match self.create_recovered_note(&note, &text).await {
-                Ok(RecoverOutcome::Created) => {}
-                Ok(RecoverOutcome::AlreadyThere) => {
-                    info!(note = %note, "recover_missing_files: a file is there after all (the existence probe was wrong, or it reappeared) — not overwriting");
-                    continue;
-                }
-                Ok(RecoverOutcome::Skipped) => continue,
-                Err(e) => {
-                    warn!(note = %note, error = %e, "recover_missing_files: write failed — skipping");
-                    continue;
-                }
-            }
-            restored += 1;
-            let _ = self.inner.events.send(SyncEvent::NoteWritten {
-                path: note.0.clone(),
-            });
         }
         Ok(restored)
+    }
+
+    /// The per-note body of [`Self::recover_missing_files`]: if `note` is a live
+    /// DocStore entry whose file is missing, CREATE it from the stored copy.
+    /// Returns `true` only when a file was actually created.
+    ///
+    /// Also the restore half of the watcher-overflow policy: a missing note with
+    /// no evidence it was ever on disk (`DiskSeen`) is restored here instead of
+    /// being tombstoned, exactly as startup recovery treats it. Takes the note's
+    /// lock itself — callers must not hold it.
+    pub(super) async fn recover_missing_note(&self, note: &NotePath) -> bool {
+        let store_arc = self.inner.doc_store.clone();
+        // Serialize the missing-check → doc read → disk write against a
+        // concurrent adopt/local-save for this note, so we never render a
+        // stale doc over a file another path is actively writing. See
+        // `note_locks`.
+        let _note_guard = self.inner.note_locks.lock(note).await;
+        let exists = match self.note_exists_on_disk(note).await {
+            Ok(b) => b,
+            Err(e) => {
+                warn!(note = %note, error = %e, "recover_missing_files: existence check failed — skipping");
+                return false;
+            }
+        };
+        if exists {
+            return false;
+        }
+
+        let (text, md_hash) = {
+            let store = store_arc.lock().await;
+            let doc = match store.load_or_create(note) {
+                Ok(d) => d,
+                Err(e) => {
+                    warn!(note = %note, error = %e, "recover_missing_files: load_or_create failed — skipping");
+                    return false;
+                }
+            };
+            // CRITICAL: a tombstone is "missing from disk" by definition
+            // (the file was trashed on delete). Recovering it would
+            // resurrect every deleted note on the next pass. Skip
+            // deleted docs — the file is supposed to be gone.
+            match doc.is_deleted() {
+                Ok(true) => return false,
+                Ok(false) => {}
+                Err(e) => {
+                    warn!(note = %note, error = %e, "recover_missing_files: is_deleted check failed — skipping");
+                    return false;
+                }
+            }
+            let text = match doc.render() {
+                Ok(t) => t,
+                Err(e) => {
+                    warn!(note = %note, error = %e, "recover_missing_files: render failed — skipping");
+                    return false;
+                }
+            };
+            let md_hash = match doc.md_hash() {
+                Ok(h) => h,
+                Err(e) => {
+                    warn!(note = %note, error = %e, "recover_missing_files: md_hash failed — skipping");
+                    return false;
+                }
+            };
+            (text, md_hash)
+        };
+        if text.is_empty() {
+            // A doc that renders empty is EITHER a legitimately empty note
+            // (the user cleared it) OR a divergent/corrupt CRDT object
+            // whose real text is trapped in a *losing* Automerge text
+            // object and is invisible to `render()` — the dual-text-object
+            // artifact that also makes such notes uneditable. Tell them
+            // apart by md_hash: an intentionally-empty note hashes the
+            // empty string.
+            //
+            // - Legit empty  → recover it (restoring the file is correct).
+            // - Divergent    → writing an empty file would cement the data
+            //   loss, so refuse AND surface it loudly instead of the
+            //   previous silent `continue` that dropped notes without a
+            //   trace.
+            if md_hash != crate::sync::crdt::sha256_text("") {
+                warn!(
+                    note = %note,
+                    "recover_missing_files: doc renders EMPTY but md_hash says it holds content — likely a divergent CRDT object (dual text object). NOT writing an empty file over it; note left in the docstore for inspection/repair."
+                );
+                return false;
+            }
+            info!(note = %note, "recover_missing_files: restoring legitimately-empty note to disk");
+        }
+
+        // CREATE-ONLY. "Missing" came from an existence probe that can be
+        // wrong (on Android a swallowed provider failure used to read as
+        // "absent"); overwriting then replaced a real note — and any edit
+        // made in another app, which never reaches this stored copy — with
+        // the stale CRDT render. If anything is there now, leave it.
+        match self.create_recovered_note(note, &text).await {
+            Ok(RecoverOutcome::Created) => {}
+            Ok(RecoverOutcome::AlreadyThere) => {
+                info!(note = %note, "recover_missing_files: a file is there after all (the existence probe was wrong, or it reappeared) — not overwriting");
+                return false;
+            }
+            Ok(RecoverOutcome::Skipped) => return false,
+            Err(e) => {
+                warn!(note = %note, error = %e, "recover_missing_files: write failed — skipping");
+                return false;
+            }
+        }
+        let _ = self.inner.events.send(SyncEvent::NoteWritten {
+            path: note.0.clone(),
+        });
+        true
     }
 
     /// Existence probe used by `recover_missing_files` and the watcher's
@@ -439,7 +458,11 @@ impl SyncEngine {
             fs.write_atomic(rel, text.as_bytes()).await
         };
         match written {
-            Ok(()) => Ok(RecoverOutcome::Created),
+            Ok(()) => {
+                // We just put the file there: later removal is a real delete.
+                self.inner.disk_seen.mark(note);
+                Ok(RecoverOutcome::Created)
+            }
             Err(crate::roostfs::RoostError::AlreadyExists(_)) if create_only => {
                 Ok(RecoverOutcome::AlreadyThere)
             }

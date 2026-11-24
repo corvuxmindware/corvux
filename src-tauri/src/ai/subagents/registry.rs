@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use std::sync::RwLock;
 
 use super::manifest::{parse_agent_md, read_and_parse, SubagentDef, SubagentParseError};
+use crate::ai::skills::roost_scan::{scan_native, ScanOutcome};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SubagentSource {
@@ -43,34 +44,18 @@ impl SubagentRegistry {
     /// Build (or rebuild) the in-memory map. Loads built-ins first,
     /// then global, then roost — later sources OVERRIDE earlier on name
     /// collision, which gives us roost > global > builtin.
+    ///
+    /// AT-5: the roost directory is read through the hardened roost filesystem
+    /// (`skills::roost_scan`), never with raw `std::fs`, so a link or junction
+    /// inside `<roost>/.corvux/agents` that points outside the roost is refused
+    /// instead of followed. Pass the directory in its roost shape
+    /// (`<roost>/.corvux/agents`, as `roost_agents_dir` builds it) so a link at
+    /// `.corvux` or `agents` itself is caught too.
     pub fn refresh(&self, roost_dir: Option<&Path>, global_dir: Option<&Path>) -> RefreshOutcome {
-        let mut outcome = RefreshOutcome::default();
-        let mut next: HashMap<String, SubagentEntry> = HashMap::new();
-
-        // 1) Built-ins
-        for def in super::builtin::builtins() {
-            outcome.loaded += 1;
-            next.insert(
-                def.name.clone(),
-                SubagentEntry {
-                    def,
-                    source: SubagentSource::Builtin,
-                },
-            );
-        }
-        // 2) Global
-        if let Some(dir) = global_dir {
-            collect_dir(dir, SubagentSource::Global, &mut next, &mut outcome);
-        }
-        // 3) Roost (highest precedence — last write wins)
-        if let Some(dir) = roost_dir {
-            collect_dir(dir, SubagentSource::Roost, &mut next, &mut outcome);
-        }
-
-        if let Ok(mut guard) = self.inner.write() {
-            *guard = next;
-        }
-        outcome
+        let scan = roost_dir
+            .map(|dir| scan_native(dir, "agents", "AGENT.md"))
+            .unwrap_or_default();
+        self.rebuild(scan, global_dir)
     }
 
     pub fn refresh_with_roost_contents(
@@ -78,6 +63,18 @@ impl SubagentRegistry {
         roost_manifests: Vec<(String, String)>,
         global_dir: Option<&Path>,
     ) -> RefreshOutcome {
+        self.rebuild(
+            ScanOutcome {
+                manifests: roost_manifests,
+                failed: Vec::new(),
+            },
+            global_dir,
+        )
+    }
+
+    /// The one place the map is rebuilt: built-ins, then the global folder (raw
+    /// read, see `collect_dir`), then the roost manifests (highest precedence).
+    fn rebuild(&self, roost: ScanOutcome, global_dir: Option<&Path>) -> RefreshOutcome {
         let mut outcome = RefreshOutcome::default();
         let mut next = HashMap::new();
         for def in super::builtin::builtins() {
@@ -93,7 +90,8 @@ impl SubagentRegistry {
         if let Some(dir) = global_dir {
             collect_dir(dir, SubagentSource::Global, &mut next, &mut outcome);
         }
-        for (rel, content) in roost_manifests {
+        outcome.failed.extend(roost.failed);
+        for (rel, content) in roost.manifests {
             let path = PathBuf::from(&rel);
             let Some(folder) = path
                 .parent()
@@ -162,6 +160,11 @@ impl SubagentRegistry {
     }
 }
 
+/// Scan the user's GLOBAL agents folder (`~/.corvux/agents`) with plain
+/// `std::fs`. Deliberately not the hardened path: the folder belongs to the user,
+/// not to a roost, so there is no boundary to stay inside, and people keep it
+/// under a dotfile manager (symlinks must keep working). Never call this for a
+/// roost directory — those go through `skills::roost_scan` (AT-5).
 fn collect_dir(
     dir: &Path,
     source: SubagentSource,
@@ -252,6 +255,46 @@ mod tests {
         let entry = reg.get("general").unwrap();
         assert_eq!(entry.source, SubagentSource::Roost);
         assert_eq!(entry.def.description, "ROOST general");
+    }
+
+    /// AT-5 twin of the skills test: an agent folder that is a link out of the
+    /// roost is refused (its body would otherwise become a subagent system
+    /// prompt). Runs on Windows (junction) as well as Unix (symlink).
+    #[test]
+    fn an_agent_folder_linked_out_of_the_roost_is_not_loaded() {
+        use crate::ai::skills::roost_scan::test_support::make_dir_link;
+        let roost = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let agents = roost_agents_dir(roost.path());
+        write_agent(&agents, "good", "an honest agent");
+        write_agent(outside.path(), "evil", "PRIVATE outside the roost");
+        make_dir_link(&agents.join("evil"), &outside.path().join("evil"));
+
+        let reg = SubagentRegistry::new();
+        let outcome = reg.refresh(Some(&agents), None);
+        assert!(reg.get("good").is_some());
+        assert!(
+            reg.get("evil").is_none(),
+            "a link out of the roost was followed"
+        );
+        assert_eq!(outcome.failed.len(), 1, "{:?}", outcome.failed);
+        assert!(outcome.failed[0].0.ends_with("evil"));
+        // Built-ins are unaffected by a hostile roost.
+        assert!(reg.get("general").is_some());
+    }
+
+    #[test]
+    fn a_dot_corvux_link_out_of_the_roost_loads_no_agents() {
+        use crate::ai::skills::roost_scan::test_support::make_dir_link;
+        let roost = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        write_agent(&outside.path().join("agents"), "evil", "PRIVATE");
+        make_dir_link(&roost.path().join(".corvux"), outside.path());
+
+        let reg = SubagentRegistry::new();
+        reg.refresh(Some(&roost_agents_dir(roost.path())), None);
+        assert!(reg.get("evil").is_none());
+        assert!(reg.get("general").is_some());
     }
 
     #[test]

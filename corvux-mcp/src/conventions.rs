@@ -681,6 +681,40 @@ pub fn is_hhmm(s: &str) -> bool {
     h < 24 && m < 60
 }
 
+/// Canonicalise a time typed by a user or model into the `HH:MM` the app's
+/// reminder scheduler reads: `H:MM` gains its leading zero (`9:30` → `09:30`),
+/// `HH:MM` passes through. Everything else (seconds, `T`, `pm`, Unicode digits,
+/// out-of-range values) is `None`, so the tool returns a clear error rather
+/// than writing a line the scheduler cannot arm (AT-9: that used to be a
+/// reminder that silently never fired).
+pub fn normalize_hhmm(s: &str) -> Option<String> {
+    let padded;
+    let candidate = if s.len() == 4 && s.as_bytes().get(1) == Some(&b':') {
+        padded = format!("0{s}");
+        padded.as_str()
+    } else {
+        s
+    };
+    is_hhmm(candidate).then(|| candidate.to_string())
+}
+
+/// `true` if `s` is a real calendar date written `YYYY-MM-DD` (`2026-02-30` and
+/// `2026-13-01` are not). [`is_iso_date`] only checks the shape, which is right
+/// for READING lines already in a note (the indexer decides what to do with
+/// them) but wrong for WRITING one: the app's scheduler drops a due date that
+/// is not a real day, so a reminder written for it would never fire (AT-9).
+pub fn is_calendar_date(s: &str) -> bool {
+    if !is_iso_date(s) {
+        return false;
+    }
+    // `is_iso_date` guarantees ASCII digits at fixed offsets.
+    let num = |r: std::ops::Range<usize>| s[r].parse::<u32>().ok();
+    match (num(0..4), num(5..7), num(8..10)) {
+        (Some(y), Some(m), Some(d)) => chrono::NaiveDate::from_ymd_opt(y as i32, m, d).is_some(),
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -967,6 +1001,53 @@ mod tests {
         assert!(!is_hhmm("24:00"));
         assert!(!is_hhmm("9:30"));
         assert!(!is_hhmm("09:60"));
+    }
+
+    /// AT-9 parity: the app's scheduler now arms `9:30`; the tools accept it
+    /// and write the canonical `09:30`. Shapes it cannot arm are refused with
+    /// an error, never written.
+    #[test]
+    fn normalize_hhmm_pads_single_digit_hours_and_rejects_the_rest() {
+        assert_eq!(normalize_hhmm("9:30").as_deref(), Some("09:30"));
+        assert_eq!(normalize_hhmm("09:30").as_deref(), Some("09:30"));
+        assert_eq!(normalize_hhmm("0:00").as_deref(), Some("00:00"));
+        assert_eq!(normalize_hhmm("23:59").as_deref(), Some("23:59"));
+        for bad in [
+            "",
+            "9",
+            "9:3",
+            "24:00",
+            "9:60",
+            "09:30:00",
+            "T09:30",
+            "9:30pm",
+            " 9:30",
+            "9:30 ",
+            "09.30",
+            "\u{ff19}:30",
+            "9:3\u{0660}",
+            "+9:30",
+            "-9:30",
+            "9::30",
+        ] {
+            assert_eq!(normalize_hhmm(bad), None, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn calendar_date_rejects_days_that_do_not_exist() {
+        assert!(is_calendar_date("2026-06-01"));
+        assert!(is_calendar_date("2028-02-29"), "leap day");
+        assert!(!is_calendar_date("2026-02-29"));
+        assert!(!is_calendar_date("2026-02-30"));
+        assert!(!is_calendar_date("2026-13-01"));
+        assert!(!is_calendar_date("2026-00-10"));
+        assert!(!is_calendar_date("2026-04-31"));
+        assert!(!is_calendar_date("2026-6-1"));
+        assert!(!is_calendar_date("2026-06-01T09:30"));
+        assert!(!is_calendar_date("２０２６-06-01"));
+        // The READ-side shape check is deliberately unchanged.
+        assert!(is_iso_date("2026-02-30"));
     }
 
     #[test]

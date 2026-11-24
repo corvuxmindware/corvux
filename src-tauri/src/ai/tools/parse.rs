@@ -55,7 +55,28 @@ fn strip_code_fence(s: &str) -> &str {
 /// the surrounding prose. Used when re-feeding model history into the LLM
 /// so the agent doesn't see its own tool-call markup as conversational
 /// content (it should see the parsed result instead).
+///
+/// Runs to a fixed point (AT-7): removing a block can splice its neighbours
+/// into a new one (`<tool_c<tool_call>x</tool_call>all>y</tool_call>`), so a
+/// single pass is not enough. Bounded; input still changing after the bound is
+/// adversarially nested and has its remaining markers defanged instead.
 pub fn strip_tool_call_blocks(text: &str) -> String {
+    const MAX_PASSES: usize = 16;
+    let mut cur = strip_tool_call_blocks_once(text);
+    for _ in 0..MAX_PASSES {
+        let next = strip_tool_call_blocks_once(&cur);
+        // A pass only ever removes bytes: equal length == nothing changed.
+        if next.len() == cur.len() {
+            return cur;
+        }
+        cur = next;
+    }
+    cur.replace("<tool_call>", "&lt;tool_call>")
+        .replace("</tool_call>", "&lt;/tool_call>")
+}
+
+/// One left-to-right pass of [`strip_tool_call_blocks`].
+fn strip_tool_call_blocks_once(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut cursor = 0;
     while let Some(start) = text[cursor..].find("<tool_call>") {
@@ -128,5 +149,35 @@ Some text
             strip_tool_call_blocks(text),
             "Hello <tool_call>oops never closed"
         );
+    }
+
+    /// AT-7: removing a block must not splice its neighbours into a new one.
+    #[test]
+    fn strip_blocks_reaches_a_fixed_point() {
+        // One pass turns this into `<tool_call>y</tool_call>`; the fixed point
+        // removes that too.
+        let text = "a<tool_c<tool_call>x</tool_call>all>y</tool_call>b";
+        let out = strip_tool_call_blocks(text);
+        assert_eq!(out, "ab");
+        assert!(!out.contains("tool_call"));
+    }
+
+    #[test]
+    fn strip_blocks_is_bounded_and_defangs_deep_nesting() {
+        // Each wrapper level re-forms one block when its inner block is
+        // removed, so 40 levels need 40 passes — more than the bound.
+        let mut text = "<tool_call>x</tool_call>".to_string();
+        for _ in 0..40 {
+            text = format!("<tool_c{text}all>x</tool_call>");
+        }
+        let out = strip_tool_call_blocks(&text);
+        assert!(!out.contains("<tool_call>"), "{out}");
+        assert!(!out.contains("</tool_call>"), "{out}");
+    }
+
+    #[test]
+    fn strip_blocks_leaves_clean_text_alone() {
+        let text = "no markup, <b>html</b>, and a < sign";
+        assert_eq!(strip_tool_call_blocks(text), text);
     }
 }

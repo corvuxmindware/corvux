@@ -1,4 +1,7 @@
+use std::collections::HashMap;
+
 use serde::Serialize;
+use unicode_normalization::{char::is_combining_mark, UnicodeNormalization};
 
 #[derive(Debug, Serialize, Clone, specta::Type)]
 pub struct InlineTag {
@@ -7,6 +10,127 @@ pub struct InlineTag {
     pub start: usize,
     #[specta(type = u32)]
     pub end: usize,
+}
+
+// ── Tag identity (LR-6 / LR-7) ───────────────────────────────────────────
+//
+// ONE rule for "what is a tag character" and "when are two tags the same
+// tag", shared by every parser/comparer in the app (inline body scan,
+// frontmatter scan, task-line scan, graph tag nodes, tag inventory, the agent
+// tag-guard) and mirrored verbatim by the standalone `corvux-mcp` crate
+// (`corvux-mcp/src/frontmatter.rs`, "tag identity" section). The two copies
+// are kept in lock-step by the shared fixture
+// `corvux-mcp/tests/fixtures/tag_identity.json`, asserted by a test on each
+// side.
+//
+// * Characters: Unicode letters, numbers and combining marks (Telugu/Hindi
+//   vowel signs and viramas are marks), plus `_`, `-` and `/` (nesting).
+//   Anything else — whitespace, punctuation (ASCII or CJK), emoji — ends the
+//   tag. Before LR-7 this was ASCII-only, so `#café` indexed as `caf` and
+//   `#日本語` was dropped.
+// * Identity: Unicode lowercase of the NFC form, applied at QUERY / GROUP
+//   time only. Stored `tags` rows stay VERBATIM (Locked Decision #12), so a
+//   graph.db written before this change folds to exactly the same keys as one
+//   written after it — no migration, no reindex, no mixed identities.
+
+/// May `c` appear inside a tag?
+pub fn is_tag_char(c: char) -> bool {
+    c.is_alphanumeric() || matches!(c, '_' | '-' | '/') || is_combining_mark(c)
+}
+
+/// Obsidian rule: a tag needs at least one non-numeric character, so `#1`,
+/// `#5`, `#2024` (list markers, issue refs) are not tags. Combining marks do
+/// not count as content (a keycap emoji `1\u{FE0F}\u{20E3}` is not a tag).
+/// Empty text is never a tag.
+pub fn is_valid_tag_text(tag: &str) -> bool {
+    tag.chars()
+        .any(|c| !c.is_numeric() && !is_combining_mark(c))
+}
+
+/// Tag identity key: Unicode lowercase of the NFC form. Two spellings are the
+/// same tag iff their keys are equal (`#ML` == `#ml`, NFC `café` == NFD
+/// `café`). The input is never stored in this form — only compared/grouped.
+pub fn fold_tag(tag: &str) -> String {
+    if tag.is_ascii() {
+        return tag.to_ascii_lowercase();
+    }
+    let nfc: String = tag.nfc().collect();
+    nfc.to_lowercase().nfc().collect()
+}
+
+/// The `candidates` that are NOT in `known`, compared by tag IDENTITY
+/// ([`fold_tag`]) — `known` holds stored (verbatim) spellings, so a roost with
+/// `#ml` knows `#ML`. The agent tag-guards (`roost_write`, `roost_edit`) use
+/// this instead of exact-string `contains`, which was the LR-6 gap.
+pub fn tags_not_in<'a>(
+    candidates: impl IntoIterator<Item = &'a str>,
+    known: &std::collections::HashSet<String>,
+) -> Vec<&'a str> {
+    let keys: std::collections::HashSet<String> = known.iter().map(|t| fold_tag(t)).collect();
+    candidates
+        .into_iter()
+        .filter(|t| !keys.contains(&fold_tag(t)))
+        .collect()
+}
+
+/// If the `#` at byte `hash` of `line` starts a tag, the byte offset just past
+/// the tag text (so the text is `line[hash + 1..end]`); otherwise `None`.
+///
+/// The `#` must open the line or follow whitespace (any Unicode whitespace —
+/// the editor's highlighter already agrees, and CJK text uses U+3000), and the
+/// scanned text must pass [`is_valid_tag_text`]. `hash` must index a `#` byte
+/// (so it is a char boundary). This is the single scanner behind both
+/// [`parse_tags`] and the task-line extractor in `parser::checkboxes`.
+pub(crate) fn scan_inline_tag(line: &str, hash: usize) -> Option<usize> {
+    let preceded_ok = hash == 0
+        || line[..hash]
+            .chars()
+            .next_back()
+            .is_some_and(char::is_whitespace);
+    if !preceded_ok {
+        return None;
+    }
+    let start = hash + 1;
+    let end = start
+        + line[start..]
+            .char_indices()
+            .find(|&(_, c)| !is_tag_char(c))
+            .map_or(line.len() - start, |(i, _)| i);
+    is_valid_tag_text(&line[start..end]).then_some(end)
+}
+
+/// Groups verbatim tag spellings under their [`fold_tag`] identity and picks
+/// one spelling to DISPLAY per identity (most-used wins; ties go to the
+/// byte-wise smallest, so the choice is deterministic). Used wherever the app
+/// folds stored rows for display: the tag inventory and the graph's tag nodes.
+#[derive(Debug, Default)]
+pub struct TagIdentities {
+    /// identity key → (verbatim spelling → weight)
+    by_key: HashMap<String, HashMap<String, usize>>,
+}
+
+impl TagIdentities {
+    /// Record `weight` uses of `spelling`; returns its identity key.
+    pub fn add(&mut self, spelling: &str, weight: usize) -> String {
+        let key = fold_tag(spelling);
+        *self
+            .by_key
+            .entry(key.clone())
+            .or_default()
+            .entry(spelling.to_string())
+            .or_default() += weight;
+        key
+    }
+
+    /// The spelling to show for `key` (`None` if the key was never added).
+    pub fn display(&self, key: &str) -> Option<&str> {
+        self.by_key.get(key).and_then(|spellings| {
+            spellings
+                .iter()
+                .max_by(|a, b| a.1.cmp(b.1).then_with(|| b.0.cmp(a.0)))
+                .map(|(s, _)| s.as_str())
+        })
+    }
 }
 
 /// Extract all tags from markdown content.
@@ -76,38 +200,21 @@ pub fn parse_tags(content: String) -> Vec<InlineTag> {
             }
 
             if line_bytes[i] == b'#' {
-                // Must be preceded by whitespace or start of line
-                let preceded_ok = i == 0 || line_bytes[i - 1].is_ascii_whitespace();
-                if !preceded_ok {
-                    i += 1;
-                    continue;
-                }
-
-                let tag_start = i;
-                i += 1; // skip the #
-
-                // Collect tag chars: alphanumeric, -, _, /
-                let mut tag_text = String::new();
-                while i < line_bytes.len() {
-                    let c = line_bytes[i];
-                    if c.is_ascii_alphanumeric() || c == b'-' || c == b'_' || c == b'/' {
-                        tag_text.push(c as char);
-                        i += 1;
-                    } else {
-                        break;
+                // `scan_inline_tag` owns the whole rule: the `#` must open the
+                // line or follow whitespace, tag characters are Unicode-aware
+                // (LR-7), and the Obsidian "at least one non-numeric char" rule
+                // keeps `#1`, `#5`, `#2024` (list markers / issue refs) out of
+                // the graph.
+                match scan_inline_tag(line, i) {
+                    Some(end) => {
+                        tags.push(InlineTag {
+                            tag: line[i + 1..end].to_string(),
+                            start: offset + i,
+                            end: offset + end,
+                        });
+                        i = end;
                     }
-                }
-
-                // Obsidian rule: tags must contain at least one non-numeric
-                // character. Without this check, `#1`, `#5`, `#2024` all become
-                // tags and pollute the graph — users commonly write `#1`, `#2`
-                // as list markers or issue references, not intended tags.
-                if !tag_text.is_empty() && tag_text.chars().any(|c| !c.is_ascii_digit()) {
-                    tags.push(InlineTag {
-                        tag: tag_text,
-                        start: offset + tag_start,
-                        end: offset + i,
-                    });
+                    None => i += 1,
                 }
             } else {
                 i += 1;
@@ -215,23 +322,20 @@ fn find_frontmatter_close(body: &str) -> Option<(usize, usize)> {
 }
 
 /// Strip quotes, validate, and append a frontmatter tag.
-/// Applies the same Obsidian rules as inline tags:
-///  - must contain at least one non-digit character
-///  - chars restricted to alphanumeric, `-`, `_`, `/`
+/// Applies the SAME rule as inline tags (`is_tag_char` / `is_valid_tag_text`):
+///  - must contain at least one non-numeric character
+///  - chars restricted to Unicode letters/numbers/marks, `-`, `_`, `/`
 fn push_tag(out: &mut Vec<InlineTag>, raw: &str) {
     let stripped = raw.trim().trim_matches(['"', '\'']).trim_start_matches('#'); // tolerate `- #tag` in YAML
     if stripped.is_empty() {
         return;
     }
     // Reject if any disallowed char.
-    if !stripped
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '/')
-    {
+    if !stripped.chars().all(is_tag_char) {
         return;
     }
     // Reject purely-numeric tags (matches Obsidian rule).
-    if !stripped.chars().any(|c| !c.is_ascii_digit()) {
+    if !is_valid_tag_text(stripped) {
         return;
     }
     // Frontmatter tags have no meaningful inline offset — report 0..0 so
@@ -356,5 +460,197 @@ mod tests {
         let tags = parse_tags("no frontmatter\n\nbut #a-body-tag".to_string());
         assert_eq!(tags.len(), 1);
         assert_eq!(tags[0].tag, "a-body-tag");
+    }
+
+    // ── LR-7: Unicode tag characters ─────────────────────────────────
+
+    fn names(content: &str) -> Vec<String> {
+        parse_tags(content.to_string())
+            .into_iter()
+            .map(|t| t.tag)
+            .collect()
+    }
+
+    #[test]
+    fn lr7_accented_tag_is_not_truncated() {
+        // Regression: the ASCII-only loop broke at `é` and still pushed the
+        // prefix, so `#café` was indexed as `caf`.
+        assert_eq!(names("Le #café ici"), vec!["café"]);
+    }
+
+    #[test]
+    fn lr7_non_latin_scripts_are_tags() {
+        // Regression: `#日本語` produced an empty prefix and was dropped.
+        assert_eq!(names("#日本語 と #タグ。"), vec!["日本語", "タグ"]);
+        // Telugu / Devanagari: vowel signs and viramas are combining MARKS,
+        // not letters — they must not end the tag.
+        assert_eq!(names("#ప్రాజెక్ట్ #తెలుగు"), vec!["ప్రాజెక్ట్", "తెలుగు"]);
+        assert_eq!(names("#हिंदी"), vec!["हिंदी"]);
+    }
+
+    #[test]
+    fn lr7_decomposed_accent_stays_one_tag() {
+        assert_eq!(names("#cafe\u{301} ok"), vec!["cafe\u{301}"]);
+    }
+
+    #[test]
+    fn lr7_offsets_are_byte_offsets_into_the_original() {
+        let content = "あ #café x";
+        let tags = parse_tags(content.to_string());
+        assert_eq!(tags.len(), 1);
+        assert_eq!(&content[tags[0].start..tags[0].end], "#café");
+    }
+
+    #[test]
+    fn lr7_emoji_and_trailing_punctuation_end_a_tag() {
+        assert_eq!(
+            names("ship #🚀 and #launch🚀 and #ok❤️"),
+            vec!["launch", "ok"]
+        );
+        assert_eq!(
+            names("#end. #comma, #bang! #q? #semi; #colon: #x) (#paren)"),
+            vec!["end", "comma", "bang", "q", "semi", "colon", "x"]
+        );
+    }
+
+    #[test]
+    fn lr7_numeric_rule_is_unicode_aware() {
+        // Arabic-Indic digits are numbers too: `#١٢٣` is not a tag, `#2nd` is.
+        assert_eq!(names("#١٢٣ #2024 #2nd"), vec!["2nd"]);
+        // A keycap emoji (digit + marks) must not smuggle a numeric tag in.
+        assert!(names("#1\u{FE0F}\u{20E3}").is_empty());
+    }
+
+    #[test]
+    fn lr7_url_fragments_and_headings_and_code_stay_excluded() {
+        assert_eq!(
+            names("see https://example.com/page#section and http://x.y/#top but #real"),
+            vec!["real"]
+        );
+        assert_eq!(names("# Titel\n\n## Über #notatag\n\n#café"), vec!["café"]);
+        assert_eq!(names("```\n#café\n```\n`#日本語` #タグ"), vec!["タグ"]);
+    }
+
+    #[test]
+    fn lr7_unicode_whitespace_may_precede_a_hash() {
+        // The editor's highlighter (`\s`) already treats these as boundaries;
+        // CJK text uses U+3000 between words.
+        assert_eq!(
+            names("nbsp\u{a0}#nbsp wide\u{3000}#wide"),
+            vec!["nbsp", "wide"]
+        );
+    }
+
+    #[test]
+    fn lr7_frontmatter_accepts_the_same_characters_as_inline() {
+        // Regression: `[café]` was rejected by the ASCII-only frontmatter
+        // check while the MCP accepted it — two answers for one note.
+        let content = "---\ntags: [café, 日本語, ML, 2024, two words]\n---\n\n#café";
+        assert_eq!(names(content), vec!["café", "日本語", "ML", "café"]);
+        let block = "---\ntags:\n  - Ünïcode\n  - \"#日本語\"\n---\n";
+        assert_eq!(names(block), vec!["Ünïcode", "日本語"]);
+        assert_eq!(
+            frontmatter_tag_names("---\ntags: [café, ML]\n---\nbody #inline"),
+            vec!["café", "ML"]
+        );
+    }
+
+    // ── LR-6: identity (case + normalization) ─────────────────────────
+
+    #[test]
+    fn lr6_fold_is_case_and_normalization_insensitive() {
+        assert_eq!(fold_tag("ML"), fold_tag("ml"));
+        assert_eq!(fold_tag("Project/Corvux"), "project/corvux");
+        assert_eq!(fold_tag("CAFÉ"), "café");
+        // NFD and NFC spellings of the same word are ONE tag.
+        assert_eq!(fold_tag("cafe\u{301}"), fold_tag("café"));
+        assert_eq!(fold_tag("CAFE\u{301}"), "café");
+        // Folding never merges genuinely different tags.
+        assert_ne!(fold_tag("ml"), fold_tag("ml2"));
+        assert_ne!(fold_tag("a/b"), fold_tag("a-b"));
+    }
+
+    #[test]
+    fn lr6_fold_is_idempotent() {
+        for s in [
+            "ML",
+            "CAFÉ",
+            "cafe\u{301}",
+            "İstanbul",
+            "ΣΑΣ",
+            "日本語",
+            "x/Y_z-9",
+        ] {
+            let once = fold_tag(s);
+            assert_eq!(fold_tag(&once), once, "fold must be idempotent for {s:?}");
+        }
+    }
+
+    #[test]
+    fn lr6_tags_not_in_compares_by_identity_not_exact_string() {
+        // The `roost_write` / `roost_edit` guards' core: stored spellings are
+        // verbatim (`ml`, `Café`), candidates may use any spelling.
+        let known: std::collections::HashSet<String> = ["ml", "Café", "project/corvux"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert!(tags_not_in(["ML", "café", "cafe\u{301}", "Project/Corvux"], &known).is_empty());
+        assert_eq!(
+            tags_not_in(["ML", "invented", "日本語"], &known),
+            vec!["invented", "日本語"]
+        );
+        // Identity is exact modulo case/NFC — a different tag is still unknown.
+        assert_eq!(tags_not_in(["ml2"], &known), vec!["ml2"]);
+    }
+
+    #[test]
+    fn lr6_display_picks_most_used_spelling_then_smallest() {
+        let mut ids = TagIdentities::default();
+        let k = ids.add("ML", 1);
+        assert_eq!(ids.add("ml", 3), k);
+        assert_eq!(ids.add("Ml", 1), k);
+        assert_eq!(k, "ml");
+        assert_eq!(ids.display("ml"), Some("ml"), "most-used spelling wins");
+        // Tie → byte-wise smallest, so the choice is deterministic.
+        let mut tie = TagIdentities::default();
+        tie.add("ml", 2);
+        tie.add("ML", 2);
+        assert_eq!(tie.display("ml"), Some("ML"));
+        assert_eq!(tie.display("absent"), None);
+    }
+
+    /// Shared contract — the SAME fixture is asserted against the standalone
+    /// MCP parser (`corvux-mcp/src/frontmatter.rs`) and the frontend
+    /// (`tests/unit/tags.test.ts`). If any of the three drifts, one fails.
+    #[test]
+    fn shared_tag_identity_fixture_matches() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("corvux-mcp")
+            .join("tests")
+            .join("fixtures")
+            .join("tag_identity.json");
+        let raw = std::fs::read_to_string(&path).expect("read tag_identity.json");
+        let fixture: serde_json::Value = serde_json::from_str(&raw).expect("parse fixture");
+
+        let parse_cases = fixture["parse"].as_array().expect("parse array");
+        assert!(parse_cases.len() >= 20, "fixture looks truncated");
+        for case in parse_cases {
+            let name = case["name"].as_str().unwrap();
+            let content = case["content"].as_str().unwrap();
+            let want: Vec<String> = case["tags"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|t| t.as_str().unwrap().to_string())
+                .collect();
+            assert_eq!(names(content), want, "parse case {name:?}");
+        }
+
+        for pair in fixture["fold"].as_array().expect("fold array") {
+            let input = pair[0].as_str().unwrap();
+            let key = pair[1].as_str().unwrap();
+            assert_eq!(fold_tag(input), key, "fold case {input:?}");
+        }
     }
 }

@@ -43,7 +43,7 @@ pub fn path_is_blocked(path: &str, patterns: &[String]) -> bool {
 /// * Unicode is NFC-folded (R7) — macOS APFS stores names decomposed (NFD)
 ///   while the user's pattern is almost certainly typed composed (NFC), and
 ///   both must match the same.
-fn normalize(s: &str) -> String {
+pub(super) fn normalize(s: &str) -> String {
     use unicode_normalization::UnicodeNormalization;
     s.nfc()
         .collect::<String>()

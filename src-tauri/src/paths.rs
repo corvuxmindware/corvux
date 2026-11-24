@@ -136,13 +136,22 @@ pub fn mobile_secret_store_dir() -> Result<PathBuf, String> {
 /// upgrade. If the id can't be resolved (read-only / offline / disconnected
 /// roost, or a SAF root we can't stat), we fall back to the legacy path hash —
 /// no worse than before.
+///
+/// **This CREATES state**: it writes `<roost>/.corvux/vault-id.bin` into the
+/// folder when it has no id yet, plus the index dir and its marker. Call it
+/// only for the roost the app has OPEN or is about to sync — i.e. behind the
+/// first-open gate or the installed-backend check (`init_graph`, `init_search`,
+/// `rebuild_database`, the tree cache of the open roost, `sync_init`). A caller
+/// that only needs to FIND an existing index (startup GC, deleting a roost's
+/// index) must use [`existing_index_dirs`] / [`live_index_dir_names`], which
+/// never write into a roost folder (RF-6).
 pub fn roost_db_dir(app: &AppHandle, roost_key: &str) -> Result<PathBuf, String> {
     let data = app
         .path()
         .app_data_dir()
         .map_err(|e| format!("app_data_dir: {e}"))?;
     let vaults = data.join("vaults");
-    let legacy_dir = vaults.join(format!("{:016x}", stable_hash(&normalize_key(roost_key))));
+    let legacy_dir = vaults.join(legacy_dir_name(roost_key));
 
     let dir = match stable_roost_dir_name(roost_key) {
         Some(name) => {
@@ -184,6 +193,69 @@ pub fn roost_db_dir(app: &AppHandle, roost_key: &str) -> Result<PathBuf, String>
 fn stable_roost_dir_name(roost_key: &str) -> Option<String> {
     let id = crate::sync::vault_id::ensure_vault_id_sync(Path::new(roost_key)).ok()?;
     Some(format!("id-{}", hex32(&id)))
+}
+
+/// READ-ONLY twin of [`stable_roost_dir_name`] (RF-6): the same name for a roost
+/// that already has an id, but it never creates, repairs or writes anything.
+/// `Ok(None)` = the folder has no usable id yet (so no id-keyed index dir can
+/// belong to it); `Err` = it could not be checked.
+fn existing_roost_dir_name(roost_key: &str) -> std::io::Result<Option<String>> {
+    Ok(
+        crate::sync::vault_id::lookup_vault_id_sync(Path::new(roost_key))?
+            .map(|id| format!("id-{}", hex32(&id))),
+    )
+}
+
+/// Legacy bare path-hash name of a roost's index dir (computable from the path
+/// alone, no id needed).
+fn legacy_dir_name(roost_key: &str) -> String {
+    format!("{:016x}", stable_hash(&normalize_key(roost_key)))
+}
+
+/// Every index dir this install currently holds for `roost_key` — the id-keyed
+/// one and the legacy path-hash one — under `<data>/vaults`. READ-ONLY (RF-6):
+/// unlike [`roost_db_dir`] it writes no `vault-id.bin` into the roost folder,
+/// creates nothing and migrates nothing, so it is the right call for "find this
+/// roost's index so it can be deleted". A dir that does not exist is simply
+/// absent from the result.
+pub(crate) fn existing_index_dirs(data: &Path, roost_key: &str) -> Vec<PathBuf> {
+    let vaults = data.join("vaults");
+    let mut names = Vec::with_capacity(2);
+    if let Ok(Some(id_name)) = existing_roost_dir_name(roost_key) {
+        names.push(id_name);
+    }
+    names.push(legacy_dir_name(roost_key));
+    names
+        .into_iter()
+        .map(|name| vaults.join(name))
+        .filter(|dir| dir.is_dir())
+        .collect()
+}
+
+/// Index-dir names GC must KEEP for the registered roost paths, and whether
+/// every roost's id could be checked (`id-` dirs are deletable only then).
+/// READ-ONLY (RF-6): the registered paths come from a manifest the webview can
+/// write, so GC must never write into them — it used to call
+/// `ensure_vault_id_sync` here and so planted `.corvux/vault-id.bin` in every
+/// folder the manifest named.
+fn live_index_dir_names(registered: &[String]) -> (HashSet<String>, bool) {
+    let mut live: HashSet<String> = HashSet::new();
+    let mut all_ids_resolved = true;
+    for path in registered {
+        live.insert(legacy_dir_name(path));
+        match existing_roost_dir_name(path) {
+            Ok(Some(name)) => {
+                live.insert(name);
+            }
+            // No id yet: no id-keyed dir can have been named after this folder,
+            // so there is nothing of its to keep and nothing is unattributable.
+            Ok(None) => {}
+            // Could not check (permission, expired grant, I/O error): id-dirs
+            // cannot be attributed this run, so none may be removed.
+            Err(_) => all_ids_resolved = false,
+        }
+    }
+    (live, all_ids_resolved)
 }
 
 /// Lowercase-hex encoding of a 16-byte roost id (32 chars).
@@ -325,14 +397,20 @@ pub(crate) fn manifest_paths(json: &str) -> Option<Vec<String>> {
 /// removed (see `is_orphaned_index_dir`); user content dirs and unknown dirs are
 /// left untouched. Best-effort: per-dir errors are logged, never fatal.
 pub fn gc_orphaned_index_dirs(app: &AppHandle) -> IndexGcReport {
+    match app.path().app_data_dir() {
+        Ok(data) => gc_orphaned_index_dirs_in(&data),
+        Err(e) => IndexGcReport {
+            skipped: Some(format!("app_data_dir unavailable: {e}")),
+            ..IndexGcReport::default()
+        },
+    }
+}
+
+/// [`gc_orphaned_index_dirs`] for an explicit app-data dir, so the whole sweep
+/// is testable on a tempdir. The manifest's paths are only READ (RF-6): nothing
+/// is ever written into a registered roost folder.
+fn gc_orphaned_index_dirs_in(data: &Path) -> IndexGcReport {
     let mut report = IndexGcReport::default();
-    let data = match app.path().app_data_dir() {
-        Ok(d) => d,
-        Err(e) => {
-            report.skipped = Some(format!("app_data_dir unavailable: {e}"));
-            return report;
-        }
-    };
 
     // Registered set from the manifest. Missing / unparseable / empty → skip.
     let manifest = data.join("roosts.json");
@@ -355,18 +433,8 @@ pub fn gc_orphaned_index_dirs(app: &AppHandle) -> IndexGcReport {
     };
 
     // Build the live set: every registered roost's legacy path-hash name
-    // (always computable) plus its stable id-dir name (when resolvable).
-    let mut live: HashSet<String> = HashSet::new();
-    let mut all_ids_resolved = true;
-    for path in &registered {
-        live.insert(format!("{:016x}", stable_hash(&normalize_key(path))));
-        match stable_roost_dir_name(path) {
-            Some(name) => {
-                live.insert(name);
-            }
-            None => all_ids_resolved = false,
-        }
-    }
+    // (always computable) plus its stable id-dir name (read-only lookup).
+    let (live, all_ids_resolved) = live_index_dir_names(&registered);
 
     let vaults = data.join("vaults");
     let read_dir = match std::fs::read_dir(&vaults) {
@@ -799,6 +867,138 @@ mod tests {
         // Non-array shapes → None (caller skips rather than assuming zero roosts).
         assert_eq!(manifest_paths("{}"), None);
         assert_eq!(manifest_paths("not json"), None);
+    }
+
+    // ── RF-6: GC and "find the index" never write into a roost folder ─────
+
+    fn marked_index_dir(vaults: &Path, name: &str) -> PathBuf {
+        let path = vaults.join(name);
+        std::fs::create_dir_all(&path).unwrap();
+        std::fs::write(path.join(INDEX_DIR_MARKER), b"marker").unwrap();
+        path
+    }
+
+    /// Everything inside `dir`, recursively, as relative paths — to prove a
+    /// folder was not touched at all.
+    fn tree_of(dir: &Path) -> Vec<String> {
+        fn walk(base: &Path, dir: &Path, out: &mut Vec<String>) {
+            for e in std::fs::read_dir(dir).unwrap().flatten() {
+                let p = e.path();
+                out.push(p.strip_prefix(base).unwrap().display().to_string());
+                if p.is_dir() {
+                    walk(base, &p, out);
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(dir, dir, &mut out);
+        out.sort();
+        out
+    }
+
+    /// The startup GC used to call the creating id resolver on every path the
+    /// (webview-writable) manifest lists. Prove it now leaves every listed
+    /// folder exactly as it found it, and still reclaims the real orphans.
+    #[test]
+    fn gc_never_writes_into_a_registered_roost_folder() {
+        let data = tempfile::tempdir().unwrap();
+        let vaults = data.path().join("vaults");
+
+        // Roost A was opened before: it already has an id (and an index dir).
+        let a = tempfile::tempdir().unwrap();
+        let a_key = a.path().display().to_string();
+        let a_id_dir = stable_roost_dir_name(&a_key).expect("a has an id");
+        let a_id_file = a.path().join(".corvux").join("vault-id.bin");
+        let a_id_before = std::fs::read(&a_id_file).unwrap();
+        // Roost B is a plain folder the manifest names; Corvux never opened it.
+        let b = tempfile::tempdir().unwrap();
+        std::fs::write(b.path().join("note.md"), "# mine").unwrap();
+        let b_before = tree_of(b.path());
+        // Roost C is a listed path that is not there (an unplugged drive).
+        let c_key = data.path().join("not-there").display().to_string();
+
+        let manifest: Vec<_> = [&a_key, &b.path().display().to_string(), &c_key]
+            .iter()
+            .map(|p| serde_json::json!({ "path": p }))
+            .collect();
+        std::fs::write(
+            data.path().join("roosts.json"),
+            serde_json::to_string(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        let live_dir = marked_index_dir(&vaults, &a_id_dir);
+        let orphan_id = marked_index_dir(&vaults, &format!("id-{}", "b".repeat(32)));
+        let orphan_legacy = marked_index_dir(&vaults, &"1".repeat(16));
+
+        let report = gc_orphaned_index_dirs_in(data.path());
+
+        assert!(report.skipped.is_none(), "{:?}", report.skipped);
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert!(live_dir.is_dir(), "A's live index is kept");
+        assert!(!orphan_id.exists(), "an orphan id dir is reclaimed");
+        assert!(!orphan_legacy.exists(), "an orphan legacy dir is reclaimed");
+        // The point of RF-6:
+        assert_eq!(
+            tree_of(b.path()),
+            b_before,
+            "B was not touched (no .corvux)"
+        );
+        assert!(!b.path().join(".corvux").exists());
+        assert_eq!(std::fs::read(&a_id_file).unwrap(), a_id_before);
+        assert!(!data.path().join("not-there").exists());
+    }
+
+    #[test]
+    fn live_names_come_from_a_read_only_lookup_and_match_the_creating_name() {
+        // A roost with an id: the read-only name equals what the creating
+        // resolver (used when the roost is opened) produces.
+        let opened = tempfile::tempdir().unwrap();
+        let opened_key = opened.path().display().to_string();
+        let created = stable_roost_dir_name(&opened_key).unwrap();
+        let (live, resolved) = live_index_dir_names(std::slice::from_ref(&opened_key));
+        assert!(resolved);
+        assert!(live.contains(&created), "{live:?}");
+        assert!(live.contains(&legacy_dir_name(&opened_key)));
+
+        // A roost with no id yet: only the legacy name is live and NOTHING is
+        // written — whereas the creating resolver, given the same folder,
+        // does write `.corvux/vault-id.bin` (the behaviour GC must not have).
+        let fresh = tempfile::tempdir().unwrap();
+        let fresh_key = fresh.path().display().to_string();
+        let (live, resolved) = live_index_dir_names(std::slice::from_ref(&fresh_key));
+        assert!(resolved);
+        assert_eq!(live.len(), 1);
+        assert!(!fresh.path().join(".corvux").exists(), "read-only");
+        let _ = stable_roost_dir_name(&fresh_key);
+        assert!(
+            fresh.path().join(".corvux").join("vault-id.bin").exists(),
+            "contrast: the creating resolver writes the id"
+        );
+    }
+
+    #[test]
+    fn existing_index_dirs_finds_both_names_and_creates_nothing() {
+        let data = tempfile::tempdir().unwrap();
+        let vaults = data.path().join("vaults");
+        let roost = tempfile::tempdir().unwrap();
+        let key = roost.path().display().to_string();
+        let id_name = stable_roost_dir_name(&key).unwrap();
+        let id_dir = marked_index_dir(&vaults, &id_name);
+        let legacy_dir = marked_index_dir(&vaults, &legacy_dir_name(&key));
+        // A neighbour's index must not be returned.
+        let other = marked_index_dir(&vaults, &"2".repeat(16));
+
+        let found = existing_index_dirs(data.path(), &key);
+        assert_eq!(found, vec![id_dir.clone(), legacy_dir.clone()]);
+        assert!(!found.contains(&other));
+
+        // Nothing there yet → empty, and no folder or id is created.
+        let fresh = tempfile::tempdir().unwrap();
+        let none = existing_index_dirs(data.path(), &fresh.path().display().to_string());
+        assert!(none.is_empty(), "{none:?}");
+        assert!(!fresh.path().join(".corvux").exists());
+        assert!(!data.path().join("vaults").join("id-").exists());
     }
 
     // ── AUDIT-043 migration tests ─────────────────────────────────

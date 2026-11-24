@@ -882,7 +882,11 @@ fn purge_from_graph(abs_path: &str, db_state: &State<'_, super::graph::GraphDb>)
             Err(_) => return,
         };
         let note_id = crate::db::queries::note_id_from_abs_path(abs_path, &roost_root);
-        if let Err(errs) = crate::db::queries::purge_note(db, &note_id) {
+        // DB-3: `purge_note_cached` drops the cached resolver + stats snapshot
+        // WHILE the db lock is held (a save sneaking in between purge and a
+        // post-unlock invalidation would patch a snapshot that still counts the
+        // purged note).
+        if let Err(errs) = db_state.purge_note_cached(db, &note_id) {
             // AUDIT-069: log every per-relation failure individually so
             // an orphaned chunks row vs an orphaned links row are
             // distinguishable in tracing — both leak DB rows but they

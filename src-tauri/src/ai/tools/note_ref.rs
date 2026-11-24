@@ -473,7 +473,15 @@ pub fn display_path(input: &str, roost: &str) -> String {
 /// ASCII-case-insensitive on the prefix (Windows drive casing) and matches
 /// both `\` and `/` forms. Non-path content is preserved (aside from
 /// backslashes becoming forward slashes, which is the friendlier form anyway).
+///
+/// Runs to a fixed point (AT-7 class): deleting one root occurrence can splice
+/// the text around it into a NEW root (`C:/Users/me/RooC:/Users/me/Roost/st`
+/// is `C:/Users/me/Roost` once the inner one is gone), so a single pass can
+/// hand the cloud model exactly the path it was meant to hide. Bounded; a
+/// message still changing after the bound is adversarially nested and is
+/// withheld outright rather than risk a leak.
 pub fn scrub_roost_paths(message: &str, roost: Option<&str>) -> String {
+    const MAX_PASSES: usize = 8;
     let Some(roost) = roost else {
         return message.to_string();
     };
@@ -481,6 +489,21 @@ pub fn scrub_roost_paths(message: &str, roost: Option<&str>) -> String {
     if root.is_empty() {
         return message.to_string();
     }
+    let mut cur = scrub_roost_paths_once(message, &root);
+    for _ in 0..MAX_PASSES {
+        let next = scrub_roost_paths_once(&cur, &root);
+        // A pass only removes bytes: equal length == nothing left to scrub.
+        if next.len() == cur.len() {
+            return cur;
+        }
+        cur = next;
+    }
+    "[error text withheld: it embeds the roost path repeatedly]".to_string()
+}
+
+/// One left-to-right pass of [`scrub_roost_paths`]. `root` is already
+/// normalized (forward slashes, no `\\?\`).
+fn scrub_roost_paths_once(message: &str, root: &str) -> String {
     let normalized = message.replace('\\', "/");
     let root_bytes = root.as_bytes();
     let nb = normalized.as_bytes();
@@ -722,6 +745,39 @@ mod path_scrub_tests {
             "plain message"
         );
         assert_eq!(scrub_roost_paths("anything", None), "anything");
+    }
+
+    /// AT-7 class: deleting the inner root splices the text around it into a
+    /// NEW root. One pass would hand the cloud model the path it was meant to
+    /// hide; the fixed point removes it too.
+    #[test]
+    fn spliced_root_is_scrubbed_to_a_fixed_point() {
+        let roost = "C:/Users/alice/Roost";
+        let msg = "failed: C:/Users/alice/RooC:/Users/alice/Roost/st/notes/a.md";
+        let out = scrub_roost_paths(msg, Some(roost));
+        assert!(
+            !out.to_lowercase().contains("users/alice"),
+            "re-formed root leaked: {out}"
+        );
+        assert!(out.contains("notes/a.md"), "{out}");
+        // Backslash spelling and nested case-variants too.
+        let out = scrub_roost_paths(
+            r"x C:\Users\alice\RooC:\Users\alice\Roost\st\n.md",
+            Some(r"C:\Users\alice\Roost"),
+        );
+        assert!(!out.to_lowercase().contains("users/alice"), "{out}");
+    }
+
+    #[test]
+    fn deeply_nested_root_text_is_withheld_not_leaked() {
+        let roost = "C:/Users/alice/Roost";
+        // Each level re-forms the root once the level inside it is deleted.
+        let mut msg = "C:/Users/alice/Roost".to_string();
+        for _ in 0..30 {
+            msg = format!("C:/Users/alice/Roo{msg}st");
+        }
+        let out = scrub_roost_paths(&msg, Some(roost));
+        assert!(!out.to_lowercase().contains("users/alice"), "{out}");
     }
 }
 

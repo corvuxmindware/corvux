@@ -8,6 +8,7 @@
 
 import * as d3 from "d3";
 import { parseNote } from "../../lib/frontmatter";
+import { extractInlineTags, foldTag } from "../../lib/tags";
 
 /** A graph node as the simulation + renderer see it. */
 export interface GraphNode extends d3.SimulationNodeDatum {
@@ -274,25 +275,30 @@ export interface NotePreview {
  */
 export function noteHoverPreview(content: string, maxLines = 3): NotePreview {
   const { frontmatter, body } = parseNote(content);
-  const tags = new Set<string>();
+  // LR-6: tags are de-duplicated by IDENTITY (`foldTag`), so `#ML` and `#ml`
+  // show as one chip — the first spelling seen is the one displayed. (The
+  // graph's own tag nodes fold the same way, in the backend.)
+  const tags = new Map<string, string>();
+  const addTag = (raw: string) => {
+    const t = raw.trim().replace(/^#/, "");
+    if (!t) return;
+    const key = foldTag(t);
+    if (!tags.has(key)) tags.set(key, t);
+  };
 
   const ft = frontmatter?.tags;
   if (Array.isArray(ft)) {
     for (const t of ft) {
-      if (typeof t === "string" && t.trim()) tags.add(t.trim().replace(/^#/, ""));
+      if (typeof t === "string") addTag(t);
     }
   } else if (typeof ft === "string") {
-    for (const t of ft.split(/[,\s]+/)) {
-      if (t.trim()) tags.add(t.trim().replace(/^#/, ""));
-    }
+    for (const t of ft.split(/[,\s]+/)) addTag(t);
   }
 
-  // Inline #tags from the start of the body (bounded scan).
+  // Inline #tags from the start of the body (bounded scan). Unicode-aware
+  // (LR-7) and shared with the editor highlighter: see `lib/tags.ts`.
   const head = body.slice(0, 2000);
-  const inline = head.match(/(?:^|\s)#([A-Za-z0-9_][\w/-]*)/g);
-  if (inline) {
-    for (const m of inline) tags.add(m.trim().replace(/^#/, ""));
-  }
+  for (const t of extractInlineTags(head)) addTag(t);
 
   // Excerpt: first `maxLines` non-empty body lines that aren't headings or
   // horizontal rules; strip leading list/quote markers.
@@ -306,5 +312,5 @@ export function noteHoverPreview(content: string, maxLines = 3): NotePreview {
     if (lines.length >= maxLines) break;
   }
 
-  return { tags: [...tags].slice(0, 8), excerpt: lines.join(" ") };
+  return { tags: [...tags.values()].slice(0, 8), excerpt: lines.join(" ") };
 }

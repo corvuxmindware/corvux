@@ -596,12 +596,16 @@ fn query_pending_for_note(db: &DbInstance, note_id: &str) -> Result<Vec<PendingT
     params.insert("id".to_string(), DataValue::Str(note_id.to_string().into()));
     let script = r#"
         ?[note_id, source_line, text, due_at, note_title, note_path] :=
+            note_id = $id,
             *task{ note_id, source_line, text, due_at, completed },
             *notes{ id: note_id, title: note_title, path: note_path },
-            note_id == $id,
             !completed,
             due_at != ""
     "#;
+    // (`note_id = $id` FIRST so Cozo joins it into the `:task` key prefix —
+    // O(this note's tasks). The old trailing `note_id == $id` predicate was a
+    // filter over a FULL `:task` scan, run on every save via
+    // `reschedule_for_note`.)
     let result = db
         .run_script(script, params, ScriptMutability::Immutable)
         .map_err(|e| e.to_string())?;
@@ -666,7 +670,7 @@ enum EnrollPlan {
 
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 fn plan_enroll(task: PendingTask, now: SystemTime) -> EnrollPlan {
-    let Some(deadline) = parse_local_due_to_system_time(&task.due_at) else {
+    let Some(deadline) = parse_task_due(&task) else {
         return EnrollPlan::Invalid;
     };
     // NEW-T1: any future deadline enrolls, no matter how far out. The old code
@@ -920,7 +924,7 @@ fn local_wall_clock_as_utc(secs: i64, local_offset_secs: i32) -> Option<time::Of
 #[cfg(any(target_os = "android", target_os = "ios"))]
 fn enroll_timer(state: &mut SchedulerState, task: PendingTask) -> Option<EntryHandle> {
     let app = state.app_handle.clone()?;
-    let deadline = parse_local_due_to_system_time(&task.due_at)?;
+    let deadline = parse_task_due(&task)?;
     let now = SystemTime::now();
     let secs = deadline.duration_since(UNIX_EPOCH).ok()?.as_secs() as i64;
     let now_secs = now.duration_since(UNIX_EPOCH).ok()?.as_secs() as i64;
@@ -1095,48 +1099,106 @@ fn task_notification_id(note_id: &str, source_line: i32) -> i32 {
 /// place of this constant.
 const DATE_ONLY_DEFAULT_HHMM: (u32, u32) = (9, 0);
 
-/// Parse `YYYY-MM-DD[ HH:MM]` interpreted as local wall-clock and convert to a
-/// `SystemTime`. A date-only string is armed at [`DATE_ONLY_DEFAULT_HHMM`]
-/// (TRN-1); DST seams are handled rather than dropped (TRN-2). Returns `None`
-/// only for a missing/unparseable date.
-fn parse_local_due_to_system_time(due_at: &str) -> Option<SystemTime> {
-    let s = due_at.trim();
-    // Note metadata and existing indexed values are untrusted. Validate the
-    // complete ASCII shape before using byte offsets: a multibyte character
-    // crossing one of these offsets would otherwise abort release builds.
-    if !matches!(s.len(), 10 | 16)
-        || !s.is_ascii()
-        || s.as_bytes().iter().enumerate().any(|(i, byte)| match i {
-            4 | 7 => *byte != b'-',
-            10 => *byte != b' ',
-            13 => *byte != b':',
-            _ => !byte.is_ascii_digit(),
-        })
-    {
+/// Strictly parse the shape `YYYY-MM-DD` optionally followed by a separator
+/// (one space, or `T`) and a time `H:MM`, `HH:MM`, `H:MM:SS` or `HH:MM:SS`,
+/// returning `(year, month, day, hour, minute, second)` UNVALIDATED for range
+/// (chrono rejects month 13, hour 25, Feb 30 afterwards). Every character is
+/// checked as an ASCII digit / fixed delimiter: note metadata is untrusted, and
+/// `char::is_numeric` / `str::parse` would accept Unicode digits, a leading `+`
+/// and the like — and a multibyte character crossing a byte offset would abort a
+/// release build (hence the `is_ascii` gate before any slicing).
+///
+/// AT-9: the first strict version accepted only `HH:MM` after a space, so the
+/// valid, common spellings `⏰ 9:30`, `09:30:00` and `2026-07-04T09:30` reached
+/// the database and then silently never armed. They are accepted here.
+fn parse_due_parts(s: &str) -> Option<(i32, u32, u32, u32, u32, u32)> {
+    if !s.is_ascii() || s.len() < 10 {
         return None;
     }
-    let date = &s[..10];
-    let mut date_parts = date.split('-');
-    let y: i32 = date_parts.next()?.parse().ok()?;
-    let m: u32 = date_parts.next()?.parse().ok()?;
-    let d: u32 = date_parts.next()?.parse().ok()?;
-
-    // Use the note's time-of-day when present ("YYYY-MM-DD HH:MM"), else the
-    // date-only default (TRN-1) so a dated task still fires.
-    let (hh, mm) = if s.len() == 16 {
-        let mut time_parts = s[11..16].split(':');
-        let hh: u32 = time_parts.next()?.parse().ok()?;
-        let mm: u32 = time_parts.next()?.parse().ok()?;
-        (hh, mm)
-    } else {
-        DATE_ONLY_DEFAULT_HHMM
+    let b = s.as_bytes();
+    // `YYYY-MM-DD` — digits only where digits belong.
+    let num = |part: &[u8]| -> Option<u32> {
+        if part.is_empty() || part.len() > 4 || !part.iter().all(u8::is_ascii_digit) {
+            return None;
+        }
+        Some(part.iter().fold(0u32, |n, d| n * 10 + u32::from(d - b'0')))
     };
+    if b[4] != b'-' || b[7] != b'-' {
+        return None;
+    }
+    let y = num(&b[0..4])?;
+    let m = num(&b[5..7])?;
+    let d = num(&b[8..10])?;
+    if b.len() == 10 {
+        let (hh, mm) = DATE_ONLY_DEFAULT_HHMM;
+        return Some((y as i32, m, d, hh, mm, 0));
+    }
+    if !matches!(b[10], b' ' | b'T') {
+        return None;
+    }
+    // `H:MM[:SS]` / `HH:MM[:SS]`.
+    let time = &b[11..];
+    let hour_len = time.iter().position(|&c| c == b':')?;
+    if !(1..=2).contains(&hour_len) {
+        return None;
+    }
+    let hh = num(&time[..hour_len])?;
+    let rest = &time[hour_len + 1..];
+    let (mm, ss) = match rest.len() {
+        2 => (num(rest)?, 0),
+        5 if rest[2] == b':' => (num(&rest[..2])?, num(&rest[3..])?),
+        _ => return None,
+    };
+    Some((y as i32, m, d, hh, mm, ss))
+}
+
+/// A digits-and-delimiters outline of `due_at` for logs (`9999-99-99 9:99`):
+/// every ASCII digit becomes `9`, every other ASCII letter `a`, anything else
+/// `?`, capped at 24 chars. Enough to see WHY a value did not parse without
+/// writing note text into the log.
+fn due_shape(due_at: &str) -> String {
+    due_at
+        .trim()
+        .chars()
+        .take(24)
+        .map(|c| match c {
+            '0'..='9' => '9',
+            'a'..='z' | 'A'..='Z' => 'a',
+            '-' | ':' | ' ' => c,
+            _ => '?',
+        })
+        .collect()
+}
+
+/// Resolve a pending task's `due_at` to an instant, and say so LOUDLY when it
+/// cannot: an unparseable due time means a reminder that will never fire, which
+/// must not be silent (AT-9). Used by both the desktop and the mobile enroll
+/// path. Logs only ids and the digit-shape of the value, never note text.
+fn parse_task_due(task: &PendingTask) -> Option<SystemTime> {
+    let parsed = parse_local_due_to_system_time(&task.due_at);
+    if parsed.is_none() {
+        tracing::warn!(
+            note_id = %task.note_id,
+            source_line = task.source_line,
+            due_shape = %due_shape(&task.due_at),
+            "task_notify: due time not understood — this reminder will not fire"
+        );
+    }
+    parsed
+}
+
+/// Parse `YYYY-MM-DD[( |T)H[H]:MM[:SS]]` interpreted as local wall-clock and
+/// convert to a `SystemTime`. A date-only string is armed at
+/// [`DATE_ONLY_DEFAULT_HHMM`] (TRN-1); DST seams are handled rather than
+/// dropped (TRN-2). Returns `None` only for a missing/unparseable value.
+fn parse_local_due_to_system_time(due_at: &str) -> Option<SystemTime> {
+    let (y, m, d, hh, mm, ss) = parse_due_parts(due_at.trim())?;
 
     use chrono::{
         Duration as ChronoDuration, Local, LocalResult, NaiveDate, NaiveDateTime, TimeZone,
     };
     let date = NaiveDate::from_ymd_opt(y, m, d)?;
-    let naive = NaiveDateTime::new(date, chrono::NaiveTime::from_hms_opt(hh, mm, 0)?);
+    let naive = NaiveDateTime::new(date, chrono::NaiveTime::from_hms_opt(hh, mm, ss)?);
     // TRN-2: resolve the wall-clock time to a UTC instant, handling DST seams
     // instead of silently dropping the task (the old `.single()?` returned
     // `None` for a spring-forward-gap time → the reminder never armed):
@@ -1260,19 +1322,101 @@ mod tests {
         for due_at in [
             "2030-5-008",
             "2030/05/08",
-            "2030-05-08T10:00",
-            "2030-05-08 1:00",
             "2030-05-08 10:00junk",
-            "2030-05-08 10:00:00",
             "2030-05-08 25:00",
+            "2030-05-08 10:60",
+            "2030-05-08 10:00:60",
             "2030-02-30",
             "2030-05-08garbage",
+            // Strictness that survived AT-9: exact delimiters and digit counts.
+            "2030-05-08  10:00",
+            "2030-05-08t10:00",
+            "2030-05-08 100:00",
+            "2030-05-08 :30",
+            "2030-05-08 10",
+            "2030-05-08 10:5",
+            "2030-05-08 10:00:5",
+            "2030-05-08 10:00:00:00",
+            "2030-05-08 10:00Z",
+            "2030-05-08 +9:30",
+            "2030-05-08 -9:30",
+            "+030-05-08",
+            "2030-05-08\n10:00",
+            "2030-05-08\t10:00",
         ] {
             assert!(
                 parse_local_due_to_system_time(due_at).is_none(),
                 "{due_at:?}"
             );
         }
+    }
+
+    /// AT-9: the strict parser had started rejecting valid reminder spellings,
+    /// which reached the database and then silently never armed.
+    #[test]
+    fn accepts_seconds_t_separator_and_single_digit_hours() {
+        let canonical = parse_local_due_to_system_time("2030-05-08 09:30").unwrap();
+        for due_at in [
+            "2030-05-08 9:30",
+            "2030-05-08T09:30",
+            "2030-05-08T9:30",
+            "2030-05-08 09:30:00",
+            "2030-05-08 9:30:00",
+            "2030-05-08T09:30:00",
+            " 2030-05-08T9:30:00 ",
+        ] {
+            assert_eq!(
+                parse_local_due_to_system_time(due_at),
+                Some(canonical),
+                "{due_at:?} must arm at 09:30"
+            );
+        }
+        // Seconds are honoured, not dropped.
+        let with_secs = parse_local_due_to_system_time("2030-05-08 09:30:45").unwrap();
+        assert_eq!(
+            with_secs.duration_since(canonical).unwrap(),
+            Duration::from_secs(45)
+        );
+        // Every valid hour 0..=23 in both digit counts parses (DST seams are
+        // handled, never `None`).
+        for h in 0..24 {
+            assert!(parse_local_due_to_system_time(&format!("2030-05-08 {h}:05")).is_some());
+            assert!(parse_local_due_to_system_time(&format!("2030-05-08T{h:02}:05")).is_some());
+        }
+    }
+
+    /// The injection / Unicode-digit rejections hold for the new forms too:
+    /// every character is an ASCII digit or a fixed delimiter.
+    #[test]
+    fn new_forms_still_reject_unicode_digits_and_injection() {
+        for due_at in [
+            "2030-05-08T\u{ff10}9:30",     // fullwidth zero
+            "2030-05-08 9:3\u{0660}",      // Arabic-indic zero
+            "2030-05-08 09:30:\u{0663}0",  // Arabic-indic three
+            "2030-05-08T09:30:00\u{200b}", // zero-width space
+            "2030-05-08T09:30\u{e9}",      // multibyte after a valid prefix
+            "2030-05-08 9:30; DROP TABLE",
+            "2030-05-08T09:30:00+05:30",
+            "2030-05-08 9:30\0",
+            "2030-05-08 9:3\u{fe0f}",
+        ] {
+            assert!(
+                parse_local_due_to_system_time(due_at).is_none(),
+                "{due_at:?}"
+            );
+        }
+    }
+
+    /// An unparseable value is logged by shape only: no note text, no digits.
+    #[test]
+    fn due_shape_never_echoes_note_text() {
+        assert_eq!(due_shape("2030-05-08 9:30"), "9999-99-99 9:99");
+        assert_eq!(due_shape("tomorrow-ish"), "aaaaaaaa-aaa");
+        assert_eq!(due_shape("日本語 \u{200b}x"), "??? ?a");
+        assert_eq!(due_shape(&"1".repeat(100)).len(), 24);
+        assert!(due_shape("sk-secret-token")
+            .chars()
+            .all(|c| matches!(c, 'a' | '-')));
     }
 
     #[test]

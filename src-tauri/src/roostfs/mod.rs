@@ -56,10 +56,24 @@ pub enum RoostError {
     NotEmpty(String),
     #[error("path traversal blocked: {0}")]
     OutsideRoost(String),
+    /// A name this system cannot use as a file or folder name (on Windows: a
+    /// reserved character, a trailing dot or space, a device name such as
+    /// `CON`). Not an escape attempt, so it must not read as one.
+    #[error("not a valid file or folder name on this system: {0}")]
+    InvalidName(String),
     #[error("permission denied: {0}")]
     PermissionDenied(String),
     #[error("{0}")]
     Io(String),
+}
+
+impl RoostError {
+    /// The path was refused BEFORE touching anything (it escapes the roost, or
+    /// it is not a usable name here). Probes answer "absent" for these rather
+    /// than an error, and a recursive listing skips just that entry.
+    pub(crate) fn is_path_refusal(&self) -> bool {
+        matches!(self, Self::OutsideRoost(_) | Self::InvalidName(_))
+    }
 }
 
 impl From<std::io::Error> for RoostError {
@@ -159,11 +173,31 @@ async fn list_recursive_via_list<T: RoostFs + Sync + ?Sized>(
 ) -> Result<(), RoostError> {
     let entries = fs.list(rel_dir).await?;
     for entry in entries {
-        let is_dir = entry.is_dir;
+        if !entry.is_dir {
+            out.push(entry);
+            continue;
+        }
         let rel_path = entry.rel_path.clone();
+        // RF-7: one folder this system refuses (a Windows-hostile name, a
+        // symlink that leaves the roost) must not abort the listing for the
+        // whole roost. Skip THAT folder: it is neither listed nor followed, so
+        // the refusal still holds for the entry itself. The check only covers
+        // the `list` of this one folder; any other error (an unreadable
+        // folder, a provider failure) still fails the listing, because a
+        // partial listing that looks complete is worse than an error.
+        if let Err(refusal) = validate_rel(&rel_path) {
+            tracing::warn!(folder = %rel_path, error = %refusal, "roostfs: skipping a folder this system cannot use");
+            continue;
+        }
+        let kept = out.len();
         out.push(entry);
-        if is_dir {
-            Box::pin(list_recursive_via_list(fs, &rel_path, out)).await?;
+        match Box::pin(list_recursive_via_list(fs, &rel_path, out)).await {
+            Ok(()) => {}
+            Err(refusal) if refusal.is_path_refusal() => {
+                out.truncate(kept);
+                tracing::warn!(folder = %rel_path, error = %refusal, "roostfs: skipping a folder the roost does not allow");
+            }
+            Err(other) => return Err(other),
         }
     }
     Ok(())
@@ -229,8 +263,9 @@ pub(crate) fn is_incomplete_listing(message: &str) -> bool {
 ///   attached to a visible note;
 /// * a trailing `.` or space — Windows strips it, so `Journal./x.md` IS
 ///   `Journal\x.md` and would dodge any textual path rule;
-/// * DOS device names (`CON`, `NUL`, `COM1`, `LPT3`, …), with or without an
-///   extension — they open devices, not files;
+/// * DOS device names (`CON`, `NUL`, `COM1`, `LPT3`, the console handles
+///   `CONIN$` / `CONOUT$`, and the superscript forms `COM¹ COM² COM³ LPT¹ LPT²
+///   LPT³`), with or without an extension — they open devices, not files;
 /// * `< > " | ? *` — not valid in a Windows file name.
 #[cfg_attr(not(windows), allow(dead_code))]
 pub(crate) fn windows_hostile_segment(seg: &str) -> bool {
@@ -244,12 +279,28 @@ pub(crate) fn windows_hostile_segment(seg: &str) -> bool {
         return true;
     }
     let stem = seg.split('.').next().unwrap_or(seg).trim_end_matches(' ');
-    let up = stem.to_ascii_uppercase();
-    matches!(up.as_str(), "CON" | "PRN" | "AUX" | "NUL")
-        || ((up.starts_with("COM") || up.starts_with("LPT"))
-            && up.len() == 4
-            && up.as_bytes()[3].is_ascii_digit()
-            && up.as_bytes()[3] != b'0')
+    is_windows_device_name(stem)
+}
+
+/// `stem` (a name up to its first dot, trailing spaces removed) is a Windows
+/// device. `COM0` / `LPT0` stay ordinary names, as before.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn is_windows_device_name(stem: &str) -> bool {
+    let up = stem.to_ascii_uppercase(); // leaves the non-ASCII superscripts alone
+    if matches!(
+        up.as_str(),
+        "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$"
+    ) {
+        return true;
+    }
+    let Some(port) = up.strip_prefix("COM").or_else(|| up.strip_prefix("LPT")) else {
+        return false;
+    };
+    let mut chars = port.chars();
+    matches!(
+        (chars.next(), chars.next()),
+        (Some('1'..='9' | '\u{b9}' | '\u{b2}' | '\u{b3}'), None)
+    )
 }
 
 /// Validate a roost-relative path. Rejects `..`, absolute paths, Windows
@@ -285,8 +336,10 @@ pub(crate) fn validate_rel(rel: &str) -> Result<String, RoostError> {
         // Names Windows reinterprets (ADS, trailing dot/space, devices). Only
         // on Windows: on Linux/macOS/Android a `:` is a legal filename
         // character and users do title notes "Meeting: notes".
+        // A different error from the escapes above: this is a bad NAME, not an
+        // attempt to leave the roost, and the message must not claim otherwise.
         if cfg!(windows) && windows_hostile_segment(seg) {
-            return Err(RoostError::OutsideRoost(rel.to_string()));
+            return Err(RoostError::InvalidName(rel.to_string()));
         }
     }
 
@@ -364,6 +417,206 @@ mod incomplete_listing_tests {
     }
 }
 
+/// RF-7: what the default recursive listing does when ONE folder is refused.
+#[cfg(test)]
+mod list_recursive_refusal_tests {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+
+    use super::*;
+
+    /// How listing one directory ends.
+    enum Listing {
+        Entries(Vec<(&'static str, bool)>),
+        Outside,
+        Invalid,
+        Broken,
+    }
+
+    /// A tree scripted per directory; records every directory it was asked to list.
+    struct Scripted {
+        dirs: HashMap<&'static str, Listing>,
+        listed: Mutex<Vec<String>>,
+    }
+
+    fn rel(dir: &str, name: &str) -> String {
+        if dir.is_empty() {
+            name.to_string()
+        } else {
+            format!("{dir}/{name}")
+        }
+    }
+
+    #[async_trait]
+    impl RoostFs for Scripted {
+        async fn list(&self, rel_dir: &str) -> Result<Vec<Entry>, RoostError> {
+            self.listed.lock().unwrap().push(rel_dir.to_string());
+            match self.dirs.get(rel_dir) {
+                Some(Listing::Entries(rows)) => Ok(rows
+                    .iter()
+                    .map(|(name, is_dir)| Entry {
+                        name: name.to_string(),
+                        rel_path: rel(rel_dir, name),
+                        is_dir: *is_dir,
+                    })
+                    .collect()),
+                Some(Listing::Outside) => Err(RoostError::OutsideRoost(rel_dir.to_string())),
+                Some(Listing::Invalid) => Err(RoostError::InvalidName(rel_dir.to_string())),
+                Some(Listing::Broken) => Err(RoostError::Io("provider failed".into())),
+                None => Ok(vec![]),
+            }
+        }
+        async fn read(&self, _: &str) -> Result<Vec<u8>, RoostError> {
+            Err(RoostError::Io("unused".into()))
+        }
+        async fn write_atomic(&self, _: &str, _: &[u8]) -> Result<(), RoostError> {
+            Err(RoostError::Io("unused".into()))
+        }
+        async fn create(&self, _: &str, _: &[u8]) -> Result<(), RoostError> {
+            Err(RoostError::Io("unused".into()))
+        }
+        async fn trash(&self, _: &str) -> Result<(), RoostError> {
+            Err(RoostError::Io("unused".into()))
+        }
+        async fn rename(&self, _: &str, _: &str) -> Result<(), RoostError> {
+            Err(RoostError::Io("unused".into()))
+        }
+        async fn mkdir(&self, _: &str) -> Result<(), RoostError> {
+            Err(RoostError::Io("unused".into()))
+        }
+        async fn rmdir(&self, _: &str) -> Result<(), RoostError> {
+            Err(RoostError::Io("unused".into()))
+        }
+        async fn exists(&self, _: &str) -> Result<bool, RoostError> {
+            Ok(false)
+        }
+        fn display_root(&self) -> &str {
+            "scripted"
+        }
+        fn root_id(&self) -> String {
+            "scripted".into()
+        }
+    }
+
+    /// root: Good/ (a.md, Sub/ (b.md)), BAD/ (<refused>), z.md
+    fn tree(bad: Listing) -> Scripted {
+        let mut dirs = HashMap::new();
+        dirs.insert(
+            "",
+            Listing::Entries(vec![("Good", true), ("BAD", true), ("z.md", false)]),
+        );
+        dirs.insert(
+            "Good",
+            Listing::Entries(vec![("a.md", false), ("Sub", true)]),
+        );
+        dirs.insert("Good/Sub", Listing::Entries(vec![("b.md", false)]));
+        dirs.insert("BAD", bad);
+        Scripted {
+            dirs,
+            listed: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn paths(entries: &[Entry]) -> Vec<String> {
+        let mut all: Vec<String> = entries.iter().map(|e| e.rel_path.clone()).collect();
+        all.sort();
+        all
+    }
+
+    const EVERYTHING_ELSE: [&str; 5] = ["Good", "Good/Sub", "Good/Sub/b.md", "Good/a.md", "z.md"];
+
+    #[tokio::test]
+    async fn a_refused_folder_is_skipped_and_the_rest_of_the_roost_is_listed() {
+        for refusal in [Listing::Outside, Listing::Invalid] {
+            let fs = tree(refusal);
+            let out = fs.list_recursive("").await.expect("must not abort");
+            assert_eq!(
+                paths(&out),
+                EVERYTHING_ELSE,
+                "BAD must not be listed at all"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_refused_folder_below_the_top_is_skipped_too() {
+        let mut fs = tree(Listing::Broken);
+        // Make the refusal nested: Good/Sub is the refused one, BAD is fine.
+        fs.dirs
+            .insert("BAD", Listing::Entries(vec![("c.md", false)]));
+        fs.dirs.insert("Good/Sub", Listing::Outside);
+        let out = fs.list_recursive("").await.expect("must not abort");
+        assert_eq!(
+            paths(&out),
+            vec!["BAD", "BAD/c.md", "Good", "Good/a.md", "z.md"]
+        );
+    }
+
+    #[tokio::test]
+    async fn any_other_error_still_fails_the_whole_listing() {
+        // "Could not tell" is an error, never a smaller listing.
+        let fs = tree(Listing::Broken);
+        let error = fs.list_recursive("").await.unwrap_err();
+        assert!(matches!(error, RoostError::Io(_)), "{error:?}");
+    }
+
+    #[tokio::test]
+    async fn a_refused_top_directory_is_still_an_error_for_the_caller() {
+        let fs = tree(Listing::Outside);
+        let error = fs.list_recursive("BAD").await.unwrap_err();
+        assert!(error.is_path_refusal(), "{error:?}");
+    }
+
+    #[tokio::test]
+    async fn a_folder_with_a_name_the_system_rejects_is_never_even_listed() {
+        // On Windows `validate_rel` rejects this name up front, so the backend
+        // is never asked to open it. Elsewhere the name is legal.
+        let mut fs = tree(Listing::Entries(vec![]));
+        fs.dirs.insert(
+            "",
+            Listing::Entries(vec![("Good", true), ("Hostile.", true), ("z.md", false)]),
+        );
+        fs.dirs
+            .insert("Hostile.", Listing::Entries(vec![("secret.md", false)]));
+        let out = fs.list_recursive("").await.unwrap();
+        let got = paths(&out);
+        if cfg!(windows) {
+            assert!(!got.iter().any(|p| p.starts_with("Hostile.")), "{got:?}");
+            assert!(!fs.listed.lock().unwrap().iter().any(|d| d == "Hostile."));
+        } else {
+            assert!(got.contains(&"Hostile./secret.md".to_string()), "{got:?}");
+        }
+        assert!(got.contains(&"Good/a.md".to_string()));
+    }
+
+    /// The real backend on the real Windows rules: a folder whose name ends in
+    /// a dot (only creatable through a verbatim path) sits beside normal notes.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn native_listing_survives_a_folder_with_a_trailing_dot_name() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.md"), "a").unwrap();
+        std::fs::create_dir(dir.path().join("Notes")).unwrap();
+        std::fs::write(dir.path().join("Notes").join("b.md"), "b").unwrap();
+        let verbatim = format!(r"\\?\{}", dir.path().join("Hostile.").display());
+        std::fs::create_dir(&verbatim).unwrap();
+        std::fs::write(format!(r"{verbatim}\secret.md"), "hidden").unwrap();
+        // Remove it with the verbatim path too, whatever the assertions do.
+        struct Cleanup(String);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(verbatim);
+
+        let fs = crate::roostfs::native::NativeFs::new(dir.path());
+        let out = fs.list_recursive("").await.expect("must not abort");
+        let got = paths(&out);
+        assert_eq!(got, vec!["Notes", "Notes/b.md", "a.md"], "{got:?}");
+    }
+}
+
 #[cfg(test)]
 mod validate_rel_tests {
     use super::*;
@@ -420,6 +673,17 @@ mod validate_rel_tests {
             "what?.md",
             "star*.md",
             "q\"uote",
+            // RF-7: console handles and the superscript port forms.
+            "CONIN$",
+            "conout$",
+            "CONIN$.txt",
+            "COM\u{b9}",
+            "COM\u{b2}.md",
+            "com\u{b3}",
+            "LPT\u{b9}",
+            "lpt\u{b2}.txt",
+            "LPT\u{b3}",
+            "COM\u{b9} ", // trailing space is stripped by Windows too
         ] {
             assert!(windows_hostile_segment(bad), "{bad:?}");
         }
@@ -435,8 +699,61 @@ mod validate_rel_tests {
             "LPT10",
             "资料",
             "a b.md",
+            "CONIN", // only the `$` form is the console handle
+            "CONOUT",
+            "CONIN$$",
+            "COM\u{b9}0",  // two characters after COM: not a port
+            "COM\u{2074}", // superscript four is not reserved
+            "COM\u{b9}x.md",
+            "LPT\u{b9}\u{b2}",
+            "Concon\u{b9}",
         ] {
             assert!(!windows_hostile_segment(ok), "{ok:?}");
+        }
+    }
+
+    /// RF-7: a name that is merely invalid on Windows is reported as that, not
+    /// as a path-traversal attempt. Windows-only because `validate_rel` applies
+    /// the Windows rules there only.
+    #[cfg(windows)]
+    #[test]
+    fn invalid_windows_names_are_not_reported_as_traversal() {
+        for bad in [
+            "Journal./x.md",
+            "a/NUL.md",
+            "Meeting: notes.md",
+            "CONIN$",
+            "COM\u{b9}.md",
+        ] {
+            let error = validate_rel(bad).unwrap_err();
+            assert!(
+                matches!(error, RoostError::InvalidName(_)),
+                "{bad:?}: {error:?}"
+            );
+            let text = error.to_string();
+            assert!(!text.contains("traversal"), "{text}");
+            assert!(text.contains("not a valid file or folder name"), "{text}");
+            assert!(error.is_path_refusal());
+        }
+        // Real escapes keep the traversal wording.
+        let escape = validate_rel("../x.md").unwrap_err();
+        assert!(matches!(escape, RoostError::OutsideRoost(_)));
+        assert!(escape.to_string().contains("traversal"));
+    }
+
+    #[test]
+    fn both_refusals_count_as_path_refusals_and_nothing_else_does() {
+        assert!(RoostError::OutsideRoost("x".into()).is_path_refusal());
+        assert!(RoostError::InvalidName("x".into()).is_path_refusal());
+        for other in [
+            RoostError::NotFound("x".into()),
+            RoostError::AlreadyExists("x".into()),
+            RoostError::NotDir("x".into()),
+            RoostError::NotEmpty("x".into()),
+            RoostError::PermissionDenied("x".into()),
+            RoostError::Io("x".into()),
+        ] {
+            assert!(!other.is_path_refusal(), "{other:?}");
         }
     }
 
@@ -446,14 +763,14 @@ mod validate_rel_tests {
     fn colon_titles_are_only_refused_where_windows_would_misread_them() {
         let r = validate_rel("Meeting: notes.md");
         if cfg!(windows) {
-            assert!(matches!(r, Err(RoostError::OutsideRoost(_))));
+            assert!(matches!(r, Err(RoostError::InvalidName(_))));
             assert!(matches!(
                 validate_rel("Journal./x.md"),
-                Err(RoostError::OutsideRoost(_))
+                Err(RoostError::InvalidName(_))
             ));
             assert!(matches!(
                 validate_rel("a/NUL.md"),
-                Err(RoostError::OutsideRoost(_))
+                Err(RoostError::InvalidName(_))
             ));
         } else {
             assert_eq!(r.unwrap(), "Meeting: notes.md");

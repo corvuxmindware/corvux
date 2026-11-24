@@ -16,6 +16,9 @@
 //! Now every agent write goes through [`create_note`], [`mutate_note`] or
 //! [`mutate_internal`]. They check the FINAL, cleaned, roost-relative path
 //! (the same `roostfs::validate_rel` form the backend writes) against:
+//! * the roost instructions file (`AGENTS.md` at the roost root, the file
+//!   chat loads as instructions the model follows) — never writable by the
+//!   agent, whatever the spelling ([`is_roost_instructions_path`]), and
 //! * the reserved-path rule (notes only; the two app-owned agent files in
 //!   [`AGENT_INTERNAL_FILES`] are the only `.corvux/` targets, and only via
 //!   [`mutate_internal`]), and
@@ -41,6 +44,7 @@ use serde_json::Value;
 use tauri::Runtime;
 
 use super::registry::{ToolContext, ToolError};
+use crate::ai::roost_instructions::ROOST_INSTRUCTIONS_FILE;
 
 /// App-owned files inside `.corvux/` that agent tools may write — and only
 /// through [`mutate_internal`]. `remember` / `forget` keep long-term memory
@@ -97,6 +101,42 @@ pub(crate) fn is_reserved_path(rel: &str) -> bool {
         .any(|seg| seg.starts_with('.') && seg != "." && seg != "..")
 }
 
+/// What the agent (and the user's tool card) is told when a write targets the
+/// roost instructions file. Shared with the early check in the agent loop.
+pub(crate) const INSTRUCTIONS_REFUSAL: &str =
+    "The assistant cannot edit your roost instructions (AGENTS.md); edit it yourself.";
+
+/// True if `rel` names the roost instructions file — the exact ROOT file
+/// `commands::ai::chat` loads into every chat as instructions the model is told
+/// to follow ([`ROOST_INSTRUCTIONS_FILE`], one spelling shared with the loader).
+///
+/// Why the agent may not write it: a prompt-injected note could otherwise make
+/// the agent create or edit that file — the approval card looks routine, and
+/// with auto-approve there is no click — turning a one-off injection into a
+/// lasting instruction in every chat on every device. The user edits it by hand.
+///
+/// Compared on the identity the file system uses, the same rule as the
+/// blocklist matcher (`glob::normalize`: NFC, `\` as `/`, empty / `.` segments
+/// collapsed, per-segment trailing dots and spaces ignored, case-insensitive),
+/// so `agents.md`, `Agents.MD`, `./AGENTS.md`, `/AGENTS.md` and `AGENTS.md.`
+/// all match. One extra fold: `ſ` (U+017F) is `s` to a case-insensitive APFS
+/// volume. Only the root file matches — `Docs/AGENTS.md` is an ordinary note
+/// because chat never loads it.
+pub(crate) fn is_roost_instructions_path(rel: &str) -> bool {
+    fn identity(s: &str) -> String {
+        super::glob::normalize(s).replace('\u{17f}', "s")
+    }
+    identity(rel) == identity(ROOST_INSTRUCTIONS_FILE)
+}
+
+fn refuse_instructions_file(cleaned: &str) -> Result<(), ToolError> {
+    if is_roost_instructions_path(cleaned) {
+        // Fatal: retrying a different spelling is exactly what must not work.
+        return Err(ToolError::fatal(INSTRUCTIONS_REFUSAL));
+    }
+    Ok(())
+}
+
 /// The message the agent (and the user's tool card) sees when a target is on
 /// the blocklist. Shared with the early check in the agent loop so both
 /// refusals read the same.
@@ -132,6 +172,7 @@ fn check_blocklist(cleaned: &str, blocked: &[String]) -> Result<(), ToolError> {
 /// path the caller must write to.
 pub(crate) fn check_note_target(rel: &str, blocked: &[String]) -> Result<String, ToolError> {
     let cleaned = clean_target(rel)?;
+    refuse_instructions_file(&cleaned)?;
     if is_reserved_path(&cleaned) {
         return Err(ToolError::fatal(format!(
             "refusing to write to a reserved path '{cleaned}'. Corvux's own folders (.corvux, .attachments) and dotfiles are off-limits to the agent."
@@ -145,6 +186,7 @@ pub(crate) fn check_note_target(rel: &str, blocked: &[String]) -> Result<String,
 /// [`AGENT_INTERNAL_FILES`] pass, and the user's blocklist still applies.
 pub(crate) fn check_internal_target(rel: &str, blocked: &[String]) -> Result<String, ToolError> {
     let cleaned = clean_target(rel)?;
+    refuse_instructions_file(&cleaned)?;
     if !AGENT_INTERNAL_FILES.contains(&cleaned.as_str()) {
         return Err(ToolError::fatal(format!(
             "refusing to write '{cleaned}': it is not an agent-owned file"
@@ -307,6 +349,9 @@ mod tests {
             ("Journal/x.md", "- [ ] secret task 📅 2026-01-01\n"),
             ("Finance/Q1.md", "numbers\n"),
             ("Scratch/ok.md", "ok\n"),
+            // The roost instructions file, and a same-named ordinary note.
+            ("AGENTS.md", "- be terse\n"),
+            ("Docs/AGENTS.md", "docs about agents\n"),
         ] {
             let p = dir.path().join(rel);
             std::fs::create_dir_all(p.parent().expect("parent")).expect("mkdir");
@@ -510,6 +555,159 @@ mod tests {
         }
     }
 
+    // ── the roost instructions file (AGENTS.md) ────────────────────────
+
+    fn assert_instructions_refused(res: Result<String, ToolError>, what: &str) {
+        let err = res.expect_err(what);
+        assert!(
+            err.fatal && err.message == INSTRUCTIONS_REFUSAL,
+            "{what}: expected the roost-instructions refusal, got: {}",
+            err.message
+        );
+        assert!(err.message.contains("edit it yourself"));
+    }
+
+    #[test]
+    fn roost_instructions_file_is_refused_in_every_spelling() {
+        // Spellings the backend's own name rules accept on every platform: the
+        // GATE is what refuses them, with the roost-instructions message.
+        for rel in [
+            "AGENTS.md",
+            "agents.md",
+            "Agents.MD",
+            "AGENTS.MD",
+            "/AGENTS.md",
+            "\\AGENTS.md",
+            "//AGENTS.md",
+            // NFC identity + the one special case fold (ſ is `s` to APFS).
+            "AGENTſ.md",
+        ] {
+            assert_instructions_refused(check_note_target(rel, &[]), rel);
+            // The user's blocklist does not change which refusal wins.
+            assert_instructions_refused(check_note_target(rel, &pats(&["Journal/"])), rel);
+        }
+        // `./AGENTS.md` is always refused by the backend's `.` rule; a trailing
+        // dot or space is refused as a hostile name on Windows and as the
+        // instructions file elsewhere. Never writable either way.
+        for rel in ["./AGENTS.md", "AGENTS.md.", "AGENTS.md "] {
+            assert!(check_note_target(rel, &[]).is_err(), "{rel:?}");
+        }
+    }
+
+    #[test]
+    fn identity_rule_matches_the_blocklist_matcher() {
+        for rel in [
+            "AGENTS.md",
+            "agents.md",
+            "./AGENTS.md",
+            "/AGENTS.md",
+            "\\AGENTS.md",
+            "AGENTS.md.",
+            "AGENTS.md ",
+            "AGENTS.MD",
+            "AGENTſ.md",
+        ] {
+            assert!(is_roost_instructions_path(rel), "{rel:?}");
+        }
+        for rel in [
+            "Docs/AGENTS.md",
+            "docs/agents.md",
+            "Notes/Sub/AGENTS.md",
+            "AGENTS",
+            "AGENTS2.md",
+            "My AGENTS.md",
+            "AGENTS.md.bak",
+            "AGENTS.markdown",
+            "XAGENTS.md",
+            "",
+        ] {
+            assert!(!is_roost_instructions_path(rel), "{rel:?}");
+        }
+    }
+
+    #[test]
+    fn an_agents_md_in_a_subfolder_is_an_ordinary_note() {
+        // Chat loads ONLY the root file, so a note of that name elsewhere
+        // stays writable (and the blocklist still applies to it).
+        for rel in ["Docs/AGENTS.md", "docs/agents.md", "Notes/Sub/Agents.MD"] {
+            assert!(check_note_target(rel, &[]).is_ok(), "{rel}");
+        }
+        assert_blocked(
+            check_note_target("Docs/AGENTS.md", &pats(&["Docs/"])),
+            "blocklist still applies",
+        );
+    }
+
+    #[tokio::test]
+    async fn resolver_spellings_of_the_root_file_are_refused_after_resolution() {
+        let dir = roost();
+        // `[[wiki]]` markers, a missing `.md`, an exact name: all resolve to
+        // the ROOT file, and the gate checks that final path.
+        for input in ["AGENTS", "AGENTS.md", "[[AGENTS]]", "[[AGENTS.md]]"] {
+            let rel = resolve(&dir, input, false, &no_titles)
+                .await
+                .expect("resolves");
+            assert!(
+                is_roost_instructions_path(&rel),
+                "{input} resolved to {rel}"
+            );
+            assert_instructions_refused(check_note_target(&rel, &[]), input);
+        }
+        // The same-named note in a subfolder resolves to ITS path and passes.
+        let rel = resolve(&dir, "Docs/AGENTS", false, &no_titles)
+            .await
+            .expect("resolves");
+        assert_eq!(rel, "Docs/AGENTS.md");
+        assert!(check_note_target(&rel, &[]).is_ok());
+    }
+
+    #[test]
+    fn folder_plus_title_forms_of_the_root_file_are_refused() {
+        for args in [
+            json!({"title": "AGENTS", "body": "b"}),
+            json!({"title": "agents", "body": "b"}),
+            json!({"title": "AGENTS", "body": "b", "folder": ""}),
+            json!({"title": "AGENTS", "body": "b", "folder": "/"}),
+            json!({"title": " Agents ", "body": "b", "folder": " / "}),
+        ] {
+            let rel = crate::ai::tools::roost_write::planned_rel(&args).expect("planned");
+            assert_instructions_refused(check_note_target(&rel, &[]), &rel);
+        }
+        for args in [
+            json!({"title": "AGENTS", "body": "b", "folder": "Docs"}),
+            json!({"title": "x/AGENTS", "body": "b"}),
+        ] {
+            let rel = crate::ai::tools::roost_write::planned_rel(&args).expect("planned");
+            assert!(check_note_target(&rel, &[]).is_ok(), "{rel}");
+        }
+    }
+
+    #[test]
+    fn internal_writers_cannot_be_pointed_at_the_instructions_file() {
+        for rel in ["AGENTS.md", "agents.md", "/AGENTS.md"] {
+            assert_instructions_refused(check_internal_target(rel, &[]), rel);
+        }
+    }
+
+    /// The file the chat loader reads and the file the gate reserves must be
+    /// the same spelling: chat reads it through the shared constant, never a
+    /// string literal of its own.
+    #[test]
+    fn chat_loads_exactly_the_file_the_gate_reserves() {
+        assert_eq!(ROOST_INSTRUCTIONS_FILE, "AGENTS.md");
+        assert!(is_roost_instructions_path(ROOST_INSTRUCTIONS_FILE));
+        let chat = include_str!("../../commands/ai/chat.rs");
+        let production = chat.split("#[cfg(test)]").next().expect("split");
+        assert!(
+            production.contains("ROOST_INSTRUCTIONS_FILE"),
+            "chat.rs must load the instructions through ROOST_INSTRUCTIONS_FILE"
+        );
+        assert!(
+            !production.contains("read(\"AGENTS.md\")"),
+            "chat.rs reads AGENTS.md by a literal the gate does not know about"
+        );
+    }
+
     // ── registry level ──────────────────────────────────────────────────
 
     /// How each Write/Destructive tool picks its target. A NEW write tool
@@ -584,15 +782,38 @@ mod tests {
                             check_write_call_shape(&decoy, &schema).is_err(),
                             "{name}: decoy key accepted"
                         );
+                        // The roost instructions file, however the tool is told
+                        // to spell it, resolves to the root file and is refused.
+                        for input in ["AGENTS", "[[AGENTS]]", "AGENTS.md"] {
+                            let rel = resolve(&dir, input, false, &no_titles)
+                                .await
+                                .expect("resolves");
+                            assert_instructions_refused(
+                                check_note_target(&rel, &[]),
+                                &format!("{name} {input}"),
+                            );
+                        }
                     }
                     Target::FolderTitle => {
                         let args = json!({"title": "t", "body": "b", "folder": "Journal"});
                         let rel =
                             crate::ai::tools::roost_write::planned_rel(&args).expect("planned");
                         assert_blocked(check_note_target(&rel, &blocked), name);
+                        for args in [
+                            json!({"title": "AGENTS", "body": "b"}),
+                            json!({"title": "agents", "body": "b", "folder": "/"}),
+                        ] {
+                            let rel =
+                                crate::ai::tools::roost_write::planned_rel(&args).expect("planned");
+                            assert_instructions_refused(check_note_target(&rel, &[]), name);
+                        }
                     }
                     Target::Internal(rel) => {
                         assert_blocked(check_internal_target(rel, &blocked), name);
+                        // Their fixed target is never the instructions file,
+                        // and they cannot be pointed at it.
+                        assert!(!is_roost_instructions_path(rel), "{name}");
+                        assert_instructions_refused(check_internal_target("AGENTS.md", &[]), name);
                     }
                 }
             }

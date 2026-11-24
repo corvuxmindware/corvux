@@ -30,13 +30,78 @@ use tauri_specta::Event;
 use crate::events;
 
 use super::consumer::SseEvents;
+use super::{
+    limit_error, too_many_tool_calls_error, ByteCounter, MAX_STREAMED_TEXT_BYTES,
+    MAX_STREAMED_TOOL_ARG_BYTES, MAX_STREAMED_TOOL_CALLS,
+};
 use crate::ai::tool_protocol::{StopReason, StreamEvent, ToolCall as ProtoToolCall};
-use crate::ai::tool_translator::openai_compat::{PartialCall, ToolsStreamChunk};
+use crate::ai::tool_translator::openai_compat::{PartialCall, ToolsDeltaCall, ToolsStreamChunk};
 
 /// Channel capacity for `StreamEvent` delivery. Small enough to
 /// backpressure a runaway stream, large enough that normal token-rate
 /// doesn't block.
 const CHANNEL_CAPACITY: usize = 16;
+
+/// Per-`index` accumulator for OpenAI-style tool-call deltas, with a hard bound
+/// (review AT-6). The arguments of every call are held until the stream ends, so
+/// without a cap a stream that never stops sending `arguments` fragments, or
+/// sends a fresh `index` with every delta, grows this without limit.
+#[derive(Default)]
+struct ToolCallAccumulator {
+    /// index → accumulated call. BTreeMap so a flush iterates in index order,
+    /// matching the model's intent.
+    partials: std::collections::BTreeMap<usize, PartialCall>,
+    /// Bytes of id + name + argument fragments received so far, all calls.
+    bytes: usize,
+}
+
+impl ToolCallAccumulator {
+    /// Fold one delta in. `Err` carries the user-visible reason the reply must
+    /// be stopped (too many calls, or too much argument data).
+    fn apply(&mut self, delta: ToolsDeltaCall) -> Result<(), String> {
+        if !self.partials.contains_key(&delta.index)
+            && self.partials.len() >= MAX_STREAMED_TOOL_CALLS
+        {
+            return Err(too_many_tool_calls_error());
+        }
+        let incoming = delta.id.as_ref().map_or(0, String::len)
+            + delta.function.as_ref().map_or(0, |f| {
+                f.name.as_ref().map_or(0, String::len) + f.arguments.as_ref().map_or(0, String::len)
+            });
+        if self.bytes.saturating_add(incoming) > MAX_STREAMED_TOOL_ARG_BYTES {
+            return Err(limit_error("tool-call data", MAX_STREAMED_TOOL_ARG_BYTES));
+        }
+        self.bytes += incoming;
+
+        // Names and ids arrive on the FIRST delta for that index; later deltas
+        // only carry argument fragments to concatenate.
+        let entry = self.partials.entry(delta.index).or_default();
+        if let Some(id) = delta.id {
+            if entry.id.is_empty() {
+                entry.id = id;
+            }
+        }
+        if let Some(func) = delta.function {
+            if let Some(name) = func.name {
+                if entry.name.is_empty() {
+                    entry.name = name;
+                }
+            }
+            if let Some(args_chunk) = func.arguments {
+                entry.arguments.push_str(&args_chunk);
+            }
+        }
+        Ok(())
+    }
+
+    fn is_empty(&self) -> bool {
+        self.partials.is_empty()
+    }
+
+    fn into_partials(self) -> std::collections::BTreeMap<usize, PartialCall> {
+        self.partials
+    }
+}
 
 /// Drain an OpenAI-compat streaming chat response in a spawned task and
 /// return the receiver end of a `StreamEvent` channel.
@@ -60,10 +125,11 @@ pub fn spawn_openai_compat_chat<R: tauri::Runtime + 'static>(
 
     tokio::spawn(async move {
         let mut events = SseEvents::new(response.bytes_stream(), cancel.clone());
-        // index → accumulated PartialCall. BTreeMap so we iterate
-        // calls in index order on flush, matching the model's intent.
-        let mut partials: std::collections::BTreeMap<usize, PartialCall> =
-            std::collections::BTreeMap::new();
+        // Tool-call deltas accumulate per index and are parsed only on flush.
+        let mut accumulator = ToolCallAccumulator::default();
+        // The text forwarded so far — counted here because this task only
+        // forwards it, so nothing else would notice a runaway.
+        let mut text_bytes = ByteCounter::default();
         let mut finish_reason: Option<String> = None;
 
         'outer: loop {
@@ -112,6 +178,12 @@ pub fn spawn_openai_compat_chat<R: tauri::Runtime + 'static>(
                 // panel AND the agent loop's history accumulator.
                 if let Some(content) = delta.content {
                     if !content.is_empty() {
+                        if let Err(msg) =
+                            text_bytes.add(content.len(), MAX_STREAMED_TEXT_BYTES, "text")
+                        {
+                            let _ = tx.send(StreamEvent::Stop(StopReason::Other(msg))).await;
+                            return;
+                        }
                         let _ = events::AiChunk(content.clone()).emit(&app);
                         if tx.send(StreamEvent::TextChunk(content)).await.is_err() {
                             break 'outer;
@@ -119,25 +191,12 @@ pub fn spawn_openai_compat_chat<R: tauri::Runtime + 'static>(
                     }
                 }
 
-                // Tool-call deltas: accumulate per-index. Names and
-                // ids arrive on the FIRST delta for that index; later
-                // deltas only carry argument fragments to concatenate.
+                // Tool-call deltas: accumulate per-index (bounded — a reply
+                // that runs past the caps is stopped, never held).
                 for call_delta in delta.tool_calls {
-                    let entry = partials.entry(call_delta.index).or_default();
-                    if let Some(id) = call_delta.id {
-                        if entry.id.is_empty() {
-                            entry.id = id;
-                        }
-                    }
-                    if let Some(func) = call_delta.function {
-                        if let Some(name) = func.name {
-                            if entry.name.is_empty() {
-                                entry.name = name;
-                            }
-                        }
-                        if let Some(args_chunk) = func.arguments {
-                            entry.arguments.push_str(&args_chunk);
-                        }
+                    if let Err(msg) = accumulator.apply(call_delta) {
+                        let _ = tx.send(StreamEvent::Stop(StopReason::Other(msg))).await;
+                        return;
                     }
                 }
             }
@@ -148,9 +207,9 @@ pub fn spawn_openai_compat_chat<R: tauri::Runtime + 'static>(
         // because Anthropic-via-OpenRouter sometimes interleaves
         // metadata fragments that would break a partial parse.
         let emit_tools =
-            matches!(finish_reason.as_deref(), Some("tool_calls")) || !partials.is_empty();
+            matches!(finish_reason.as_deref(), Some("tool_calls")) || !accumulator.is_empty();
         if emit_tools {
-            for (idx, partial) in partials.into_iter() {
+            for (idx, partial) in accumulator.into_partials() {
                 // Empty-string arguments → empty object. Some models
                 // emit `tool_calls` with no arguments field for
                 // no-arg tools (e.g. `skill_list` with `{}`).
@@ -205,4 +264,75 @@ pub fn spawn_openai_compat_chat<R: tauri::Runtime + 'static>(
     });
 
     rx
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn delta(
+        index: usize,
+        id: Option<&str>,
+        name: Option<&str>,
+        args: Option<&str>,
+    ) -> ToolsDeltaCall {
+        serde_json::from_value(json!({
+            "index": index,
+            "id": id,
+            "function": { "name": name, "arguments": args },
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn fragments_concatenate_per_index_and_the_first_id_and_name_win() {
+        let mut acc = ToolCallAccumulator::default();
+        acc.apply(delta(0, Some("c1"), Some("roost_read"), Some("{\"pa")))
+            .unwrap();
+        acc.apply(delta(1, Some("c2"), Some("roost_search"), Some("{}")))
+            .unwrap();
+        acc.apply(delta(0, Some("IGNORED"), Some("IGNORED"), Some("th\":1}")))
+            .unwrap();
+        assert!(!acc.is_empty());
+        let partials = acc.into_partials();
+        assert_eq!(partials[&0].id, "c1");
+        assert_eq!(partials[&0].name, "roost_read");
+        assert_eq!(partials[&0].arguments, "{\"path\":1}");
+        assert_eq!(partials[&1].arguments, "{}");
+    }
+
+    /// AT-6: a stream that opens a new tool call with every delta is stopped at
+    /// the call cap instead of growing the map forever.
+    #[test]
+    fn a_stream_of_ever_new_indexes_is_stopped_at_the_call_cap() {
+        let mut acc = ToolCallAccumulator::default();
+        for i in 0..MAX_STREAMED_TOOL_CALLS {
+            acc.apply(delta(i, None, Some("t"), None)).unwrap();
+        }
+        let err = acc
+            .apply(delta(MAX_STREAMED_TOOL_CALLS, None, Some("t"), None))
+            .unwrap_err();
+        assert!(err.contains("tool calls"), "{err}");
+        // A further fragment for a call that already exists is still fine.
+        acc.apply(delta(0, None, None, Some("{}"))).unwrap();
+    }
+
+    /// AT-6: one call that never stops sending `arguments` is stopped at the
+    /// argument-data cap.
+    #[test]
+    fn endless_argument_fragments_are_stopped_at_the_data_cap() {
+        let mut acc = ToolCallAccumulator::default();
+        let mib = "x".repeat(1024 * 1024);
+        let calls_that_fit = MAX_STREAMED_TOOL_ARG_BYTES / mib.len();
+        for _ in 0..calls_that_fit {
+            acc.apply(delta(0, None, None, Some(&mib))).unwrap();
+        }
+        let err = acc.apply(delta(0, None, None, Some("y"))).unwrap_err();
+        assert!(err.contains("tool-call data"), "{err}");
+        // The refused fragment was not appended.
+        let partials = acc.into_partials();
+        assert_eq!(partials[&0].arguments.len(), MAX_STREAMED_TOOL_ARG_BYTES);
+        assert!(!partials[&0].arguments.ends_with('y'));
+    }
 }

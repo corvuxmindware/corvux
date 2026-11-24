@@ -133,10 +133,23 @@ pub fn required_consent(
                         .into(),
                 );
             }
-            let host = url::Url::parse(ollama_effective_base(ollama_base))
-                .ok()
+            let parsed = url::Url::parse(ollama_effective_base(ollama_base)).ok();
+            let host = parsed
+                .as_ref()
                 .and_then(|u| u.host_str().map(|h| h.to_ascii_lowercase()))
                 .unwrap_or_else(|| "unknown-host".to_string());
+            // The grant is for an ORIGIN, not just a host name (review AK-8): a
+            // "yes" to `http://localhost:11434` must not carry over to
+            // `https://localhost:8443` or to another service on the same host.
+            // Path is deliberately not part of it (a reverse-proxy prefix is the
+            // same server).
+            let origin = parsed.as_ref().map(|u| {
+                format!(
+                    "{}://{host}:{}",
+                    u.scheme(),
+                    u.port_or_known_default().unwrap_or(0)
+                )
+            });
             let local = matches!(
                 host.trim_start_matches('[').trim_end_matches(']'),
                 "localhost" | "127.0.0.1" | "::1"
@@ -147,9 +160,14 @@ pub fn required_consent(
             } else {
                 String::new()
             };
+            let (id, shown) = match origin {
+                Some(o) => (format!("ollama:{o}"), o),
+                // Unparseable base: one shared "unknown" id, as before.
+                None => (format!("ollama:{host}"), host.clone()),
+            };
             AiConsentTarget {
-                id: format!("ollama:{host}"),
-                provider_name: format!("the Ollama server at {host}"),
+                id,
+                provider_name: format!("the Ollama server at {shown}"),
                 host,
                 detail,
             }
@@ -205,9 +223,45 @@ fn lock() -> Result<std::sync::MutexGuard<'static, ()>, String> {
         .map_err(|e| format!("AI consent lock error: {e}"))
 }
 
+/// The host of a current-format Ollama id `ollama:<scheme>://<host>:<port>`;
+/// `None` for every other id (the fixed provider ids, the legacy `ollama:<host>`
+/// form, `ollama:ollama.com`, or anything malformed). The host is returned
+/// exactly as it is in the id (bracketed for IPv6), so it can be compared for
+/// EQUALITY with a legacy grant's host — never as a suffix or pattern.
+fn origin_id_host(id: &str) -> Option<&str> {
+    let rest = id.strip_prefix("ollama:")?;
+    let (scheme, authority) = rest.split_once("://")?;
+    let (host, port) = authority.rsplit_once(':')?;
+    let well_formed = matches!(scheme, "http" | "https")
+        && !host.is_empty()
+        && !host.contains('/')
+        && !port.is_empty()
+        && port.bytes().all(|b| b.is_ascii_digit());
+    well_formed.then_some(host)
+}
+
+/// Before review AK-8 an Ollama grant was keyed `ollama:<host>` with no scheme or
+/// port, and it meant "chats to that host, on whatever scheme and port is
+/// configured". Existing users keep exactly that meaning (migration safety, rule
+/// 7): a legacy grant covers every scheme and port for EXACTLY that host. New
+/// grants are written in the stricter `ollama:<scheme>://<host>:<port>` form and
+/// cover only that origin.
+fn legacy_host_id(host: &str) -> String {
+    format!("ollama:{host}")
+}
+
+/// Whether `granted` covers `id`: the id itself, or the legacy grant for the same
+/// host. The ONLY membership test — `is_granted` and `pending_consent` must agree
+/// or the prompt and the gate would disagree. Host matching is exact string
+/// equality: no wildcards, no suffix or subdomain matching.
+fn covers(granted: &BTreeSet<String>, id: &str) -> bool {
+    granted.contains(id)
+        || origin_id_host(id).is_some_and(|host| granted.contains(&legacy_host_id(host)))
+}
+
 fn is_granted(settings_path: &Path, id: &str) -> Result<bool, String> {
     let _guard = lock()?;
-    Ok(read_granted(&consent_path(settings_path)).contains(id))
+    Ok(covers(&read_granted(&consent_path(settings_path)), id))
 }
 
 fn check_granted(settings_path: &Path, id: &str) -> Result<(), String> {
@@ -309,7 +363,23 @@ fn revoke(settings_path: &Path, id: &str) -> Result<(), String> {
     let _guard = lock()?;
     let path = consent_path(settings_path);
     let mut set = read_granted(&path);
-    if set.remove(id) {
+    let mut changed = set.remove(id);
+    if let Some(host) = origin_id_host(id) {
+        // Withdrawing a current-format id also withdraws the legacy grant for
+        // that host that still counts for it (see `covers`), or it would stay
+        // granted.
+        changed |= set.remove(&legacy_host_id(host));
+    } else if let Some(host) = id
+        .strip_prefix("ollama:")
+        .filter(|h| !h.is_empty() && !h.contains("://"))
+    {
+        // Withdrawing a legacy `ollama:<host>` grant also withdraws every
+        // current-format grant for exactly that host (whatever scheme/port).
+        let before = set.len();
+        set.retain(|granted| origin_id_host(granted) != Some(host));
+        changed |= set.len() != before;
+    }
+    if changed {
         write_granted(&path, &set)?;
     }
     Ok(())
@@ -330,7 +400,7 @@ fn pending_consent(settings: &Settings, granted: &BTreeSet<String>) -> Option<Ai
     if !configured {
         return None;
     }
-    Some(target_for(settings)).filter(|t| !granted.contains(&t.id))
+    Some(target_for(settings)).filter(|t| !covers(granted, &t.id))
 }
 
 fn settings_snapshot(state: &State<'_, SettingsState>) -> Result<Settings, String> {
@@ -418,7 +488,8 @@ mod tests {
             ("", "localhost"), // blank base → OllamaChat's default
         ] {
             let t = required_consent(LlmProvider::Ollama, base, "llama3.2", "");
-            assert_eq!(t.id, format!("ollama:{host}"), "{base:?}");
+            assert_eq!(t.id, format!("ollama:http://{host}:11434"), "{base:?}");
+            assert_eq!(t.host, host, "{base:?}");
             assert!(!t.detail.is_empty(), "local Ollama must explain forwarding");
         }
         // Cloud models go to ollama.com whatever the base URL is.
@@ -433,7 +504,7 @@ mod tests {
             "llama3.2",
             "",
         );
-        assert_eq!(lan.id, "ollama:192.168.1.20");
+        assert_eq!(lan.id, "ollama:http://192.168.1.20:11434");
         // Userinfo can't disguise a remote host as localhost.
         let sneaky = required_consent(
             LlmProvider::Ollama,
@@ -441,10 +512,227 @@ mod tests {
             "m",
             "",
         );
-        assert_eq!(sneaky.id, "ollama:evil.example");
+        assert_eq!(sneaky.id, "ollama:http://evil.example:80");
+        assert_eq!(sneaky.host, "evil.example");
         assert!(required_consent(LlmProvider::Ollama, "not a url", "m", "")
             .id
             .starts_with("ollama:"));
+    }
+
+    #[test]
+    fn the_ollama_consent_id_names_scheme_and_port_but_not_the_path() {
+        // AK-8: a "yes" is for an origin. Two services on one host, or the same
+        // host over a different scheme, are different recipients.
+        let id = |base: &str| required_consent(LlmProvider::Ollama, base, "m", "").id;
+        let plain = id("http://box.example:11434");
+        assert_eq!(plain, "ollama:http://box.example:11434");
+        assert_ne!(plain, id("http://box.example:8080"));
+        assert_ne!(plain, id("https://box.example:11434"));
+        assert_ne!(id("https://box.example"), id("http://box.example"));
+        assert_eq!(id("https://box.example"), "ollama:https://box.example:443");
+        // Same server: path prefix, trailing slash and host case do not matter.
+        assert_eq!(plain, id("http://BOX.example:11434/"));
+        assert_eq!(plain, id("http://box.example:11434/ollama"));
+        // The cloud id is unchanged.
+        assert_eq!(
+            required_consent(
+                LlmProvider::Ollama,
+                "http://box.example:11434",
+                "x:cloud",
+                ""
+            )
+            .id,
+            "ollama:ollama.com"
+        );
+        // The prompt shows where the chat goes, scheme and port included.
+        let t = required_consent(LlmProvider::Ollama, "http://box.example:11434", "m", "");
+        assert!(
+            t.provider_name.contains("http://box.example:11434"),
+            "{t:?}"
+        );
+        assert_eq!(t.host, "box.example");
+    }
+
+    fn grants(ids: &[&str]) -> BTreeSet<String> {
+        ids.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn an_old_format_grant_covers_that_host_on_any_scheme_and_port() {
+        // Migration safety (rule 7): before AK-8 `ollama:<host>` meant "chats to
+        // that host, whatever scheme/port is configured". It still does.
+        let dir = tempfile::tempdir().unwrap();
+        let sp = settings_path(&dir);
+        write_granted(
+            &consent_path(&sp),
+            &grants(&["ollama:localhost", "ollama:box.example"]),
+        )
+        .unwrap();
+        for covered in [
+            "ollama:http://localhost:11434",
+            "ollama:http://localhost:8080",
+            "ollama:https://localhost:8443",
+            "ollama:http://box.example:11434",
+            "ollama:https://box.example:443",
+            "ollama:https://box.example:8443",
+            "ollama:http://box.example:80",
+        ] {
+            assert!(check_granted(&sp, covered).is_ok(), "{covered}");
+        }
+        // Exact host only: another host, a look-alike suffix/prefix host, a
+        // sub-domain, a malformed id and the cloud id are all NOT covered.
+        for not_covered in [
+            "ollama:http://other.example:11434",
+            "ollama:https://other.example:8443",
+            "ollama:http://notbox.example:11434",
+            "ollama:http://evilbox.example:11434",
+            "ollama:https://box.example.evil.net:443",
+            "ollama:https://a.box.example:443",
+            "ollama:http://localhost.evil.example:11434",
+            "ollama:http://:11434",
+            "ollama:ftp://box.example:21",
+            "ollama:http://box.example",
+            "ollama:ollama.com",
+        ] {
+            assert!(check_granted(&sp, not_covered).is_err(), "{not_covered}");
+        }
+        // The prompt agrees with the gate: no re-ask for a covered target.
+        let mut s = settings(LlmProvider::Ollama);
+        s.ollama_model = "llama3.2".into();
+        let granted = read_granted(&consent_path(&sp));
+        for base in [
+            "http://localhost:11434",
+            "https://localhost:8443",
+            "https://box.example:8443",
+        ] {
+            s.ollama_base_url = base.into();
+            assert_eq!(pending_consent(&s, &granted), None, "{base}");
+        }
+        // (Kept off the `for` line: the raw-fs ratchet's line counter reads `//`
+        // inside a string as a comment and would lose this loop's opening brace.)
+        let uncovered = ["http://other.example:11434", "https://box.example.evil.net"];
+        for base in uncovered {
+            s.ollama_base_url = base.into();
+            assert!(pending_consent(&s, &granted).is_some(), "{base}");
+        }
+    }
+
+    #[test]
+    fn a_new_style_grant_covers_only_its_own_origin() {
+        // New grants are strict: scheme + host + port. Nothing widens them and
+        // nothing writes a legacy host-wide grant on their behalf.
+        let dir = tempfile::tempdir().unwrap();
+        let sp = settings_path(&dir);
+        write_granted(
+            &consent_path(&sp),
+            &grants(&["ollama:http://box.example:11434"]),
+        )
+        .unwrap();
+        assert!(check_granted(&sp, "ollama:http://box.example:11434").is_ok());
+        for not_covered in [
+            "ollama:https://box.example:11434",
+            "ollama:http://box.example:8080",
+            "ollama:https://box.example:443",
+            "ollama:http://other.example:11434",
+            "ollama:http://notbox.example:11434",
+            "ollama:http://a.box.example:11434",
+            "ollama:ollama.com",
+        ] {
+            assert!(check_granted(&sp, not_covered).is_err(), "{not_covered}");
+        }
+        // Granting through the normal path stores the strict id only.
+        let dir2 = tempfile::tempdir().unwrap();
+        let sp2 = settings_path(&dir2);
+        let mut s = settings(LlmProvider::Ollama);
+        s.ollama_model = "llama3.2".into();
+        s.ollama_base_url = "https://box.example:8443".into();
+        let id = target_for(&s).id;
+        grant_current(&sp2, &s, &id).unwrap();
+        assert_eq!(
+            read_granted(&consent_path(&sp2)),
+            grants(&["ollama:https://box.example:8443"])
+        );
+        assert!(check_granted(&sp2, "ollama:https://box.example:8443").is_ok());
+        assert!(check_granted(&sp2, "ollama:http://box.example:11434").is_err());
+    }
+
+    #[test]
+    fn origin_id_host_reads_only_current_format_ids() {
+        assert_eq!(
+            origin_id_host("ollama:http://box.example:11434"),
+            Some("box.example")
+        );
+        assert_eq!(origin_id_host("ollama:https://[::1]:8443"), Some("[::1]"));
+        assert_eq!(
+            origin_id_host("ollama:http://192.168.1.2:11434"),
+            Some("192.168.1.2")
+        );
+        for not_an_origin in [
+            "ollama:localhost",
+            "ollama:ollama.com",
+            "gemini",
+            "ollama:http://box.example",
+            "ollama:http://box.example:",
+            "ollama:http://box.example:80a",
+            "ollama:http://:80",
+            "ollama:ftp://box.example:21",
+            "ollama:http://a://b:80",
+            "http://box.example:80",
+            "",
+        ] {
+            assert_eq!(origin_id_host(not_an_origin), None, "{not_an_origin}");
+        }
+    }
+
+    #[test]
+    fn revoking_either_form_withdraws_the_other_for_that_host() {
+        let dir = tempfile::tempdir().unwrap();
+        let sp = settings_path(&dir);
+        // New id revoked → the legacy host grant behind it goes too.
+        write_granted(&consent_path(&sp), &grants(&["ollama:localhost"])).unwrap();
+        assert!(check_granted(&sp, "ollama:http://localhost:11434").is_ok());
+        revoke(&sp, "ollama:http://localhost:11434").unwrap();
+        assert!(check_granted(&sp, "ollama:http://localhost:11434").is_err());
+        assert!(check_granted(&sp, "ollama:https://localhost:8443").is_err());
+        assert!(read_granted(&consent_path(&sp)).is_empty());
+
+        // Legacy id revoked → every new-style grant for exactly that host goes
+        // too (any scheme/port), and other hosts are left alone.
+        write_granted(
+            &consent_path(&sp),
+            &grants(&[
+                "ollama:box.example",
+                "ollama:http://box.example:11434",
+                "ollama:https://box.example:8443",
+                "ollama:http://notbox.example:11434",
+                "ollama:other.example",
+                "gemini",
+            ]),
+        )
+        .unwrap();
+        revoke(&sp, "ollama:box.example").unwrap();
+        assert_eq!(
+            read_granted(&consent_path(&sp)),
+            grants(&[
+                "ollama:http://notbox.example:11434",
+                "ollama:other.example",
+                "gemini",
+            ])
+        );
+        assert!(check_granted(&sp, "ollama:https://box.example:8443").is_err());
+        assert!(check_granted(&sp, "ollama:https://other.example:443").is_ok());
+
+        // Revoking a new-style id leaves OTHER origins' new-style grants alone.
+        write_granted(
+            &consent_path(&sp),
+            &grants(&["ollama:http://a.example:1", "ollama:http://a.example:2"]),
+        )
+        .unwrap();
+        revoke(&sp, "ollama:http://a.example:1").unwrap();
+        assert_eq!(
+            read_granted(&consent_path(&sp)),
+            grants(&["ollama:http://a.example:2"])
+        );
     }
 
     #[test]

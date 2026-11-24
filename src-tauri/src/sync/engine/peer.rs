@@ -145,6 +145,14 @@ pub struct PeerHandle {
     /// UI bounced back to "disconnected" right after reconnecting). 0 until
     /// registered.
     pub(super) generation: u64,
+    /// CL-6: `true` when WE dialed this connection (`Role::Client`), `false` when
+    /// we accepted it. With `established_at` it lets `register_peer` resolve a
+    /// simultaneous dial (both sides dial at once, so two live connections to the
+    /// same device exist) the same way on both ends. Local bookkeeping only; it
+    /// never goes on the wire.
+    pub(super) dialed_by_us: bool,
+    /// CL-6: when the handshake finished and this handle was built.
+    pub(super) established_at: std::time::Instant,
     /// Symmetric pairing: the dialer's offered redial credentials (ticket,
     /// pin), populated on the SERVER/accept side so the engine can persist
     /// them and dial the dialer back. `None` on the dialer side / legacy.
@@ -310,6 +318,8 @@ where
         peer_vault_id,
         control: control_tx,
         generation: 0,
+        dialed_by_us: is_client,
+        established_at: std::time::Instant::now(),
         peer_reconnect,
         resumption_token,
     };
@@ -1799,17 +1809,25 @@ async fn handle_local(ctx: &mut SyncCtx, change: LocalChange) -> SyncResult<()> 
             // path (so peers converge and the delete reaches offline devices
             // via the queue's FullDoc). We deliberately do NOT `forget` the
             // sync state — the tombstone must keep syncing — and we no longer
-            // emit a `NoteDelete` frame. The markdown file itself was already
-            // trashed by the delete entry point (or removed externally, which
-            // is what triggered this watcher event), so there's nothing to
-            // trash here on the local side.
+            // emit a `NoteDelete` frame. The markdown file is already gone
+            // (trashed, or verified absent), so there's nothing to trash here
+            // on the local side.
+            //
+            // REACHABILITY (SY-2 follow-up): a `Removed` reaches a peer task ONLY
+            // from `SyncEngine::commit_tombstone`'s fan-out, AFTER the tombstone
+            // is committed under the note lock. The watcher never sends one: an
+            // inferred (watcher / rescan) removal goes through
+            // `verify_then_tombstone`, which re-checks "file still absent" and
+            // "doc not already deleted" under the lock before it commits. So in
+            // production the doc is already deleted here.
             let _note_guard = ctx.note_locks.lock(&path).await;
             let store = ctx.doc_store.lock().await;
             let mut doc = store.load_or_create(&path)?;
-            // Idempotent: when the delete entry point (`mark_note_deleted`)
-            // already tombstoned the doc, skip the redundant CRDT op and just
-            // re-propagate. Only the watcher-driven external-delete path, where
-            // nothing wrote the tombstone yet, actually marks here.
+            // Idempotent: skip the redundant CRDT op and just re-propagate. The
+            // `mark_deleted` fallback below is a safety net for a caller that
+            // fans out before committing (tests do). It is NOT an inferred-delete
+            // path and must never become one: it would tombstone with no
+            // existence check.
             if !doc.is_deleted()? {
                 doc.mark_deleted(super::util::now_millis())?;
                 store.save(&path, &mut doc)?;
@@ -1819,8 +1837,8 @@ async fn handle_local(ctx: &mut SyncCtx, change: LocalChange) -> SyncResult<()> 
         }
         LocalChange::RemovedPrefix { .. } => {
             // Prefix removals (external folder deletes) are expanded into a
-            // tombstone per nested note centrally in the engine's
-            // watcher-intake loop (`mark_note_deleted` for each), BEFORE
+            // verified tombstone per nested note centrally in the engine
+            // (`schedule_prefix_removal` → `commit_tombstone`), BEFORE
             // fan-out — a peer task never receives one. Handled here only for
             // match exhaustiveness; the central path owns the docstore sweep.
         }
@@ -2802,6 +2820,8 @@ mod tests {
             peer_vault_id: [0u8; 16],
             control: tx,
             generation: 0,
+            dialed_by_us: false,
+            established_at: std::time::Instant::now(),
             peer_reconnect: None,
             resumption_token: [0u8; 32].into(),
         };

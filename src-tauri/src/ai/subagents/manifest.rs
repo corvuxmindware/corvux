@@ -219,6 +219,10 @@ pub fn parse_agent_md(
     })
 }
 
+/// Read an AGENT.md from disk with plain `std::fs` and parse it. Used ONLY for
+/// the user's global `~/.corvux/agents` folder (not part of any roost; may be a
+/// link farm). Roost-local manifests are read by `skills::roost_scan` through the
+/// roost filesystem, which refuses links that leave the roost (AT-5).
 pub fn read_and_parse(agent_md_path: &Path) -> Result<SubagentDef, SubagentParseError> {
     let folder = agent_md_path
         .parent()

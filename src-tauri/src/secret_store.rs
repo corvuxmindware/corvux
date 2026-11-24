@@ -149,13 +149,71 @@ mod mobile {
         Ok(seed)
     }
 
-    /// Write `data` to `path` atomically: write to `path.tmp` first, then
-    /// rename. Power-cut mid-write leaves the destination intact (either
-    /// the old contents or nothing — never a truncated half).
+    /// Write `data` to `path` atomically AND durably: write to `path.tmp`,
+    /// fsync it, rename it over `path`, then fsync the parent directory so the
+    /// rename itself survives a power cut. A power cut mid-write leaves the
+    /// destination intact (the old contents or nothing — never a truncated
+    /// half), and once this returns `Ok` the new contents are on disk. That
+    /// matters: callers (e.g. the hosting-PIN migration) delete their fallback
+    /// copy as soon as a secret is stored, so "stored" has to mean durable. Same
+    /// discipline as the desktop stores (`peer_store::write_envelope`: file
+    /// fsync before rename), plus the directory fsync they lack.
+    ///
+    /// The temp file may hold a plaintext seed, so it is removed on any failure.
     fn write_atomic(path: &std::path::Path, data: &[u8]) -> Result<(), String> {
         let tmp = path.with_extension("tmp");
-        fs::write(&tmp, data).map_err(|e| format!("write tmp {}: {e}", tmp.display()))?;
-        fs::rename(&tmp, path).map_err(|e| format!("rename {}: {e}", path.display()))?;
+        let result = write_synced(&tmp, data)
+            .and_then(|()| {
+                fs::rename(&tmp, path).map_err(|e| format!("rename {}: {e}", path.display()))
+            })
+            .and_then(|()| sync_parent_dir(path));
+        if result.is_err() {
+            // Best effort; after a successful rename the temp is already gone.
+            let _ = fs::remove_file(&tmp);
+        }
+        result
+    }
+
+    /// Create/truncate `path`, write `data` and fsync the file.
+    fn write_synced(path: &std::path::Path, data: &[u8]) -> Result<(), String> {
+        use std::io::Write;
+        let mut file =
+            fs::File::create(path).map_err(|e| format!("create tmp {}: {e}", path.display()))?;
+        file.write_all(data)
+            .map_err(|e| format!("write tmp {}: {e}", path.display()))?;
+        file.sync_all()
+            .map_err(|e| format!("sync tmp {}: {e}", path.display()))
+    }
+
+    /// fsync the directory holding `path` so a completed rename is durable.
+    /// Android and iOS are unix; the directory handle is not openable on
+    /// Windows (only the host test build compiles this module there), where the
+    /// rename's durability is the OS's job. A filesystem that cannot fsync a
+    /// directory at all (`Unsupported` / `InvalidInput`) is not an error: there
+    /// is nothing more to do on it.
+    #[cfg(unix)]
+    fn sync_parent_dir(path: &std::path::Path) -> Result<(), String> {
+        let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) else {
+            return Ok(());
+        };
+        let dir =
+            fs::File::open(parent).map_err(|e| format!("open dir {}: {e}", parent.display()))?;
+        match dir.sync_all() {
+            Ok(()) => Ok(()),
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::Unsupported | std::io::ErrorKind::InvalidInput
+                ) =>
+            {
+                Ok(())
+            }
+            Err(e) => Err(format!("sync dir {}: {e}", parent.display())),
+        }
+    }
+
+    #[cfg(not(unix))]
+    fn sync_parent_dir(_path: &std::path::Path) -> Result<(), String> {
         Ok(())
     }
 
@@ -280,6 +338,63 @@ mod mobile {
             assert!(!secrets.exists());
             assert_eq!(&*get_or_create_seed_at(&seed, &secrets).unwrap(), &*fresh);
         }
+        /// SY-5a: the durable write replaces the destination, leaves no temp
+        /// behind and returns Ok only after file + directory were synced. (The
+        /// fsyncs themselves are not observable from a test; this pins the
+        /// observable contract and that the unix directory-sync step succeeds on
+        /// a real directory instead of erroring.)
+        #[test]
+        fn write_atomic_creates_replaces_and_leaves_no_temp() {
+            let dir = tempfile::tempdir().unwrap();
+            let target = dir.path().join("secret.bin");
+            write_atomic(&target, b"first").unwrap();
+            assert_eq!(fs::read(&target).unwrap(), b"first");
+            write_atomic(&target, b"second, longer").unwrap();
+            assert_eq!(fs::read(&target).unwrap(), b"second, longer");
+            assert!(!target.with_extension("tmp").exists());
+            let names: Vec<_> = fs::read_dir(dir.path())
+                .unwrap()
+                .map(|e| e.unwrap().file_name())
+                .collect();
+            assert_eq!(names.len(), 1, "only the target remains: {names:?}");
+        }
+
+        #[test]
+        fn write_atomic_failure_removes_the_temp_and_keeps_the_old_file() {
+            let dir = tempfile::tempdir().unwrap();
+            let target = dir.path().join("secret.bin");
+            write_atomic(&target, b"keep me").unwrap();
+            // A directory squatting on the destination makes the rename fail
+            // after the temp was written and synced.
+            let blocked = dir.path().join("blocked.bin");
+            fs::create_dir(&blocked).unwrap();
+            fs::write(blocked.join("child"), b"x").unwrap();
+            assert!(write_atomic(&blocked, b"never lands").is_err());
+            assert!(
+                !blocked.with_extension("tmp").exists(),
+                "a failed write must not leave the (possibly plaintext) temp behind"
+            );
+            assert_eq!(fs::read(&target).unwrap(), b"keep me");
+        }
+
+        #[test]
+        fn write_atomic_into_a_missing_directory_is_an_error() {
+            let dir = tempfile::tempdir().unwrap();
+            let target = dir.path().join("no-such-dir").join("secret.bin");
+            assert!(write_atomic(&target, b"x").is_err());
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn sync_parent_dir_works_on_a_real_directory() {
+            let dir = tempfile::tempdir().unwrap();
+            let target = dir.path().join("f");
+            fs::write(&target, b"x").unwrap();
+            sync_parent_dir(&target).unwrap();
+            // A bare file name has no usable parent: nothing to sync, not an error.
+            sync_parent_dir(std::path::Path::new("f")).unwrap();
+        }
+
         #[test]
         fn mobile_secret_round_trip_and_authentication_failure() {
             let seed = Zeroizing::new([17u8; 32]);

@@ -35,6 +35,7 @@ use crate::events;
 use super::provider::{ChatMessage, ChatRole, LLMProvider};
 use super::streaming::consumer::SseEvents;
 use super::streaming::openai_compat_chat::spawn_openai_compat_chat;
+use super::streaming::{push_capped, MAX_STREAMED_TEXT_BYTES};
 use super::tool_protocol::{StreamEvent, ToolDef};
 // Test-only — same rationale as openrouter.rs.
 #[cfg(test)]
@@ -318,7 +319,8 @@ async fn stream_chat_impl<R: tauri::Runtime>(
             if text.is_empty() {
                 continue;
             }
-            full_text.push_str(text);
+            // AT-6: bounded; past the cap the reply is stopped.
+            push_capped(&mut full_text, text, MAX_STREAMED_TEXT_BYTES, "text")?;
             events::AiChunk(text.to_string()).emit(app).ok();
         }
     }

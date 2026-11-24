@@ -17,6 +17,7 @@ import type { ConnectionTestResult } from "../../../lib/bindings";
 import { errMsg } from "../../../lib/error";
 import { confirmDialog } from "../../../lib/confirm";
 import { settingsStore } from "../../../stores/settings";
+import { reportProviderSaveFailure } from "./saveOutcome";
 
 /** Curated suggestions for the picker; users can paste any
  *  `provider/model-name` id from openrouter.ai/models too. */
@@ -77,8 +78,8 @@ export default function OpenRouterProvider() {
       setOrTest(null);
       setTimeout(() => setOrSaved(false), 2000);
     } catch (e) {
-      const msg = errMsg(e);
-      setOrSaveError(msg);
+      // A declined native confirmation is a choice, not a failure.
+      reportProviderSaveFailure(e, setOrSaveError);
     }
   }
 
@@ -112,7 +113,7 @@ export default function OpenRouterProvider() {
       setEditingOR(false);
       setOrTest(null);
     } catch (e) {
-      setOrSaveError(errMsg(e));
+      reportProviderSaveFailure(e, setOrSaveError);
     }
   }
 

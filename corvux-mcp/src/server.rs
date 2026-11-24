@@ -17,7 +17,8 @@ use serde_json::{json, Value};
 use crate::atomic_write::WriteError;
 use crate::conventions::{
     append_to_end, append_under_heading, append_under_tasks, complete_task_in, format_task_line,
-    is_hhmm, is_iso_date, pick_daily_template, reschedule_task_in, today_local,
+    is_calendar_date, is_iso_date, normalize_hhmm, pick_daily_template, reschedule_task_in,
+    today_local,
 };
 use crate::frontmatter;
 use crate::index::RoostIndex;
@@ -273,13 +274,15 @@ impl Server {
         if tags.is_empty() {
             return Vec::new();
         }
-        // lowercase -> canonical spelling; tag_counts is count-desc, so the
-        // most-used spelling of a case-variant wins.
+        // identity key -> canonical spelling. `tag_counts` is already one entry
+        // per identity (LR-6) shown under its most-used spelling, so the
+        // most-used spelling of a variant wins. The key is `fold_tag`
+        // (Unicode lowercase of NFC), shared with the app and the filters.
         let canon: HashMap<String, String> = {
             let idx = self.index_refreshed();
             let mut m = HashMap::new();
             for (t, _) in idx.tag_counts() {
-                m.entry(t.to_lowercase()).or_insert(t);
+                m.entry(frontmatter::fold_tag(&t)).or_insert(t);
             }
             m
         };
@@ -291,7 +294,7 @@ impl Server {
                     .trim_start_matches('#')
                     .trim();
                 canon
-                    .get(&clean.to_lowercase())
+                    .get(&frontmatter::fold_tag(clean))
                     .cloned()
                     .unwrap_or_else(|| clean.to_string())
             })
@@ -739,7 +742,7 @@ impl Server {
         for t in &tags {
             let t = t.trim_start_matches('#');
             frontmatter::reject_structural_chars(t, "tag", true)?;
-            if !all_tags.iter().any(|e| e.eq_ignore_ascii_case(t)) {
+            if !all_tags.iter().any(|e| frontmatter::same_tag(e, t)) {
                 all_tags.push(t.to_string());
             }
         }
@@ -871,19 +874,24 @@ impl Server {
         let note = arg_opt_str(args, "note");
 
         if let Some(d) = &provided_date {
-            if !is_iso_date(d) {
+            // A real calendar day: the app's scheduler drops one that doesn't
+            // exist, so writing it would be a reminder that never fires.
+            if !is_calendar_date(d) {
                 return Err(format!("due_date must be YYYY-MM-DD, got \"{d}\""));
             }
         }
-        if let Some(t) = &due_time {
-            if !is_hhmm(t) {
-                return Err(format!("due_time must be 24-hour HH:MM, got \"{t}\""));
-            }
-            if provided_date.is_none() {
-                return Err(
-                    "due_time requires due_date (use add_reminder, or pass due_date)".to_string(),
-                );
-            }
+        // `9:30` is accepted and written as the canonical `09:30`.
+        let due_time = match due_time {
+            Some(t) => Some(
+                normalize_hhmm(&t)
+                    .ok_or_else(|| format!("due_time must be 24-hour HH:MM, got \"{t}\""))?,
+            ),
+            None => None,
+        };
+        if due_time.is_some() && provided_date.is_none() {
+            return Err(
+                "due_time requires due_date (use add_reminder, or pass due_date)".to_string(),
+            );
         }
 
         // Convention 0.3: a dateless checkbox isn't a task. Default to today
@@ -901,12 +909,11 @@ impl Server {
         let text = arg_str(args, "text")?;
         let date = arg_str(args, "date")?;
         let time = arg_str(args, "time")?;
-        if !is_iso_date(&date) {
+        if !is_calendar_date(&date) {
             return Err(format!("date must be YYYY-MM-DD, got \"{date}\""));
         }
-        if !is_hhmm(&time) {
-            return Err(format!("time must be 24-hour HH:MM, got \"{time}\""));
-        }
+        let time = normalize_hhmm(&time)
+            .ok_or_else(|| format!("time must be 24-hour HH:MM, got \"{time}\""))?;
         let note = arg_opt_str(args, "note");
         // A reminder IS a date+time task — that's what fires the Corvux
         // notification. There is no separate reminder syntax in the app.
@@ -1664,16 +1671,19 @@ impl Server {
         if new_date.is_empty() && new_time.is_empty() {
             return Err("pass at least one of `date` or `time` (or \"clear\")".to_string());
         }
-        if !new_date.is_empty() && new_date != "clear" && !is_iso_date(&new_date) {
+        if !new_date.is_empty() && new_date != "clear" && !is_calendar_date(&new_date) {
             return Err(format!(
                 "date must be YYYY-MM-DD or \"clear\", got \"{new_date}\""
             ));
         }
-        if !new_time.is_empty() && new_time != "clear" && !is_hhmm(&new_time) {
-            return Err(format!(
-                "time must be 24-hour HH:MM or \"clear\", got \"{new_time}\""
-            ));
-        }
+        // `9:30` is accepted and written as the canonical `09:30`.
+        let new_time = if new_time.is_empty() || new_time == "clear" {
+            new_time
+        } else {
+            normalize_hhmm(&new_time).ok_or_else(|| {
+                format!("time must be 24-hour HH:MM or \"clear\", got \"{new_time}\"")
+            })?
+        };
         let rel = self.resolve_note_ref(&note)?;
         // Single-shot, no retry — same fuzzy-match ABA hazard as complete_task.
         let line = self.checked_read_modify_write(&rel, |content| {
@@ -1684,9 +1694,31 @@ impl Server {
 }
 
 /// One-line body snippet: whitespace-flattened, capped to `max` chars.
+///
+/// Reads only as much of `body` as the cap needs (AT-3, MCP side): a 1 MB
+/// body, or a single 1 MB word, is not flattened and copied whole just to keep
+/// its first couple of hundred chars.
 fn body_snippet(body: &str, max: usize) -> String {
-    let flat: String = body.split_whitespace().collect::<Vec<_>>().join(" ");
-    if flat.chars().count() > max {
+    let mut flat = String::new();
+    // Chars pushed so far; stops one past `max` so "was it longer?" is known.
+    let mut chars = 0usize;
+    for word in body.split_whitespace() {
+        if chars > max {
+            break;
+        }
+        if !flat.is_empty() {
+            flat.push(' ');
+            chars += 1;
+        }
+        for c in word.chars() {
+            if chars > max {
+                break;
+            }
+            flat.push(c);
+            chars += 1;
+        }
+    }
+    if chars > max {
         let s: String = flat.chars().take(max).collect();
         format!("{}…", s.trim_end())
     } else {
@@ -2236,6 +2268,21 @@ mod tests {
         let s = Server::new(v);
         initialize(&s);
         (dir, s)
+    }
+
+    /// `body_snippet` keeps its old output but only reads what the cap needs.
+    #[test]
+    fn body_snippet_flattens_caps_and_reads_only_what_it_needs() {
+        assert_eq!(body_snippet("  a \n b\t c ", 50), "a b c");
+        assert_eq!(body_snippet("one two three", 7), "one two…");
+        assert_eq!(body_snippet("abc", 3), "abc", "exactly max is not cut");
+        assert_eq!(body_snippet("abcd", 3), "abc…");
+        assert_eq!(body_snippet("", 5), "");
+        // One 1 MiB word and a 1 MiB multi-byte body: bounded, boundary-safe.
+        let s = body_snippet(&"x".repeat(1 << 20), 200);
+        assert_eq!(s.chars().count(), 201);
+        let s = body_snippet(&"界 ".repeat(500_000), 200);
+        assert!(s.ends_with('…') && s.chars().count() <= 201);
     }
 
     /// Send `initialize` so subsequent `tools/call`/`tools/list` pass the
@@ -2809,6 +2856,95 @@ mod tests {
         assert_eq!(r["isError"], true);
     }
 
+    /// AT-9 parity: a due time the app's scheduler cannot arm must be refused
+    /// with an error, not written as a reminder that silently never fires; the
+    /// single-digit-hour spelling the scheduler now arms is canonicalised.
+    #[test]
+    fn reminder_tools_refuse_unarmable_dates_and_canonicalise_times() {
+        let (_d, s) = server();
+        s.roost
+            .write_atomic("Plan.md", "# Plan\n\n## Tasks\n\n")
+            .unwrap();
+        // A day that does not exist is refused by every writer.
+        for (tool, args) in [
+            (
+                "add_reminder",
+                json!({"text":"x","date":"2030-02-30","time":"10:00"}),
+            ),
+            (
+                "add_reminder",
+                json!({"text":"x","date":"2030-13-01","time":"10:00"}),
+            ),
+            ("add_task", json!({"text":"x","due_date":"2030-02-30"})),
+            (
+                "add_task",
+                json!({"text":"x","due_date":"2030-04-31","due_time":"10:00"}),
+            ),
+        ] {
+            let r = call(&s, tool, args.clone());
+            assert_eq!(r["isError"], true, "{tool} {args}");
+            assert!(text_of(&r).contains("YYYY-MM-DD"), "{}", text_of(&r));
+        }
+        // Times the scheduler cannot read are refused with a clear message.
+        for t in ["10:00:00", "10", "24:00", "10:60", "T10:00", "10:00pm"] {
+            let r = call(
+                &s,
+                "add_reminder",
+                json!({"text":"x","date":"2030-05-08","time":t}),
+            );
+            assert_eq!(r["isError"], true, "{t}");
+            assert!(text_of(&r).contains("HH:MM"), "{}", text_of(&r));
+        }
+        // `9:30` is accepted and written canonically.
+        let r = call(
+            &s,
+            "add_reminder",
+            json!({"text":"Standup","date":"2030-05-08","time":"9:30","note":"Plan"}),
+        );
+        assert_eq!(r["isError"], false, "{}", text_of(&r));
+        let note = s.roost.read("Plan.md").unwrap();
+        assert!(
+            note.contains("- [ ] Standup 📅 2030-05-08 ⏰ 09:30"),
+            "{note}"
+        );
+        let r = call(
+            &s,
+            "add_task",
+            json!({"text":"Call","due_date":"2030-05-09","due_time":"7:05","note":"Plan"}),
+        );
+        assert_eq!(r["isError"], false, "{}", text_of(&r));
+        assert!(s
+            .roost
+            .read("Plan.md")
+            .unwrap()
+            .contains("- [ ] Call 📅 2030-05-09 ⏰ 07:05"));
+        // reschedule_task: canonicalised too; impossible date refused.
+        let r = call(
+            &s,
+            "reschedule_task",
+            json!({"note":"Plan","text":"Call","date":"2030-05-10","time":"8:15"}),
+        );
+        assert_eq!(r["isError"], false, "{}", text_of(&r));
+        assert!(s
+            .roost
+            .read("Plan.md")
+            .unwrap()
+            .contains("- [ ] Call 📅 2030-05-10 ⏰ 08:15"));
+        let r = call(
+            &s,
+            "reschedule_task",
+            json!({"note":"Plan","text":"Call","date":"2030-02-31"}),
+        );
+        assert_eq!(r["isError"], true);
+        // "clear" still works for both tokens.
+        let r = call(
+            &s,
+            "reschedule_task",
+            json!({"note":"Plan","text":"Call","time":"clear"}),
+        );
+        assert_eq!(r["isError"], false, "{}", text_of(&r));
+    }
+
     #[test]
     fn tools_refuse_non_corvux_folder() {
         let dir = TempDir::new().unwrap(); // no .corvux/
@@ -2926,6 +3062,58 @@ mod tests {
         assert!(
             !note.contains("- ML"),
             "must not fork a #ML variant: {note}"
+        );
+    }
+
+    /// LR-6/LR-7: the vocabulary is one entry per tag identity, so list_tags
+    /// shows `#ML (3)` once (not `#ML (2)` and `#ml (1)`), and add_tags snaps a
+    /// Unicode/NFD/upper-case spelling onto the established one.
+    #[test]
+    fn list_tags_and_snap_use_tag_identity() {
+        let (_d, s) = server();
+        s.roost
+            .write_atomic("A.md", "---\ntags: [ML]\n---\n\n# A\n")
+            .unwrap();
+        s.roost
+            .write_atomic("B.md", "# B\n\n#ML and #café\n")
+            .unwrap();
+        s.roost
+            .write_atomic("C.md", "---\ntags: [ml]\n---\n\n# C\n")
+            .unwrap();
+        s.roost.write_atomic("Note.md", "# Note\n\nbody\n").unwrap();
+
+        let res = call(&s, "list_tags", json!({}));
+        assert_eq!(res["isError"], false);
+        let text = res["content"][0]["text"].as_str().unwrap();
+        assert!(
+            text.contains("#ML (3)"),
+            "one merged entry, most-used spelling: {text}"
+        );
+        assert!(
+            !text.contains("#ml ("),
+            "no forked lower-case entry: {text}"
+        );
+        assert!(text.contains("#café (1)"), "unicode tag is whole: {text}");
+        assert_eq!(res["structuredContent"]["total"], 2);
+
+        let at = call(
+            &s,
+            "add_tags",
+            json!({"note":"Note","tags":["ml","CAFE\u{301}"]}),
+        );
+        assert_eq!(at["isError"], false);
+        let note = s.roost.read("Note.md").unwrap();
+        assert!(
+            note.contains("- ML"),
+            "snapped to the established spelling: {note}"
+        );
+        assert!(
+            note.contains("- café"),
+            "NFD input snapped to NFC spelling: {note}"
+        );
+        assert!(
+            !note.contains("- ml"),
+            "must not fork a #ml variant: {note}"
         );
     }
 

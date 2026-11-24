@@ -6,6 +6,7 @@ import { isIOS as platformIsIOS } from "../lib/platform";
 import { lsGet, lsKeysWithPrefix, lsRemove } from "../lib/storage";
 import { log } from "../lib/log";
 import { roostStore } from "./roost";
+import { toastStore } from "../components/Toast/Toast";
 
 type PeerConnectionStateMsg =
   | { kind: "disconnected" }
@@ -353,6 +354,15 @@ function createSyncStatusStore() {
         // A peer's change for this note couldn't be applied locally. Record it
         // so the UI can surface a per-note "sync issue" marker.
         setNoteSyncFailures(ev.path, { reason: ev.reason, at: Date.now() });
+        // An empty path is the engine's roost-wide safety notice: it saw a
+        // missing/empty roost folder or a mass vanish and deliberately did NOT
+        // propagate any deletes (SY-2 breaker). Silence would hide why notes
+        // are missing from the tree, so say it once; the backend already
+        // rate-limits the event to one per minute.
+        if (ev.path === "") {
+          // `reason` is already a full sentence ("Sync paused deleting notes: …").
+          toastStore.show(ev.reason, "warning", 10000);
+        }
         break;
       case "note_deleted":
         // The note is gone — a stale failure marker for it is meaningless.

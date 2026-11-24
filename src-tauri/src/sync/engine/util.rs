@@ -91,6 +91,8 @@ pub(super) fn clone_handle(handle: &PeerHandle) -> PeerHandle {
         peer_vault_id: handle.peer_vault_id,
         control: handle.control_clone(),
         generation: handle.generation,
+        dialed_by_us: handle.dialed_by_us,
+        established_at: handle.established_at,
         peer_reconnect: handle.peer_reconnect.clone(),
         resumption_token: handle.resumption_token.clone(),
     }

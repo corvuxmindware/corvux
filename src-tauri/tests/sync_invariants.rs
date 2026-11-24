@@ -13,6 +13,14 @@
 //!            (scoped to one roost's registry), anywhere in the crate.
 //!   SY-1   — the first-pair enrollment window is opened only after the
 //!            native-dialog gate, in every pairing command (review 2026-11-12).
+//!   SY-3   — prefs flows that need no PIN cannot reach the secret store
+//!            (`sy3_*`); SY-4 — unpair forgets the first-pair confirmation
+//!            (`sy4_*`); SY-5 — removed roosts lose their PIN slots, mobile
+//!            secret writes are fsynced (`sy5_*`); SY-7 — the pairing trust
+//!            record file is inside the raw-fs / spawn ratchets and has its
+//!            own lock rules (`sy7_*`).
+//!   SY-Q   — the only HTTP client on the sync surface is the queue client's, and
+//!            it never follows redirects (`syq_*`).
 //!
 //! ## Production-only counting (fixed 2026-07-11)
 //!
@@ -155,8 +163,14 @@ fn production_code_lines(text: &str) -> Vec<String> {
     out
 }
 
+/// The sync surface outside `src/sync/`: the IPC layer. `sync_endpoint.rs`
+/// holds the pairing trust records (raw `std::fs`, a static tokio lane + a static
+/// std mutex), so it is a sync file for every ratchet below — it used to sit
+/// outside all of them (review 2026-11-12, SY-7).
+const SYNC_COMMAND_FILES: [&str; 2] = ["src/commands/sync.rs", "src/commands/sync_endpoint.rs"];
+
 /// Compare per-file production counts of `needles` across the sync surface
-/// (`src/sync/**` + `src/commands/sync.rs`) against `baseline`, reporting every
+/// (`src/sync/**` + [`SYNC_COMMAND_FILES`]) against `baseline`, reporting every
 /// deviation with remediation. `src/roostfs/` is the hardened backend and lives
 /// OUTSIDE `src/sync/`, so it is never in scope — no exclusion needed.
 fn run_ratchet(
@@ -168,9 +182,10 @@ fn run_ratchet(
     let root = manifest_dir();
     let mut files = Vec::new();
     collect_rs_files(&root.join("src/sync"), &mut files);
-    let commands_sync = root.join("src/commands/sync.rs");
-    if commands_sync.exists() {
-        files.push(commands_sync);
+    for rel in SYNC_COMMAND_FILES {
+        let file = root.join(rel);
+        assert!(file.exists(), "sync surface file moved or renamed: {rel}");
+        files.push(file);
     }
     check_ratchet(invariant, &files, needles, baseline, remediation);
 }
@@ -235,6 +250,11 @@ fn syn_i1_no_new_raw_fs_on_sync_surface() {
     let baseline: BTreeMap<&str, usize> = BTreeMap::from([
         // Shared atomic preference persistence removed the local write + rename.
         ("src/commands/sync.rs", 6), // APP-PRIVATE — prefs.json + tls.bin under app_data_dir/sync
+        // APP-PRIVATE — the pairing trust record `app_data_dir/confirmed_sync_peers.json`
+        // (read, write-tmp, rename) + a read-only listing of `<app_data>/vaults` to find the
+        // paired-peer registries (marked, exactly-named index dirs only, SA-1). Never the
+        // roost. SY-7: this file was outside the ratchet until 2026-11-12.
+        ("src/commands/sync_endpoint.rs", 4),
         ("src/sync/engine/engine.rs", 1), // APP-PRIVATE — DocStore/PeerStore state_dir (never the roost)
     ]);
     run_ratchet(
@@ -474,4 +494,371 @@ fn sy1_enrollment_window_opens_only_after_native_gate() {
         checked, 4,
         "expected the 4 pinned openers in commands/sync.rs"
     );
+}
+
+// ── Review 2026-11-12, SY-3 / SY-4 / SY-5 / SY-7 ─────────────────────────────
+//
+// Textual guards over the IPC layer (`commands/sync.rs`, `commands/sync_endpoint.rs`).
+// Same limits as SY-1 above: they see source order and the enclosing function, not
+// control flow; the behaviour is proven by the unit tests named in each message.
+
+/// A column-0 line that opens a function (`fn`, `pub async fn`, …).
+fn is_top_level_fn(line: &str) -> bool {
+    !line.starts_with(char::is_whitespace) && line.contains("fn ") && !line.trim().is_empty()
+}
+
+/// Name of the top-level function enclosing (or declared on) line `i`.
+fn enclosing_fn(lines: &[String], i: usize) -> String {
+    (0..=i)
+        .rev()
+        .find(|&j| is_top_level_fn(&lines[j]))
+        .and_then(|j| lines[j].split("fn ").nth(1))
+        .and_then(|rest| rest.split(['(', '<']).next())
+        .unwrap_or("")
+        .trim()
+        .to_string()
+}
+
+/// The production lines of function `name`, header included (to its closing
+/// column-0 `}`).
+fn fn_body(lines: &[String], name: &str) -> Vec<String> {
+    let start = lines
+        .iter()
+        .position(|l| is_top_level_fn(l) && l.contains(&format!("fn {name}(")))
+        .unwrap_or_else(|| panic!("fn {name} not found"));
+    let end = (start + 1..lines.len())
+        .find(|&j| lines[j].starts_with('}'))
+        .unwrap_or(lines.len() - 1);
+    lines[start..=end].to_vec()
+}
+
+fn production_lines_of(rel: &str) -> Vec<String> {
+    let text =
+        fs::read_to_string(manifest_dir().join(rel)).unwrap_or_else(|e| panic!("{rel}: {e}"));
+    production_code_lines(&text)
+}
+
+/// Functions (enclosing, header lines excluded) that contain `needle`, sorted.
+fn callers_of(lines: &[String], needle: &str) -> Vec<String> {
+    let mut out: Vec<String> = lines
+        .iter()
+        .enumerate()
+        .filter(|(_, l)| l.contains(needle) && !is_top_level_fn(l))
+        .map(|(i, _)| enclosing_fn(lines, i))
+        .collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// SY-3: a prefs load that fails closed on the secret store took down init,
+/// autostart, the queue/strict-P2P settings and — worst — `sync_stop` (the
+/// engine stopped, then the load failed, so `enabled` stayed true and sync
+/// resumed on the next launch against the user's choice). The fix splits the
+/// prefs: `StoredPrefs` (no secret store, ever) for every flow that needs only
+/// non-secret settings, `load_prefs_with_pins` only where a PIN is used.
+///
+/// This pins the split: the secret-bearing loader/saver and every direct
+/// `secret_store` call in `commands/sync.rs` have an exact, named list of
+/// callers. A new caller fails here until someone argues it needs a PIN.
+#[test]
+fn sy3_secret_bearing_prefs_loads_are_limited_to_pin_consumers() {
+    let lines = production_lines_of("src/commands/sync.rs");
+
+    assert!(
+        !lines
+            .iter()
+            .any(|l| l.contains("load_sync_prefs(") || l.contains("save_sync_prefs(")),
+        "SY-3: `load_sync_prefs`/`save_sync_prefs` no longer exist — non-secret flows use \
+         `load_stored_prefs`/`save_stored_prefs`, PIN flows `load_prefs_with_pins`/`save_prefs_with_pins`"
+    );
+
+    // Needle -> the exact set of functions (other than its own definition) that may use it.
+    let pinned: [(&str, &[&str]); 4] = [
+        // The PIN consumers: the listener PIN at autostart, "Show pairing code",
+        // and the iroh dialer's own sticky PIN.
+        (
+            "load_prefs_with_pins(",
+            &[
+                "sync_connect_iroh",
+                "sync_listen_iroh",
+                "sync_try_autostart",
+            ],
+        ),
+        // Writers of a PIN (or the migration that moves a plaintext one).
+        (
+            "save_prefs_with_pins(",
+            &[
+                "hydrate_prefs",
+                "sync_connect_iroh",
+                "sync_listen_iroh",
+                "sync_start_listening",
+                "sync_try_autostart",
+            ],
+        ),
+        (
+            "hydrate_prefs(",
+            &["load_prefs_with_pins", "sync_try_autostart"],
+        ),
+        // Every direct secret-store call: hydrate (get), save (set), purge (delete).
+        (
+            "secret_store::",
+            &[
+                "hydrate_prefs",
+                "purge_hosting_pins",
+                "save_prefs_with_pins",
+            ],
+        ),
+    ];
+    for (needle, allowed) in pinned {
+        let callers = callers_of(&lines, needle);
+        let own = needle.trim_end_matches(['(', ':']);
+        let callers: Vec<&str> = callers
+            .iter()
+            .map(String::as_str)
+            .filter(|c| *c != own)
+            .collect();
+        assert_eq!(
+            callers, allowed,
+            "SY-3: callers of `{needle}` in commands/sync.rs changed. A flow that needs only \
+             non-secret settings must use `load_stored_prefs`/`save_stored_prefs` (they cannot \
+             reach the secret store); a flow that really needs a PIN must be added here."
+        );
+    }
+
+    // `sync_stop` must record the user's choice without any secret access.
+    let stop = fn_body(&lines, "sync_stop");
+    let stop_text = stop.join("\n");
+    assert!(
+        stop_text.contains("record_stop_in_prefs("),
+        "SY-3: sync_stop must clear `enabled` through record_stop_in_prefs"
+    );
+    for forbidden in ["with_pins", "secret_store", "hydrate", "load_stored_prefs"] {
+        assert!(
+            !stop_text.contains(forbidden),
+            "SY-3: sync_stop must not touch `{forbidden}` — it cannot depend on the keychain"
+        );
+    }
+
+    // The stored-prefs layer itself never names the secret store.
+    for name in [
+        "read_stored_prefs",
+        "write_stored_prefs",
+        "save_stored_prefs",
+        "load_stored_prefs",
+        "record_stop_in_prefs",
+        "bring_up_prefs",
+    ] {
+        let body = fn_body(&lines, name).join("\n");
+        assert!(
+            !body.contains("secret_store") && !body.contains("strip_hosting_pins"),
+            "SY-3: `{name}` must not reach the secret store"
+        );
+    }
+}
+
+/// SY-4: `sync_unpair` must drop the peer's first-pair confirmation (record AND
+/// session memory) — and must do it BEFORE `engine.unpair`, so a record that
+/// cannot be cleared refuses the unpair instead of leaving a silent re-pair path
+/// open. Behaviour: `sync_endpoint::first_pair_gate_tests::unpairing_*`.
+#[test]
+fn sy4_unpair_forgets_the_confirmation_before_dropping_the_peer() {
+    let lines = production_lines_of("src/commands/sync.rs");
+    let body = fn_body(&lines, "sync_unpair");
+    let pos = |needle: &str| {
+        body.iter()
+            .position(|l| l.contains(needle))
+            .unwrap_or_else(|| panic!("SY-4: sync_unpair lost `{needle}`"))
+    };
+    let (keys, forget, unpair) = (
+        pos("confirm_keys_for_peer"),
+        pos("forget_confirmed_peer("),
+        pos(".unpair("),
+    );
+    assert!(
+        keys < forget && forget < unpair,
+        "SY-4: sync_unpair must read the peer's keys, clear its confirmation, THEN unpair"
+    );
+}
+
+/// SY-5b: a removed roost's hosting-PIN slots (keyed by the roost PATH) are
+/// deleted at the one place that sees every removal — the authorized manifest
+/// write — and SY-5a: the mobile secret store's `write_atomic` fsyncs the file
+/// and its directory.
+#[test]
+fn sy5_removed_roosts_lose_their_pin_slots_and_mobile_writes_are_durable() {
+    let roost = production_lines_of("src/commands/roost.rs");
+    assert_eq!(
+        callers_of(&roost, "purge_hosting_pins("),
+        ["write_roost_manifest"],
+        "SY-5b: the hosting-PIN purge must run from write_roost_manifest's removal block"
+    );
+
+    // The mobile module is `cfg(any(android, ios, test))`, which the production
+    // splitter treats as test code — read the raw text.
+    let text =
+        fs::read_to_string(manifest_dir().join("src/secret_store.rs")).expect("secret_store.rs");
+    let section = |from: &str, to: &str| {
+        text.split(from)
+            .nth(1)
+            .and_then(|s| s.split(to).next())
+            .unwrap_or_else(|| panic!("secret_store.rs lost `{from}`"))
+            .to_string()
+    };
+    let write_atomic = section("fn write_atomic(", "fn write_synced(");
+    assert!(
+        write_atomic.contains("write_synced(")
+            && write_atomic.contains("sync_parent_dir(")
+            && write_atomic.contains("fs::rename("),
+        "SY-5a: write_atomic must write+fsync the temp, rename, then fsync the directory"
+    );
+    assert!(
+        write_atomic.find("write_synced(") < write_atomic.find("fs::rename(")
+            && write_atomic.find("fs::rename(") < write_atomic.find("sync_parent_dir("),
+        "SY-5a: order must be fsync file -> rename -> fsync directory"
+    );
+    assert!(
+        section("fn write_synced(", "fn sync_parent_dir(").contains(".sync_all()"),
+        "SY-5a: the temp file must be fsynced before the rename"
+    );
+}
+
+/// SY-7: `commands/sync_endpoint.rs` (pairing trust records) is a sync file for
+/// the raw-fs and spawn ratchets above (via `SYNC_COMMAND_FILES`). This adds the
+/// lock rules those line-counting ratchets cannot express:
+///
+/// * its two static locks are exactly the known ones;
+/// * the std mutex's guard is only ever a temporary inside one expression
+///   (never a `let` binding), so it cannot be held across an `.await`;
+/// * once the tokio record lane is taken a function awaits nothing else — in
+///   particular never the native dialog, which can stay open for minutes;
+/// * the record is written only under that lane.
+#[test]
+fn sy7_pairing_trust_record_lock_discipline() {
+    let lines = production_lines_of("src/commands/sync_endpoint.rs");
+
+    // 1. The static locks, by name.
+    let statics: Vec<&String> = lines
+        .iter()
+        .filter(|l| l.contains("static ") && l.contains("Mutex"))
+        .collect();
+    assert_eq!(
+        statics.len(),
+        2,
+        "SY-7: sync_endpoint.rs static locks changed: {statics:?}. A new lock needs its own \
+         rule here (what may be awaited while it is held?)"
+    );
+    assert!(statics
+        .iter()
+        .any(|l| l.contains("CONFIRMED_PEERS_WRITE") && l.contains("tokio::sync::Mutex")));
+    assert!(statics
+        .iter()
+        .any(|l| l.contains("SESSION_CONFIRMED_PEERS") && l.contains("std::sync::Mutex")));
+
+    // 2. The std guard is never bound.
+    let mut uses = 0;
+    for line in &lines {
+        if let Some(at) = line.find("session_confirmed_peers()") {
+            if line.contains("fn session_confirmed_peers(") {
+                continue;
+            }
+            uses += 1;
+            assert!(
+                line[at + "session_confirmed_peers()".len()..].starts_with('.')
+                    && !line.trim_start().starts_with("let "),
+                "SY-7: `session_confirmed_peers()` must be used as a temporary in one expression \
+                 (never bound to a variable that could live across an .await): `{}`",
+                line.trim()
+            );
+        }
+    }
+    assert!(
+        uses >= 4,
+        "SY-7: expected the session-set call sites, found {uses}"
+    );
+
+    // 3. After taking the record lane: no further await, no dialog.
+    let lane_fns: Vec<String> = lines
+        .iter()
+        .enumerate()
+        .filter(|(_, l)| l.contains("CONFIRMED_PEERS_WRITE.lock()"))
+        .map(|(i, _)| enclosing_fn(&lines, i))
+        .collect();
+    assert_eq!(
+        lane_fns,
+        ["record_user_confirmation", "forget_confirmed_peer"],
+        "SY-7: the set of functions that take the record lane changed"
+    );
+    for name in &lane_fns {
+        let body = fn_body(&lines, name);
+        let taken = body
+            .iter()
+            .position(|l| l.contains("CONFIRMED_PEERS_WRITE.lock()"))
+            .expect("lane line");
+        for line in &body[taken + 1..] {
+            assert!(
+                !line.contains(".await") && !line.contains(".confirm("),
+                "SY-7: `{name}` awaits `{}` while holding the record lane — a native dialog or \
+                 any other await under this lock stalls every pairing and unpair",
+                line.trim()
+            );
+        }
+    }
+
+    // 4. The record is only written under the lane.
+    assert_eq!(
+        callers_of(&lines, "save_confirmed_peers("),
+        ["forget_confirmed_peer", "record_user_confirmation"],
+        "SY-7: `confirmed_sync_peers.json` must only be rewritten from a function that holds \
+         CONFIRMED_PEERS_WRITE (an unlocked read-modify-write loses concurrent confirmations)"
+    );
+}
+
+/// SY-Q: the store-and-forward queue client must never follow an HTTP redirect.
+/// reqwest's default policy follows up to 10 hops and re-sends the body on a
+/// 307/308, so a queue server (or any hop in front of it) could bounce the signed
+/// auth proof, the bearer token and the pushed ciphertext to a host of its choosing.
+///
+/// 1. Ratchet: the only HTTP client built on the sync surface is the queue
+///    client's, so a second one (which would have its own, unreviewed redirect
+///    policy) fails until someone classifies it here.
+/// 2. Policy: that one builder sets `Policy::none()` and nothing weakens it.
+///
+/// Limits: text, not behaviour. The behaviour is proven by
+/// `queue::client::tests::queue_client_never_follows_a_redirect`.
+#[test]
+fn syq_queue_http_client_never_follows_redirects() {
+    let root = manifest_dir();
+    let mut files = Vec::new();
+    collect_rs_files(&root.join("src/sync"), &mut files);
+    for rel in SYNC_COMMAND_FILES {
+        files.push(root.join(rel));
+    }
+    check_ratchet(
+        "SY-Q HTTP client on the sync surface",
+        &files,
+        &["Client::builder(", "reqwest::Client::new(", "reqwest::get("],
+        &BTreeMap::from([
+            // The queue client's `build_http_client()`.
+            ("src/sync/queue/client.rs", 1),
+        ]),
+        "Every HTTP client on the sync surface must refuse redirects \
+         (`.redirect(reqwest::redirect::Policy::none())`). Reuse the queue client's builder, or \
+         classify the new client here WITH a comment naming its redirect policy.",
+    );
+
+    let text = fs::read_to_string(root.join("src/sync/queue/client.rs")).expect("read client.rs");
+    let lines = production_code_lines(&text);
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.contains(".redirect(reqwest::redirect::Policy::none())")),
+        "SY-Q: the queue HTTP client no longer sets `redirect(Policy::none())`"
+    );
+    for weaker in ["Policy::limited(", "Policy::default()", "Policy::custom("] {
+        assert!(
+            !lines.iter().any(|l| l.contains(weaker)),
+            "SY-Q: the queue HTTP client uses `{weaker}`; it must never follow a redirect"
+        );
+    }
 }

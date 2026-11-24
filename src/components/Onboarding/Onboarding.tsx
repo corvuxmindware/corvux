@@ -1,6 +1,6 @@
 import { createSignal, For, Show } from "solid-js";
 import { appInvoke, commands, isTauri, setBrowserRoost, unwrap } from "../../lib/invoke";
-import { errMsg } from "../../lib/error";
+import { errMsg, isSecurityCancel } from "../../lib/error";
 import { log } from "../../lib/log";
 import { isAndroid as platformIsAndroid, isIOS as platformIsIOS } from "../../lib/platform";
 import { lsSet } from "../../lib/storage";
@@ -19,6 +19,15 @@ interface OnboardingProps {
 import type { ConnectionTestResult } from "../../lib/bindings";
 
 type Provider = "gemini" | "openrouter" | "skip";
+
+/** Shown (neutral, not an error) when the user cancels the key confirmation. */
+export const KEY_CANCELLED_NOTE =
+  "Nothing was saved. Press Continue to try again, or choose Skip and add a key later in Settings → AI.";
+
+/** Said BEFORE the user saves, so the system dialog that follows is expected
+ *  rather than alarming (every key save now asks for a confirmation). */
+export const KEY_CONFIRM_HINT =
+  "When you continue, your computer will ask you to confirm saving this key. Choose “Allow change”.";
 
 /** Welcome-note content seeded into the user's roost on first run.
  *
@@ -74,6 +83,8 @@ export default function Onboarding(props: OnboardingProps) {
   const [testing, setTesting] = createSignal(false);
   const [testResult, setTestResult] = createSignal<ConnectionTestResult | null>(null);
   const [keySaveError, setKeySaveError] = createSignal<string | null>(null);
+  // Neutral (not red) note shown when the user cancels the key confirmation.
+  const [keyNote, setKeyNote] = createSignal<string | null>(null);
 
   // Step 2 — welcome note opt-IN (default off; user ticks to add it).
   const [includeWelcomeNote, setIncludeWelcomeNote] = createSignal(false);
@@ -174,6 +185,7 @@ export default function Onboarding(props: OnboardingProps) {
    *  silently failing. */
   async function handleSaveAndContinue() {
     setKeySaveError(null);
+    setKeyNote(null);
     const p = provider();
     if (p === "skip") {
       setStep(3);
@@ -198,6 +210,13 @@ export default function Onboarding(props: OnboardingProps) {
       }
       setStep(3);
     } catch (e) {
+      // Saving a key asks the user to confirm in a system dialog. Pressing
+      // Cancel there is their choice, not a failure: say so calmly, keep what
+      // they typed, and let them press Continue again or pick Skip (AK-5).
+      if (isSecurityCancel(e)) {
+        setKeyNote(KEY_CANCELLED_NOTE);
+        return;
+      }
       const msg = errMsg(e);
       setKeySaveError(msg);
     }
@@ -385,6 +404,7 @@ export default function Onboarding(props: OnboardingProps) {
                     setProvider(p);
                     setTestResult(null);
                     setKeySaveError(null);
+                    setKeyNote(null);
                   }}
                   class={`flex-1 py-1.5 rounded-md transition-colors ${
                     provider() === p
@@ -489,6 +509,19 @@ export default function Onboarding(props: OnboardingProps) {
                   Save failed: {err()}
                 </div>
               )}
+            </Show>
+
+            {/* Cancelling the confirmation is a choice: neutral, not red. */}
+            <Show when={keyNote()}>
+              {(note) => (
+                <div class="text-xs text-text-muted" role="status" aria-live="polite">
+                  {note()}
+                </div>
+              )}
+            </Show>
+
+            <Show when={provider() !== "skip" && !keyNote()}>
+              <p class="text-text-muted text-xs">{KEY_CONFIRM_HINT}</p>
             </Show>
 
             <div class="flex gap-2">

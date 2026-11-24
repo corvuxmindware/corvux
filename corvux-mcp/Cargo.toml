@@ -26,6 +26,10 @@ walkdir = "2"
 # Cross-process advisory locks around compare+rename. Backed by flock(2) on
 # Unix and LockFile on Windows.
 fs2 = "0.4.3"
+# Tag identity (LR-6/LR-7): NFC normalization + the combining-mark test, so a
+# tag folds to the SAME key as in the app (`src-tauri/src/parser/tags.rs`,
+# which uses this exact crate). Pure Rust, no transitive heavy deps.
+unicode-normalization = "0.1"
 
 [dev-dependencies]
 tempfile = "3"

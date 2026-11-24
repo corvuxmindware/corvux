@@ -12,6 +12,7 @@ import type { ConnectionTestResult } from "../../../lib/bindings";
 import { errMsg } from "../../../lib/error";
 import { confirmDialog } from "../../../lib/confirm";
 import { settingsStore } from "../../../stores/settings";
+import { reportProviderSaveFailure } from "./saveOutcome";
 
 const DEFAULT_MODEL = "gpt-5.5";
 
@@ -57,7 +58,8 @@ export default function OpenAiProvider() {
       setTest(null);
       setTimeout(() => setSaved(false), 2000);
     } catch (e) {
-      setSaveError(errMsg(e));
+      // A declined native confirmation is a choice, not a failure.
+      reportProviderSaveFailure(e, setSaveError);
     }
   }
 
@@ -85,7 +87,7 @@ export default function OpenAiProvider() {
       setEditing(false);
       setTest(null);
     } catch (e) {
-      setSaveError(errMsg(e));
+      reportProviderSaveFailure(e, setSaveError);
     }
   }
 

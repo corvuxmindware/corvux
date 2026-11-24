@@ -92,6 +92,33 @@ pub struct StatsSnapshot {
     pub tasks: Vec<crate::commands::tasks::TaskRow>,
 }
 
+/// DB-3: swap one note's rows inside a cached task list that is already in
+/// canonical order. Drops the note's old rows, appends its fresh ones and
+/// re-sorts with the SAME comparator `query_all_tasks` uses — a stable sort over
+/// two already-sorted runs is a near-linear merge, and the result is identical
+/// to a from-scratch query (sort keys are unique per row: path + source line).
+fn replace_note_tasks(
+    tasks: &mut Vec<crate::commands::tasks::TaskRow>,
+    note_id: &str,
+    fresh: Vec<crate::commands::tasks::TaskRow>,
+) {
+    tasks.retain(|t| t.note_id != note_id);
+    if fresh.is_empty() {
+        return;
+    }
+    tasks.extend(fresh);
+    tasks.sort_by(crate::commands::tasks::task_row_cmp);
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test counter: how many times `stats_snapshot_or_compute` had to fall
+    /// back to the O(roost) recompute on THIS thread. Lets tests prove the
+    /// steady-state save path never re-counts whole relations.
+    pub(crate) static FULL_STATS_RECOMPUTES: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
 impl GraphDb {
     pub fn new() -> Self {
         Self {
@@ -132,15 +159,13 @@ impl GraphDb {
     /// IP-A3 / TRN-7: run the full single-note (re)index for an auxiliary
     /// write path (AI roost/task edit, in-app quick-add, history revert)
     /// REUSING the cached resolver instead of rebuilding one from a full
-    /// `*notes` scan. Get-or-build the cached resolver (rebuilt only when it
-    /// was invalidated), then delegate to `index_note_full_with_resolver`,
-    /// which `add_id`s this note so the cache stays in sync — so callers must
-    /// NOT invalidate afterward (doing so would force the very O(roost)
-    /// rebuild this avoids; only id-removing paths invalidate).
+    /// `*notes` scan. See [`Self::index_note_core`] — this is the same
+    /// implementation (and the same cache maintenance) minus the result, so
+    /// callers must NOT invalidate the resolver afterward (only id-removing
+    /// paths do) and need no `invalidate_stats_cache` of their own either: the
+    /// cached totals/task list are patched for this note before this returns.
     ///
-    /// `db` must be the caller's already-locked graph DB. Lock ordering is
-    /// preserved: the caller holds `db` before this acquires `link_resolver`,
-    /// exactly as `index_note_internal` does on the editor save path.
+    /// `db` must be the caller's already-locked graph DB.
     pub fn index_note_full_cached(
         &self,
         db: &DbInstance,
@@ -148,15 +173,188 @@ impl GraphDb {
         abs_path: &str,
         content: &str,
     ) -> Result<(), String> {
-        let mut resolver_guard = self
+        self.index_note_core(db, roost_root, abs_path, content)
+            .map(|_| ())
+    }
+
+    /// The ONE single-note index implementation behind every path that
+    /// (re)indexes a note through the live graph — the editor save
+    /// (`index_note_internal`), folder-move re-index, AI roost/task edits,
+    /// in-app quick-add, and history revert. Get-or-build the cached resolver
+    /// (rebuilt only after an id-removing path invalidated it), run the atomic
+    /// per-note transaction (DB-4: `queries::index_note_full_with_resolver`),
+    /// then keep the cached stats snapshot exact (DB-3, see
+    /// [`Self::apply_outcome_to_stats_cache`]).
+    ///
+    /// Lock ordering: the caller holds `db` (and, on the save path,
+    /// `roost_path`) before this acquires `link_resolver`, then the leaf
+    /// `stats_cache`.
+    pub fn index_note_core(
+        &self,
+        db: &DbInstance,
+        roost_root: &str,
+        abs_path: &str,
+        content: &str,
+    ) -> Result<queries::NoteIndexOutcome, String> {
+        let indexed = (|| {
+            let mut resolver_guard = self
+                .link_resolver
+                .lock()
+                .map_err(|e| format!("Lock error: {e}"))?;
+            if resolver_guard.is_none() {
+                *resolver_guard = Some(LinkResolver::build(db)?);
+            }
+            let resolver = resolver_guard.as_mut().expect("resolver populated above");
+            queries::index_note_full_with_resolver(db, roost_root, abs_path, content, resolver)
+        })();
+        let outcome = match indexed {
+            Ok(outcome) => outcome,
+            Err(e) => {
+                // The transaction rolls back, so the graph should be unchanged —
+                // but a failed index is exactly when "should" isn't worth
+                // trusting, and a recompute is cheap next to a stale snapshot
+                // served as exact. (The resolver already un-adds a failed new
+                // note's id.)
+                self.invalidate_stats_cache();
+                return Err(e);
+            }
+        };
+        if !outcome.deltas_trusted {
+            // The index COMMITTED but its measurements couldn't be read, so the
+            // snapshot can't be patched and the link topology is unknown: drop
+            // the cached totals/tasks and force an algo-cache refresh.
+            self.invalidate_stats_cache();
+            self.mark_algo_cache_dirty();
+            return Ok(outcome);
+        }
+        self.apply_outcome_to_stats_cache(db, &outcome);
+        Ok(outcome)
+    }
+
+    /// DB-3: keep the cached stats snapshot exact after a single-note index
+    /// WITHOUT re-reading whole relations.
+    ///
+    /// The snapshot is either `None` (nothing cached — the next reader
+    /// recomputes once) or EXACT; this never leaves it merely "close":
+    ///
+    /// - the three totals move by the exact per-note delta the index
+    ///   transaction measured (`NoteIndexOutcome`);
+    /// - the task list has just this note's rows replaced by a key-prefix
+    ///   query (O(this note's tasks)), re-merged with the shared comparator so
+    ///   the result is byte-identical to a fresh `query_all_tasks`.
+    ///
+    /// Any failure or arithmetic that would go negative drops the snapshot
+    /// instead of guessing. Every graph mutation that does NOT pass through
+    /// here (purge, task CRUD, heal, rebuild, exclusion change) invalidates.
+    fn apply_outcome_to_stats_cache(&self, db: &DbInstance, outcome: &queries::NoteIndexOutcome) {
+        // Cold cache: nothing to maintain.
+        if self.cached_stats_is_none() {
+            return;
+        }
+        // Computed before taking the leaf lock so the lock is never held across
+        // DB work (callers already hold `db`; every mutation of the cache runs
+        // under it, so nothing can invalidate in between).
+        let fresh_tasks = crate::commands::tasks::query_note_tasks(db, &outcome.note_id);
+        let Ok(mut guard) = self.stats_cache.lock() else {
+            return;
+        };
+        let tasks = match fresh_tasks {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!(note_id = %outcome.note_id, error = %e, "graph: stats cache patch failed; dropping snapshot");
+                *guard = None;
+                return;
+            }
+        };
+        let Some(snap) = guard.as_mut() else {
+            return;
+        };
+        let apply = |current: usize, delta: i64| -> Option<usize> {
+            usize::try_from(i64::try_from(current).ok()?.checked_add(delta)?).ok()
+        };
+        let (Some(notes), Some(links), Some(tags)) = (
+            apply(snap.stats.notes, outcome.notes_delta),
+            apply(snap.stats.links, outcome.links_delta),
+            apply(snap.stats.tags, outcome.tags_delta),
+        ) else {
+            tracing::warn!(note_id = %outcome.note_id, "graph: stats cache delta out of range; dropping snapshot");
+            *guard = None;
+            return;
+        };
+        snap.stats = GraphStatsResult { notes, links, tags };
+        replace_note_tasks(&mut snap.tasks, &outcome.note_id, tasks);
+    }
+
+    fn cached_stats_is_none(&self) -> bool {
+        self.stats_cache.lock().map(|g| g.is_none()).unwrap_or(true)
+    }
+
+    /// The post-save `(stats, tasks)` pair every save folds into its response.
+    /// Warm cache (the steady state): returned as-is — NO relation scan, the
+    /// cost is independent of roost size. Cold cache (first save of a session,
+    /// or after a purge / task edit / heal invalidated it): recomputed ONCE
+    /// from the DB and cached, so the next save is warm again.
+    ///
+    /// `db` must be the caller's already-locked graph DB (the compute then
+    /// can't race a mutation).
+    pub fn stats_snapshot_or_compute(
+        &self,
+        db: &DbInstance,
+    ) -> Result<(GraphStatsResult, Vec<crate::commands::tasks::TaskRow>), String> {
+        if let Some(snap) = self.cached_stats() {
+            return Ok((snap.stats, snap.tasks));
+        }
+        #[cfg(test)]
+        FULL_STATS_RECOMPUTES.with(|c| c.set(c.get() + 1));
+        let counts = queries::get_graph_stats(db)?;
+        let tasks = crate::commands::tasks::query_all_tasks(db)?;
+        let stats = GraphStatsResult {
+            notes: counts.notes,
+            links: counts.links,
+            tags: counts.tags,
+        };
+        self.store_stats_cache(stats.clone(), tasks.clone());
+        Ok((stats, tasks))
+    }
+
+    /// Purge a note from the graph and drop everything cached about the old
+    /// graph shape, in one place. A purge removes a node, its incoming and
+    /// outgoing edges and its tasks, so it must (a) invalidate the link resolver
+    /// (an id disappeared) and (b) invalidate the stats snapshot — and (b) must
+    /// happen while the caller still holds the `db` lock, or a concurrent save
+    /// could patch a snapshot that predates the purge. Every purge call site
+    /// should use this instead of pairing `queries::purge_note` with separate
+    /// invalidations.
+    pub fn purge_note_cached(&self, db: &DbInstance, note_id: &str) -> Result<(), Vec<String>> {
+        let result = queries::purge_note(db, note_id);
+        self.invalidate_link_resolver();
+        self.invalidate_stats_cache();
+        result
+    }
+
+    /// Run `f` with the CACHED link resolver (get-or-build) instead of building
+    /// a fresh one from a full `*notes` scan. For read-only link diagnostics /
+    /// resolution that run against the live graph (AI `roost_write` /
+    /// `roost_edit` link warnings, …). The cache is maintained incrementally by
+    /// every indexing path and invalidated by every id-removing path, so it is
+    /// as current as the graph itself.
+    ///
+    /// `db` must be the caller's already-locked graph DB; the resolver lock is
+    /// taken after it (lock ordering), and `f` must not call back into
+    /// `GraphDb`.
+    pub fn with_cached_resolver<T>(
+        &self,
+        db: &DbInstance,
+        f: impl FnOnce(&LinkResolver) -> T,
+    ) -> Result<T, String> {
+        let mut guard = self
             .link_resolver
             .lock()
             .map_err(|e| format!("Lock error: {e}"))?;
-        if resolver_guard.is_none() {
-            *resolver_guard = Some(LinkResolver::build(db)?);
+        if guard.is_none() {
+            *guard = Some(LinkResolver::build(db)?);
         }
-        let resolver = resolver_guard.as_mut().expect("resolver populated above");
-        queries::index_note_full_with_resolver(db, roost_root, abs_path, content, resolver)
+        Ok(f(guard.as_ref().expect("resolver populated above")))
     }
 
     /// Mark the algo cache stale after a link-changing save. Cheap — one
@@ -427,6 +625,9 @@ pub async fn init_graph(
             .link_resolver
             .lock()
             .map_err(|e| format!("Lock error: {e}"))? = Some(resolver);
+        // A freshly published DB invalidates whatever was cached for the one it
+        // replaces (e.g. re-init after Repair on the same roost).
+        db_state.invalidate_stats_cache();
 
         tracing::info!("graph: init_graph complete (warm), DB stored in state");
 
@@ -500,6 +701,7 @@ pub async fn init_graph(
         .link_resolver
         .lock()
         .map_err(|e| format!("Lock error: {e}"))? = Some(resolver);
+    db_state.invalidate_stats_cache();
     drop(_transition);
 
     // Build the notification scheduler from the freshly-populated `:task`
@@ -664,7 +866,16 @@ fn spawn_warm_heal(
                             let db = guard
                                 .as_ref()
                                 .ok_or("Graph DB not initialized".to_string())?;
-                            queries::reconcile_deleted_notes(db, &roost_path, &disk_abs)
+                            let n = queries::reconcile_deleted_notes(db, &roost_path, &disk_abs)?;
+                            if n > 0 {
+                                // Ghosts left the graph: drop the cached
+                                // resolver ids + stats snapshot while we still
+                                // hold the db lock, so a save racing this heal
+                                // can't patch a base that still counts them.
+                                state.invalidate_link_resolver();
+                                state.invalidate_stats_cache();
+                            }
+                            Ok(n)
                         });
                     match purge_result {
                         Ok(n) => {
@@ -692,6 +903,17 @@ fn spawn_warm_heal(
                     .await;
                     added = a;
                     modified = m;
+
+                    // (c) Weekly edit-history upkeep (CO-2): orphan hash rows,
+                    // history of notes deleted over a year ago, the global
+                    // byte budget. Starts after a delay and is gated to once
+                    // per 7 days, so it never competes with the first load.
+                    crate::commands::edit_history::spawn_history_maintenance(
+                        app.clone(),
+                        roost_path.clone(),
+                        backend.clone(),
+                        disk_abs,
+                    );
                 }
             }
             Err(e) => {
@@ -920,42 +1142,62 @@ async fn reconcile_added_and_modified_notes(
         return (0, 0);
     }
 
-    let mut added = 0usize;
-    let mut modified = 0usize;
-    let mut indexed: Vec<(String, String, bool)> = Vec::new();
-    for (abs, content, was_added, _) in affected {
-        let note_id = queries::note_id_from_abs_path(&abs, roost_path);
-        match queries::index_note_pass1(db, roost_path, &abs, &content) {
-            Ok(()) => indexed.push((abs, content, was_added)),
-            Err(e) => tracing::warn!(error = %e, %note_id, "graph: added/modified pass1 failed"),
-        }
-    }
-    if indexed.is_empty() {
-        return (0, 0);
-    }
-    let resolver = match LinkResolver::build(db) {
+    // DB-4: every affected note is indexed by ONE atomic transaction (note row
+    // + mtime stamp + tags + tasks + links + dangling + promotions), so a crash
+    // mid-heal leaves each note either fully old — stamp included, so the next
+    // heal re-detects it — or fully new. The old shape (all pass1, resolver
+    // build, all pass2) wrote the stamp in pass1, so a crash between the passes
+    // left notes with a fresh stamp and no links that no later heal would touch.
+    //
+    // The two-pass ORDER requirement still holds, it just moves: links in note A
+    // to a sibling B that was added in the same batch must resolve, so the
+    // resolver is built once and EVERY affected id is made visible before the
+    // first note is indexed (`add_id` is idempotent; the per-note index adds
+    // its own again). A note whose index fails stays in the resolver for this
+    // batch only — the post-heal resolver rebuild in `spawn_warm_heal`
+    // republishes one from the DB — and is re-detected by the next heal.
+    let mut resolver = match LinkResolver::build(db) {
         Ok(r) => r,
         Err(e) => {
             tracing::warn!(error = %e, "graph: added/modified resolver build failed; links may lag");
             return (0, 0);
         }
     };
-    for (abs, content, was_added) in &indexed {
+    for (abs, _, _, _) in &affected {
+        resolver.add_id(&queries::note_id_from_abs_path(abs, roost_path));
+    }
+
+    let mut added = 0usize;
+    let mut modified = 0usize;
+    for (abs, content, was_added, _) in &affected {
         let note_id = queries::note_id_from_abs_path(abs, roost_path);
-        if let Err(e) = queries::index_note_pass2(db, roost_path, abs, content, &resolver) {
-            tracing::warn!(error = %e, %note_id, "graph: added/modified pass2 failed");
-            continue;
+        match queries::index_note_full_with_resolver(db, roost_path, abs, content, &mut resolver) {
+            Err(e) => {
+                tracing::warn!(error = %e, %note_id, "graph: added/modified index failed");
+                // Never leave a possibly-stale snapshot behind an error that
+                // `continue`s past the end-of-loop invalidation (which only
+                // fires when something was counted).
+                db_state.invalidate_stats_cache();
+                continue;
+            }
+            Ok(outcome) if !outcome.deltas_trusted => {
+                // Committed, but measurements unreadable: counted below, and
+                // the end-of-loop invalidation covers the cache; also make sure
+                // the algo cache refreshes even if the wipe below fails.
+                db_state.mark_algo_cache_dirty();
+            }
+            Ok(_) => {}
         }
         if *was_added {
             added += 1;
         } else {
             modified += 1;
         }
-        if let Err(e) = queries::promote_dangling_links(db, &resolver, &note_id) {
-            tracing::warn!(error = %e, %note_id, "graph: added/modified promote_dangling failed");
-        }
     }
     if added + modified > 0 {
+        // Counts and the task list moved off-app; drop the snapshot while we
+        // still hold the db lock so no save can patch a stale base.
+        db_state.invalidate_stats_cache();
         if let Err(e) = queries::invalidate_algo_cache(db) {
             db_state.mark_algo_cache_dirty();
             tracing::warn!(error = %e, "graph: warm-heal cache invalidation failed; queued retry");
@@ -1109,7 +1351,10 @@ pub async fn purge_note_from_graph(
             let roost_root = roost_guard.as_deref().ok_or("Roost path not set")?;
             queries::note_id_from_abs_path(&path, roost_root)
         };
-        let purge_result = queries::purge_note(db, &note_id).map_err(|errs| {
+        // `purge_note_cached` also drops the cached resolver (an id vanished)
+        // and the stats snapshot (a node, its edges and tasks just left) while
+        // we still hold the db lock.
+        db_state.purge_note_cached(db, &note_id).map_err(|errs| {
             for e in &errs {
                 tracing::warn!(%note_id, error = %e, "purge_note_from_graph: relation failed");
             }
@@ -1117,12 +1362,7 @@ pub async fn purge_note_from_graph(
                 "Graph purge was incomplete for {note_id}: {}",
                 errs.join("; ")
             )
-        });
-        db_state.invalidate_link_resolver();
-        // NEW-S2: note count + its tasks just dropped — stale-out the cached
-        // stats snapshot so the unchanged-save fast path recomputes.
-        db_state.invalidate_stats_cache();
-        purge_result
+        })
     })
 }
 
@@ -1173,35 +1413,35 @@ pub(crate) fn index_note_internal(
     content: &str,
     db_state: &State<'_, GraphDb>,
 ) -> Result<IndexNoteResponse, String> {
-    // DB-2/DB-3: the save path holds the graph mutex across pass1 + pass2 +
-    // the post-save `get_graph_stats` (3 relation counts) + `query_all_tasks`
-    // (all tasks). At 50K notes that stats/tasks tail is O(roost) PER SAVE, so
-    // block_in_place keeps a slow save from parking the tokio worker and
-    // stalling sync/IPC. (block_in_place is safe here: every caller —
-    // `index_note`, `save_roost_note`, `reindex_moved_folder` — is an async
-    // task on the multi-threaded runtime.)
+    // DB-2/DB-3: the save path holds the graph mutex across the per-note index
+    // transaction and the post-save stats/tasks fold, so block_in_place keeps a
+    // slow save from parking the tokio worker and stalling sync/IPC.
+    // (block_in_place is safe here: every caller — `index_note`,
+    // `save_roost_note`, `reindex_moved_folder` — is an async task on the
+    // multi-threaded runtime.)
     //
-    // DEFERRED (loud): block_in_place stops the save from starving the RUNTIME,
-    // but the O(roost) stats+tasks queries still run on every keystroke-save
-    // and still hold the DB mutex for their duration. Eliminating that needs
-    // either incrementally-maintained counters in `GraphDb` (a count delta on
-    // every index/purge path) or splitting stats/tasks out of the save bundle
-    // so the frontend refreshes them lazily/debounced. Both are real refactors
-    // with correctness risk on the hottest path in the app; not done here.
-    // Impact today is negligible (real roosts are small); revisit before a
-    // 50K-note user lands.
-    tokio::task::block_in_place(|| index_note_internal_locked(path, content, db_state))
+    // DB-3 (resolved): the graph-wide totals and the full task list are NOT
+    // recomputed here any more. `GraphDb` keeps a cached snapshot that the index
+    // patches per note (exact count deltas + that note's task rows — see
+    // `GraphDb::apply_outcome_to_stats_cache`), and every mutation that doesn't
+    // go through the index invalidates it. A save therefore costs O(this note)
+    // of DB work; only the very first save after an invalidation re-reads the
+    // roost, once. Residual, by IPC contract: the response still carries the
+    // WHOLE task list, so serializing it scales with total tasks (not notes).
+    tokio::task::block_in_place(|| index_note_on_graph(path, content, db_state.inner()))
 }
 
-fn index_note_internal_locked(
+/// The save-path index against a plain `&GraphDb` (so tests can drive the real
+/// hot path without a Tauri `State`).
+fn index_note_on_graph(
     path: &str,
     content: &str,
-    db_state: &State<'_, GraphDb>,
+    graph: &GraphDb,
 ) -> Result<IndexNoteResponse, String> {
     let started = std::time::Instant::now();
-    let db_guard = db_state.db.lock().map_err(|e| format!("Lock error: {e}"))?;
+    let db_guard = graph.db.lock().map_err(|e| format!("Lock error: {e}"))?;
     let db = db_guard.as_ref().ok_or("Graph DB not initialized")?;
-    let roost_guard = db_state
+    let roost_guard = graph
         .roost_path
         .lock()
         .map_err(|e| format!("Lock error: {e}"))?;
@@ -1209,57 +1449,12 @@ fn index_note_internal_locked(
     crate::commands::files::to_rel(path, roost_root)
         .ok_or_else(|| "Note path is outside the active roost".to_string())?;
 
-    // Is this the note's first save? Checked BEFORE pass1 upserts it. If new,
-    // we promote any dangling links that were waiting for it (below).
-    let note_is_new = queries::lookup_note_id_by_path(db, path)?.is_none();
-
-    // IP-A6: snapshot this note's resolved outgoing links BEFORE re-indexing
-    // so we can tell a body-only edit (no topology change) from a link change
-    // and skip needless algo-cache invalidation on the former. Skip the query
-    // for a brand-new note — a new node IS a topology change by definition.
-    // `note_id_from_abs_path` is pure and matches the id pass1/pass2 use.
-    let note_id_for_links = queries::note_id_from_abs_path(path, roost_root);
-    let old_link_targets: Vec<String> = if note_is_new {
-        Vec::new()
-    } else {
-        queries::get_note_links(db, &note_id_for_links)?
-            .into_iter()
-            .map(|l| l.target)
-            .collect()
-    };
-
-    queries::index_note_pass1(db, roost_root, path, content)?;
-
-    // Get-or-build the cached resolver, then add this note's id (idempotent
-    // — adding an existing id is a no-op). The id must be visible in the
-    // resolver before pass2 runs so a freshly-created note can resolve a
-    // wiki-link to itself, and so OTHER notes saved after this one find
-    // the new id without a rebuild.
-    let mut resolver_guard = db_state
-        .link_resolver
-        .lock()
-        .map_err(|e| format!("Lock error: {e}"))?;
-    if resolver_guard.is_none() {
-        *resolver_guard = Some(LinkResolver::build(db)?);
-    }
-    let resolver = resolver_guard.as_mut().expect("resolver populated above");
-    let new_id = queries::note_id_from_abs_path(path, roost_root);
-    resolver.add_id(&new_id);
-
-    queries::index_note_pass2(db, roost_root, path, content, resolver)?;
-
-    // First save of this note → promote any links that were left dangling
-    // because they pointed here before it existed, so their backlinks appear
-    // immediately instead of after the referencing notes are next re-saved.
-    if note_is_new {
-        match queries::promote_dangling_links(db, resolver, &new_id) {
-            Ok(n) if n > 0 => {
-                tracing::debug!(%new_id, promoted = n, "graph: promoted dangling backlinks")
-            }
-            Ok(_) => {}
-            Err(e) => tracing::warn!(%new_id, error = %e, "graph: promote_dangling_links failed"),
-        }
-    }
+    // One atomic transaction for the whole note (note row + stamp, tags, tasks,
+    // links, dangling rows, and — for a brand-new note — the promotion of links
+    // that were waiting on it, so their backlinks appear immediately). Also
+    // adds this note's id to the cached resolver and patches the stats cache.
+    let outcome = graph.index_note_core(db, roost_root, path, content)?;
+    let new_id = outcome.note_id.clone();
 
     // IP-A6: only invalidate the algo cache when the save ACTUALLY changed the
     // link topology. PageRank / community / betweenness are all global
@@ -1271,12 +1466,12 @@ fn index_note_internal_locked(
     // the next read (never serving stale results; see
     // `refresh_algo_cache_if_dirty`). This refines the old always-mark behavior
     // that recomputed all three algorithms after every prose-only autosave.
-    let new_link_targets: Vec<String> = queries::get_note_links(db, &new_id)?
-        .into_iter()
-        .map(|l| l.target)
-        .collect();
-    if link_topology_changed(note_is_new, &old_link_targets, &new_link_targets) {
-        db_state.mark_algo_cache_dirty();
+    if link_topology_changed(
+        outcome.was_new,
+        &outcome.link_targets_before,
+        &outcome.link_targets_after,
+    ) {
+        graph.mark_algo_cache_dirty();
     }
 
     // (Embeddings subsystem removed — notes are no longer enqueued for
@@ -1284,7 +1479,7 @@ fn index_note_internal_locked(
 
     // Reschedule notification timers for this note's tasks. Cheap —
     // typical note has 0–10 tasks, and the scheduler scopes to note_id.
-    db_state
+    graph
         .notification_scheduler
         .reschedule_for_note(db, &new_id);
 
@@ -1292,11 +1487,9 @@ fn index_note_internal_locked(
     // one response. Without this the save path fires three IPCs:
     // index_note + get_graph_stats + list_tasks. On Android each
     // round-trip hops the WebView/JNI bridge, so collapsing the trio is
-    // a measurable mobile win. The task query runs while we still hold
-    // the graph-db lock — same lock the indexer just held — so the
-    // total cost is one extra Datalog query, not a lock re-acquire.
-    let stats = queries::get_graph_stats(db)?;
-    let tasks = crate::commands::tasks::query_all_tasks(db)?;
+    // a measurable mobile win. Both come from the patched cache (O(note));
+    // a cold cache is recomputed once under the lock we already hold.
+    let (stats, tasks) = graph.stats_snapshot_or_compute(db)?;
 
     tracing::info!(
         note_id = %new_id,
@@ -1304,17 +1497,6 @@ fn index_note_internal_locked(
         elapsed_ms = started.elapsed().as_millis() as u64,
         "graph: index_note done"
     );
-
-    let stats = GraphStatsResult {
-        notes: stats.notes,
-        links: stats.links,
-        tags: stats.tags,
-    };
-    // NEW-S2: this is the freshest possible view of the two O(roost) values,
-    // computed while we still hold the graph lock. Cache it so the EDT-2
-    // unchanged-save fast path can reuse it (see `commands::save`) instead of
-    // re-running get_graph_stats + query_all_tasks on every no-op save.
-    db_state.store_stats_cache(stats.clone(), tasks.clone());
 
     Ok(IndexNoteResponse { stats, tasks })
 }
@@ -1698,14 +1880,16 @@ pub async fn get_graph_window(
     })
 }
 
-/// Two-pass roost indexer:
-///  1. Walk every `.md` under the roost and insert note rows + tags.
-///  2. After the full note set exists, re-parse each note and resolve its
-///     wiki-links against the DB using nearest-folder match (Obsidian semantics).
+/// Whole-roost indexer fixture:
+///  1. Walk every `.md` under the roost and make EVERY note id visible to the
+///     link resolver.
+///  2. Index each note (one atomic transaction per note) resolving its
+///     wiki-links with nearest-folder match (Obsidian semantics).
 ///
-/// This is the only reliable way to resolve `[[shared-meals]]` when a roost
-/// contains many files with the same basename across daily folders — the
-/// resolver needs to see every candidate before it can pick the closest one.
+/// Seeing every candidate id before the first note is indexed is the only
+/// reliable way to resolve `[[shared-meals]]` when a roost contains many files
+/// with the same basename across daily folders — the resolver needs every
+/// candidate before it can pick the closest one.
 ///
 /// TEST-ONLY (sharp-edges F6, 2026-11-11). This was `#[allow(dead_code)]`
 /// "future bulk re-index entry point": a complete raw-`std::fs` walker +
@@ -1719,19 +1903,17 @@ fn index_roost_two_pass(db: &DbInstance, roost_root: &str) -> Result<(), String>
     let mut md_files: Vec<String> = Vec::new();
     collect_md_files(roost_root, &mut md_files)?;
 
-    // Pass 1 — insert notes + tags, no link edges yet.
+    // Every id is visible to the resolver BEFORE any note is indexed (the same
+    // ordering the warm heal uses), so a link to a sibling that sorts later in
+    // the walk still resolves; each note is then ONE atomic transaction.
+    let mut resolver = queries::LinkResolver::build(db)?;
     for abs_path in &md_files {
-        let content = std::fs::read_to_string(abs_path)
-            .map_err(|e| format!("Failed to read {abs_path}: {e}"))?;
-        queries::index_note_pass1(db, roost_root, abs_path, &content)?;
+        resolver.add_id(&queries::note_id_from_abs_path(abs_path, roost_root));
     }
-
-    // Pass 2 — resolve every link against the fully-populated note set.
-    let resolver = queries::LinkResolver::build(db)?;
     for abs_path in &md_files {
         let content = std::fs::read_to_string(abs_path)
             .map_err(|e| format!("Failed to read {abs_path}: {e}"))?;
-        queries::index_note_pass2(db, roost_root, abs_path, &content, &resolver)?;
+        queries::index_note_full_with_resolver(db, roost_root, abs_path, &content, &mut resolver)?;
     }
 
     Ok(())
@@ -1788,6 +1970,8 @@ pub async fn rebuild_database(
             .map_err(|e| format!("Lock error: {e}"))?;
         *resolver_guard = None;
     }
+    // The cached totals/task list describe the graph being nuked.
+    db_state.invalidate_stats_cache();
     // IP-A5: drop the FTS handle too so `search.db` isn't held open when we
     // delete it below. Repair must clear FTS ghosts (a note deleted off-app
     // leaves a stale search row the graph rebuild alone wouldn't touch), not
@@ -2275,5 +2459,509 @@ mod tests {
                 .is_empty(),
             "warm-heal topology changes must invalidate persisted algorithms"
         );
+    }
+
+    // ── DB-4 / DB-3: atomic per-note index + incrementally exact stats cache ──
+
+    /// A graph state wired like a freshly-opened roost: real SQLite schema, the
+    /// roost root published, caches cold.
+    struct Fixture {
+        roost: TempDir,
+        _db_dir: TempDir,
+        graph: GraphDb,
+        db: DbInstance,
+        root: String,
+    }
+
+    fn fixture() -> Fixture {
+        let roost = TempDir::new().unwrap();
+        let db_dir = TempDir::new().unwrap();
+        let db = crate::db::schema::init_db(db_dir.path()).expect("init_db");
+        let root = roost.path().to_string_lossy().to_string();
+        let graph = GraphDb::new();
+        *graph.db.lock().unwrap() = Some(db.clone());
+        *graph.roost_path.lock().unwrap() = Some(root.clone());
+        FULL_STATS_RECOMPUTES.with(|c| c.set(0));
+        Fixture {
+            roost,
+            _db_dir: db_dir,
+            graph,
+            db,
+            root,
+        }
+    }
+
+    impl Fixture {
+        fn abs(&self, rel: &str) -> String {
+            self.roost.path().join(rel).to_string_lossy().to_string()
+        }
+
+        /// Write the note to disk (so its mtime is real) and run the save-path
+        /// index on it.
+        fn save(&self, rel: &str, content: &str) -> IndexNoteResponse {
+            let abs = self.abs(rel);
+            if let Some(parent) = std::path::Path::new(&abs).parent() {
+                std::fs::create_dir_all(parent).unwrap();
+            }
+            std::fs::write(&abs, content).unwrap();
+            index_note_on_graph(&abs, content, &self.graph).expect("index")
+        }
+
+        fn id(&self, rel: &str) -> String {
+            queries::note_id_from_abs_path(&self.abs(rel), &self.root)
+        }
+
+        fn recomputes(&self) -> usize {
+            FULL_STATS_RECOMPUTES.with(|c| c.get())
+        }
+    }
+
+    type TaskKey = (String, i32, String, String, bool, String, String);
+
+    fn task_keys(tasks: &[crate::commands::tasks::TaskRow]) -> Vec<TaskKey> {
+        tasks
+            .iter()
+            .map(|t| {
+                (
+                    t.note_id.clone(),
+                    t.source_line,
+                    t.text.clone(),
+                    t.due_at.clone(),
+                    t.completed,
+                    t.note_title.clone(),
+                    t.note_path.clone(),
+                )
+            })
+            .collect()
+    }
+
+    /// The cached snapshot and a from-scratch recount must agree exactly.
+    fn assert_cache_exact(f: &Fixture, label: &str) {
+        let snap = f
+            .graph
+            .cached_stats()
+            .unwrap_or_else(|| panic!("{label}: cache should be warm"));
+        let fresh = queries::get_graph_stats(&f.db).unwrap();
+        assert_eq!(
+            (snap.stats.notes, snap.stats.links, snap.stats.tags),
+            (fresh.notes, fresh.links, fresh.tags),
+            "{label}: cached totals drifted from a recount"
+        );
+        let fresh_tasks = crate::commands::tasks::query_all_tasks(&f.db).unwrap();
+        assert_eq!(
+            task_keys(&snap.tasks),
+            task_keys(&fresh_tasks),
+            "{label}: cached task list drifted from a fresh query_all_tasks"
+        );
+    }
+
+    fn assert_response_matches_db(f: &Fixture, resp: &IndexNoteResponse, label: &str) {
+        let fresh = queries::get_graph_stats(&f.db).unwrap();
+        assert_eq!(
+            (resp.stats.notes, resp.stats.links, resp.stats.tags),
+            (fresh.notes, fresh.links, fresh.tags),
+            "{label}: save response totals"
+        );
+        let fresh_tasks = crate::commands::tasks::query_all_tasks(&f.db).unwrap();
+        assert_eq!(
+            task_keys(&resp.tasks),
+            task_keys(&fresh_tasks),
+            "{label}: save response tasks"
+        );
+    }
+
+    /// DB-3: the steady-state save never re-counts relations or re-reads the
+    /// task list, yet the totals / task list it returns are EXACT — across
+    /// index, edit, identical re-save, purge, rename and folder move.
+    #[test]
+    fn hot_save_keeps_totals_and_tasks_exact_without_rescanning() {
+        let f = fixture();
+
+        // First save of the session: cache is cold → ONE recompute.
+        let r = f.save("a.md", "see [[b]] #x\n- [ ] one 📅 2026-12-01\n");
+        assert_eq!(f.recomputes(), 1, "cold first save recomputes once");
+        assert_response_matches_db(&f, &r, "new a");
+        assert_cache_exact(&f, "new a");
+
+        // From here on: patched in place, never recomputed.
+        let r = f.save("b.md", "# b #x #y\n- [ ] two 📅 2026-12-02\n");
+        assert_response_matches_db(&f, &r, "new b (promotes a→b)");
+        let r = f.save(
+            "a.md",
+            "no links #z\n- [x] one 📅 2026-12-01\n- [ ] extra 📅 2026-12-03\n",
+        );
+        assert_response_matches_db(&f, &r, "edit a (drop link, retag, retask)");
+        let r = f.save(
+            "a.md",
+            "no links #z\n- [x] one 📅 2026-12-01\n- [ ] extra 📅 2026-12-03\n",
+        );
+        assert_response_matches_db(&f, &r, "identical re-save");
+        let r = f.save(
+            "sub/c.md",
+            "[[a]] [[b]] [[b]] #x\n- [ ] deep 📅 2026-11-30\n",
+        );
+        assert_response_matches_db(&f, &r, "new nested note");
+        assert_cache_exact(&f, "after edits");
+        assert_eq!(
+            f.recomputes(),
+            1,
+            "steady-state saves must not fall back to the O(roost) recount"
+        );
+
+        // Purge: an id-removing path invalidates; the next save recomputes once.
+        {
+            let guard = f.graph.db.lock().unwrap();
+            let db = guard.as_ref().unwrap();
+            f.graph.purge_note_cached(db, &f.id("b.md")).unwrap();
+        }
+        assert!(f.graph.cached_stats().is_none(), "purge drops the snapshot");
+        let r = f.save("a.md", "back to [[sub/c]] #z\n");
+        assert_eq!(f.recomputes(), 2);
+        assert_response_matches_db(&f, &r, "save after purge");
+        assert_cache_exact(&f, "save after purge");
+
+        // Rename = purge old id + index the new path.
+        {
+            let guard = f.graph.db.lock().unwrap();
+            let db = guard.as_ref().unwrap();
+            f.graph.purge_note_cached(db, &f.id("sub/c.md")).unwrap();
+        }
+        let r = f.save("renamed/c2.md", "[[a]] #x\n- [ ] deep 📅 2026-11-30\n");
+        assert_response_matches_db(&f, &r, "rename");
+        assert_cache_exact(&f, "rename");
+
+        // Folder move: purge every nested old id, re-index at the new prefix.
+        f.save("proj/n1.md", "[[a]] #m\n- [ ] n1 📅 2026-12-05\n");
+        f.save("proj/n2.md", "[[n1]] #m #n\n");
+        for old in ["proj/n1.md", "proj/n2.md"] {
+            let guard = f.graph.db.lock().unwrap();
+            let db = guard.as_ref().unwrap();
+            f.graph.purge_note_cached(db, &f.id(old)).unwrap();
+        }
+        let r1 = f.save("moved/n1.md", "[[a]] #m\n- [ ] n1 📅 2026-12-05\n");
+        assert_response_matches_db(&f, &r1, "folder move: first note");
+        let r2 = f.save("moved/n2.md", "[[n1]] #m #n\n");
+        assert_response_matches_db(&f, &r2, "folder move: second note");
+        assert_cache_exact(&f, "folder move");
+        assert_eq!(
+            f.recomputes(),
+            4,
+            "one recompute per invalidation burst, none per save"
+        );
+    }
+
+    /// The patched cache must also agree with the DB after other mutators that
+    /// touch graph rows without the index — they invalidate, so a following
+    /// save recomputes instead of patching a stale base.
+    #[test]
+    fn task_and_exclusion_edits_invalidate_instead_of_patching_a_stale_base() {
+        let f = fixture();
+        f.save("a.md", "#x\n- [ ] one 📅 2026-12-01\n");
+        assert!(f.graph.cached_stats().is_some());
+        // `complete_task`-style path: tasks of a note rewritten outside the
+        // index, then the cache dropped by that path.
+        queries::index_note_tasks(&f.db, "a", "#x\n- [x] one 📅 2026-12-01\n").unwrap();
+        f.graph.invalidate_stats_cache();
+        let before = f.recomputes();
+        let r = f.save("b.md", "# b\n");
+        assert_eq!(f.recomputes(), before + 1);
+        assert_response_matches_db(&f, &r, "after task rewrite");
+        assert!(
+            r.tasks.iter().any(|t| t.completed),
+            "sees the completed task"
+        );
+    }
+
+    #[test]
+    fn aux_write_path_patches_the_cache_so_it_is_never_stale() {
+        // AI edit / quick-add / history revert go through `index_note_full_cached`
+        // and (roost_edit, edit_history) used to leave the snapshot stale.
+        let f = fixture();
+        f.save("a.md", "# a\n");
+        assert!(f.graph.cached_stats().is_some());
+        let abs = f.abs("agent.md");
+        std::fs::write(&abs, "[[a]] #ai\n- [ ] agent task 📅 2026-12-09\n").unwrap();
+        {
+            let guard = f.graph.db.lock().unwrap();
+            let db = guard.as_ref().unwrap();
+            f.graph
+                .index_note_full_cached(
+                    db,
+                    &f.root,
+                    &abs,
+                    "[[a]] #ai\n- [ ] agent task 📅 2026-12-09\n",
+                )
+                .unwrap();
+        }
+        assert_cache_exact(&f, "aux index patches the cache");
+        assert_eq!(f.recomputes(), 1, "no recount for the aux path either");
+    }
+
+    /// DB-4: a save that dies mid-transaction leaves the note exactly as it was
+    /// — stamp included — so the next warm reconcile re-detects and restores it.
+    #[tokio::test]
+    async fn interrupted_save_is_restored_by_the_next_warm_reconcile() {
+        use crate::roostfs::native::NativeFs;
+        use std::time::{Duration, SystemTime};
+
+        let f = fixture();
+        let fs = NativeFs::new(f.roost.path());
+        f.save("b.md", "# b\n");
+        f.save("c.md", "# c\n");
+        f.save("a.md", "see [[b]] #old\n- [ ] first 📅 2026-12-01\n");
+        let id_a = f.id("a.md");
+        let stamp = |f: &Fixture| {
+            let guard = f.graph.db.lock().unwrap();
+            let db = guard.as_ref().unwrap();
+            queries::note_updated_ats(db).unwrap()[&id_a]
+        };
+        let rows = |f: &Fixture| {
+            let links = queries::get_note_links(&f.db, &id_a).unwrap();
+            let tags = queries::get_note_tags(&f.db, &id_a).unwrap();
+            let mut links: Vec<String> = links.into_iter().map(|l| l.target).collect();
+            links.sort();
+            (links, tags)
+        };
+        let v1_stamp = stamp(&f);
+        assert_eq!(rows(&f), (vec!["b".to_string()], vec!["old".to_string()]));
+
+        // The user's next edit hits disk (mtime clearly newer than the stamp).
+        let v2 = "now [[c]] #new\n";
+        let abs_a = f.abs("a.md");
+        std::fs::write(&abs_a, v2).unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&abs_a)
+            .unwrap()
+            .set_modified(SystemTime::now() + Duration::from_secs(120))
+            .unwrap();
+
+        // ...but the index of that save is interrupted after its writes ran.
+        {
+            let _fp = crate::db::queries::tx_fail_point::Guard::arm();
+            assert!(index_note_on_graph(&abs_a, v2, &f.graph).is_err());
+        }
+        assert_eq!(
+            rows(&f),
+            (vec!["b".to_string()], vec!["old".to_string()]),
+            "no torn state: links and tags are still the pre-save pair"
+        );
+        assert_eq!(stamp(&f), v1_stamp, "stamp not advanced → heal can see it");
+
+        // A warm reconcile that is ITSELF interrupted changes nothing either.
+        let pairs = crate::roostfs::walk::list_markdown_path_pairs(&fs)
+            .await
+            .unwrap();
+        {
+            let _fp = crate::db::queries::tx_fail_point::Guard::arm();
+            let (added, modified) =
+                reconcile_added_and_modified_notes(&f.graph, &f.root, &fs, &pairs).await;
+            assert_eq!((added, modified), (0, 0), "nothing committed");
+        }
+        assert_eq!(stamp(&f), v1_stamp);
+
+        // The next (uninterrupted) reconcile restores the note.
+        let (added, modified) =
+            reconcile_added_and_modified_notes(&f.graph, &f.root, &fs, &pairs).await;
+        assert_eq!((added, modified), (0, 1), "a.md re-detected as modified");
+        assert_eq!(rows(&f), (vec!["c".to_string()], vec!["new".to_string()]));
+        assert!(stamp(&f) > v1_stamp + MODIFIED_MTIME_EPSILON);
+        // And it is now up to date: a further reconcile is a no-op.
+        let (added, modified) =
+            reconcile_added_and_modified_notes(&f.graph, &f.root, &fs, &pairs).await;
+        assert_eq!((added, modified), (0, 0));
+    }
+
+    /// A brand-new note must show up immediately (and promote the links that
+    /// were waiting on it) — the atomic path must not defer anything.
+    #[test]
+    fn brand_new_note_is_visible_and_promotes_waiting_links_immediately() {
+        let f = fixture();
+        f.save("a.md", "waiting on [[late]]\n");
+        assert!(queries::lookup_note_id_by_path(&f.db, &f.abs("late.md"))
+            .unwrap()
+            .is_none());
+        let r = f.save("late.md", "# late\n");
+        assert_eq!(
+            queries::lookup_note_id_by_path(&f.db, &f.abs("late.md"))
+                .unwrap()
+                .as_deref(),
+            Some("late"),
+            "the new note is queryable right after the save"
+        );
+        let backlinks = queries::get_backlinks(&f.db, "late").unwrap();
+        assert_eq!(backlinks.len(), 1, "a's dangling link promoted at once");
+        assert_response_matches_db(&f, &r, "new note + promotion");
+    }
+
+    #[test]
+    fn with_cached_resolver_borrows_the_cache_and_rebuilds_after_invalidation() {
+        // IP-A3 for AI link diagnostics: no full `*notes` scan per call.
+        let f = fixture();
+        queries::index_note_full(&f.db, &f.root, &f.abs("x.md"), "# x\n").unwrap();
+        // Cold → built from the DB.
+        assert!(f
+            .graph
+            .with_cached_resolver(&f.db, |r| r.contains_id("x"))
+            .unwrap());
+        // A note the CACHED resolver was never told about (fresh-build path
+        // leaves GraphDb's cache alone): a warm borrow can't see it.
+        queries::index_note_full(&f.db, &f.root, &f.abs("y.md"), "# y\n").unwrap();
+        assert!(
+            !f.graph
+                .with_cached_resolver(&f.db, |r| r.contains_id("y"))
+                .unwrap(),
+            "warm cache is reused, not rebuilt"
+        );
+        f.graph.invalidate_link_resolver();
+        assert!(f
+            .graph
+            .with_cached_resolver(&f.db, |r| r.contains_id("y"))
+            .unwrap());
+    }
+
+    #[test]
+    fn purge_note_cached_drops_resolver_and_stats_snapshot_together() {
+        let f = fixture();
+        f.save("a.md", "# a\n");
+        assert!(f.graph.cached_stats().is_some());
+        assert!(f.graph.link_resolver.lock().unwrap().is_some());
+        {
+            let guard = f.graph.db.lock().unwrap();
+            let db = guard.as_ref().unwrap();
+            f.graph.purge_note_cached(db, "a").unwrap();
+        }
+        assert!(f.graph.cached_stats().is_none());
+        assert!(f.graph.link_resolver.lock().unwrap().is_none());
+    }
+
+    // ── N1: errors AFTER the commit point must never leave a trusted-stale cache ──
+
+    /// A failed index (rolled back) still drops the snapshot: an error is the
+    /// moment "the graph should be unchanged" is least worth trusting.
+    #[test]
+    fn failed_index_drops_the_stats_snapshot() {
+        let f = fixture();
+        f.save("a.md", "# a\n");
+        assert!(f.graph.cached_stats().is_some());
+        let abs = f.abs("b.md");
+        {
+            let guard = f.graph.db.lock().unwrap();
+            let db = guard.as_ref().unwrap();
+            let _fp = crate::db::queries::tx_fail_point::Guard::arm();
+            assert!(f.graph.index_note_core(db, &f.root, &abs, "# b\n").is_err());
+        }
+        assert!(
+            f.graph.cached_stats().is_none(),
+            "a failed index must not leave a snapshot served as exact"
+        );
+    }
+
+    /// The index COMMITS but its post-commit measurements can't be read: the
+    /// call still succeeds (a committed index never reports Err), the snapshot
+    /// is DROPPED rather than patched with zeros, the algo cache is forced
+    /// stale, and the next reader recomputes the exact truth.
+    #[test]
+    fn committed_index_with_unreadable_post_commit_state_drops_the_snapshot() {
+        let f = fixture();
+        f.save("a.md", "# a #x\n- [ ] t 📅 2026-12-01\n");
+        assert!(f.graph.cached_stats().is_some());
+        let abs = f.abs("b.md");
+        let outcome = {
+            let guard = f.graph.db.lock().unwrap();
+            let db = guard.as_ref().unwrap();
+            let _fp = crate::db::queries::tx_fail_point::PostCommitGuard::arm();
+            f.graph
+                .index_note_core(db, &f.root, &abs, "[[a]] #y\n- [ ] u 📅 2026-12-02\n")
+                .expect("a committed index must never report Err")
+        };
+        assert!(
+            !outcome.deltas_trusted,
+            "outcome admits its deltas are unknown"
+        );
+        assert!(
+            f.graph.cached_stats().is_none(),
+            "stale-but-trusted snapshot must be dropped"
+        );
+        assert!(
+            f.graph.algo_cache_dirty.load(Ordering::Relaxed),
+            "link topology unknown → algo cache forced stale"
+        );
+        assert!(
+            queries::lookup_note_id_by_path(&f.db, &abs)
+                .unwrap()
+                .is_some(),
+            "the index really did commit"
+        );
+
+        // Next reader recomputes once and is exact.
+        let before = f.recomputes();
+        {
+            let guard = f.graph.db.lock().unwrap();
+            let db = guard.as_ref().unwrap();
+            f.graph.stats_snapshot_or_compute(db).unwrap();
+        }
+        assert_eq!(f.recomputes(), before + 1);
+        assert_cache_exact(&f, "after post-commit failure");
+
+        // And through the real save path the response is exact too.
+        let abs2 = f.abs("c.md");
+        let r = {
+            let _fp = crate::db::queries::tx_fail_point::PostCommitGuard::arm();
+            index_note_on_graph(&abs2, "[[b]] #z\n", &f.graph)
+                .expect("save path must not fail after commit")
+        };
+        assert_response_matches_db(&f, &r, "save with unreadable post-commit state");
+    }
+
+    /// Warm heal: a per-note index failure (which `continue`s) must still drop
+    /// a snapshot that user saves warmed during the heal; a committed-but-
+    /// unmeasured note is still counted and the cache dropped.
+    #[tokio::test]
+    async fn warm_heal_failure_paths_drop_the_stats_snapshot() {
+        use crate::roostfs::native::NativeFs;
+        use std::time::{Duration, SystemTime};
+
+        let f = fixture();
+        let fs = NativeFs::new(f.roost.path());
+        f.save("a.md", "see [[b]]\n");
+        f.save("b.md", "# b\n");
+        assert!(f.graph.cached_stats().is_some());
+
+        let abs_a = f.abs("a.md");
+        std::fs::write(&abs_a, "now [[b]] #new\n").unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&abs_a)
+            .unwrap()
+            .set_modified(SystemTime::now() + Duration::from_secs(120))
+            .unwrap();
+        let pairs = crate::roostfs::walk::list_markdown_path_pairs(&fs)
+            .await
+            .unwrap();
+
+        // Every per-note index fails → nothing counted, yet the snapshot goes.
+        {
+            let _fp = crate::db::queries::tx_fail_point::Guard::arm();
+            let (added, modified) =
+                reconcile_added_and_modified_notes(&f.graph, &f.root, &fs, &pairs).await;
+            assert_eq!((added, modified), (0, 0));
+        }
+        assert!(
+            f.graph.cached_stats().is_none(),
+            "an all-failures heal must not leave the old snapshot trusted"
+        );
+
+        // Re-warm, then a heal whose index commits but can't measure.
+        f.save("c.md", "# c\n");
+        assert!(f.graph.cached_stats().is_some());
+        {
+            let _fp = crate::db::queries::tx_fail_point::PostCommitGuard::arm();
+            let (added, modified) =
+                reconcile_added_and_modified_notes(&f.graph, &f.root, &fs, &pairs).await;
+            assert_eq!((added, modified), (0, 1), "committed → counted");
+        }
+        assert!(f.graph.cached_stats().is_none());
+        assert!(f.graph.algo_cache_dirty.load(Ordering::Relaxed));
     }
 }

@@ -26,11 +26,13 @@
 //! - Key: HKDF-SHA256 subkey of the pairing `SessionSecret`, label
 //!   `b"corvux-app-envelope-v1"`. Domain-separated from any other subkey.
 //! - Authenticated: Poly1305 MAC; tampered ciphertext returns `Err`.
-//! - No AAD on v1 — the key is already per-pair-per-handshake, so there's
-//!   no cross-context to bind to. If we add multi-channel concurrency
-//!   later (e.g. one envelope-cipher across two iroh streams), AAD bound
-//!   to the channel ID becomes load-bearing; bumping the label suffix
-//!   covers the rotation.
+//! - Associated data (AAD) is supplied by the caller on every `seal`/`open`
+//!   (M-2). The live transport (`transport/encrypted.rs`) binds a version tag,
+//!   the direction byte and a strictly increasing sequence number into each
+//!   frame's AAD, so replayed, reordered or reflected frames fail
+//!   authentication. The queue path (`engine/queue_ops.rs`) binds sender,
+//!   recipient and roost ids. A caller that passes an empty AAD gets no such
+//!   binding, so every new call site must choose its AAD on purpose (SYN-I11).
 //!
 //! # Wire shape
 //!

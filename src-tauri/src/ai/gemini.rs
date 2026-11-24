@@ -1,6 +1,7 @@
 //! Gemini cloud provider — implements `LLMProvider` (chat streaming).
-//! Holds a shared `reqwest::Client` from Tauri state so we don't spin up
-//! a new HTTP stack per call.
+//! Talks through `ai::http::cloud_chat_client` (one pooled client, no
+//! redirects, connect + idle timeouts), so we don't spin up a new HTTP stack per
+//! call and the `x-goog-api-key` header can never follow a redirect.
 
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
@@ -14,6 +15,10 @@ use crate::events;
 
 use super::provider::{ChatMessage, ChatRole, LLMProvider};
 use super::streaming::consumer::SseEvents;
+use super::streaming::{
+    push_capped, too_many_tool_calls_error, ByteCounter, MAX_STREAMED_TEXT_BYTES,
+    MAX_STREAMED_TOOL_ARG_BYTES, MAX_STREAMED_TOOL_CALLS,
+};
 use super::tool_protocol::{StopReason, StreamEvent, ToolCall as ProtoToolCall, ToolDef};
 use super::tool_translator::gemini::{
     build_gemini_contents, build_gemini_tools, next_gemini_call_id, GeminiError, GeminiPart,
@@ -30,22 +35,21 @@ use super::tool_translator::gemini::MIGRATION_DUMMY_SIGNATURE;
 // ── Chat ────────────────────────────────────────────────────────
 
 pub struct GeminiChat {
-    client: Arc<Client>,
     api_key: crate::sensitive::SecretString,
     model: String,
 }
 
 impl GeminiChat {
+    /// `_client` is accepted so existing call sites keep compiling, and is
+    /// deliberately ignored: the shared client follows redirects (the model
+    /// download needs that) and reqwest forwards `x-goog-api-key` across hosts
+    /// on one. Requests use `ai::http::cloud_chat_client` instead (AK-6).
     pub fn new(
-        client: Arc<Client>,
+        _client: Arc<Client>,
         api_key: crate::sensitive::SecretString,
         model: String,
     ) -> Self {
-        Self {
-            client,
-            api_key,
-            model,
-        }
+        Self { api_key, model }
     }
 }
 
@@ -58,8 +62,9 @@ impl<R: tauri::Runtime + 'static> LLMProvider<R> for GeminiChat {
         system_context: Option<String>,
         cancel: Arc<AtomicBool>,
     ) -> Result<String, String> {
+        let client = crate::ai::http::cloud_chat_client()?;
         stream_chat_impl(
-            &self.client,
+            &client,
             app,
             &self.api_key,
             &self.model,
@@ -78,8 +83,9 @@ impl<R: tauri::Runtime + 'static> LLMProvider<R> for GeminiChat {
         tools: Vec<ToolDef>,
         cancel: Arc<AtomicBool>,
     ) -> Result<tokio::sync::mpsc::Receiver<StreamEvent>, String> {
+        let client = crate::ai::http::cloud_chat_client()?;
         stream_chat_with_tools_impl(
-            self.client.clone(),
+            client,
             app.clone(),
             self.api_key.clone(),
             self.model.clone(),
@@ -209,9 +215,7 @@ async fn stream_chat_impl<R: tauri::Runtime>(
         },
     };
 
-    let response = client
-        .post(&url)
-        .header("x-goog-api-key", api_key)
+    let response = crate::ai::http::secret_header(client.post(&url), "x-goog-api-key", api_key)?
         .json(&body)
         .send()
         .await
@@ -253,7 +257,8 @@ async fn stream_chat_impl<R: tauri::Runtime>(
                             .map(|p| p.text.as_str())
                         {
                             if !text.is_empty() {
-                                full_text.push_str(text);
+                                // AT-6: bounded; past the cap the reply is stopped.
+                                push_capped(&mut full_text, text, MAX_STREAMED_TEXT_BYTES, "text")?;
                                 events::AiChunk(text.to_string()).emit(app).ok();
                             }
                         }
@@ -341,13 +346,12 @@ async fn stream_chat_with_tools_impl<R: tauri::Runtime + 'static>(
         },
     };
 
-    let response = client
-        .post(&url)
-        .header("x-goog-api-key", api_key.as_ref())
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| format!("HTTP request failed: {e}"))?;
+    let response =
+        crate::ai::http::secret_header(client.post(&url), "x-goog-api-key", api_key.as_ref())?
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| format!("HTTP request failed: {e}"))?;
 
     if !response.status().is_success() {
         let status = response.status();
@@ -366,6 +370,11 @@ async fn stream_chat_with_tools_impl<R: tauri::Runtime + 'static>(
         let mut events = SseEvents::new(response.bytes_stream(), cancel.clone());
         let mut emitted_tool_call = false;
         let mut finish_reason: Option<String> = None;
+        // AT-6: this task only forwards text and tool calls, so it counts them
+        // itself; the first thing past a cap ends the reply with a clear error.
+        let mut text_bytes = ByteCounter::default();
+        let mut arg_bytes = ByteCounter::default();
+        let mut call_count = 0usize;
 
         'outer: loop {
             let event = match events.next_event().await {
@@ -415,6 +424,12 @@ async fn stream_chat_with_tools_impl<R: tauri::Runtime + 'static>(
                 for part in parts {
                     if let Some(text) = part.text {
                         if !text.is_empty() {
+                            if let Err(msg) =
+                                text_bytes.add(text.len(), MAX_STREAMED_TEXT_BYTES, "text")
+                            {
+                                let _ = tx.send(StreamEvent::Stop(StopReason::Other(msg))).await;
+                                return;
+                            }
                             // Mirror legacy streaming behavior:
                             // emit ai:chunk for the user-facing
                             // panel, AND push a TextChunk event
@@ -426,6 +441,22 @@ async fn stream_chat_with_tools_impl<R: tauri::Runtime + 'static>(
                         }
                     }
                     if let Some(fc) = part.function_call {
+                        call_count += 1;
+                        let over = if call_count > MAX_STREAMED_TOOL_CALLS {
+                            Some(too_many_tool_calls_error())
+                        } else {
+                            arg_bytes
+                                .add(
+                                    fc.args.to_string().len(),
+                                    MAX_STREAMED_TOOL_ARG_BYTES,
+                                    "tool-call data",
+                                )
+                                .err()
+                        };
+                        if let Some(msg) = over {
+                            let _ = tx.send(StreamEvent::Stop(StopReason::Other(msg))).await;
+                            return;
+                        }
                         emitted_tool_call = true;
                         // Thinking-Gemini (3.x / 2.5-series) emits a
                         // `thoughtSignature` as a SIBLING of the

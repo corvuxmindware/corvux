@@ -68,6 +68,40 @@ fn build_config_json(bin: &str, roost: &str, mode: &str) -> String {
     serde_json::to_string_pretty(&cfg).unwrap_or_default()
 }
 
+/// What the native "Connect Claude Desktop" dialog says. `mode` is the
+/// already-validated access mode (`normalized_mode`): the sentence names what
+/// that mode really lets the client do, in plain words, so the user is not told
+/// "read and write" for a read-only connection or the reverse. Roost path is
+/// renderer-influenced text, so it goes through `dialog_safe` (which keeps the
+/// end of a long path visible).
+fn connect_confirm_body(roost: &str, mode: &str) -> String {
+    let access = match mode {
+        "full" => {
+            "READ AND CHANGE access: it can read, create, edit and delete \
+             every note in this roost"
+        }
+        "capture-only" => {
+            "CAPTURE-ONLY access: it can add new notes, tasks and reminders, \
+             but it cannot read your existing notes"
+        }
+        // "read-only" — and, defensively, anything unexpected is described as the
+        // narrowest level rather than over-promising.
+        _ => {
+            "READ-ONLY access: it can search and read every note in this roost, \
+              but it cannot change anything"
+        }
+    };
+    format!(
+        "Corvux is about to give Claude Desktop persistent {access}.\n\n{}\n\n\
+         Access mode: {}\n\n\
+         Claude Desktop will keep this access until you disconnect it.\
+         \n\nIf you did not just choose \u{201c}Connect\u{201d} in Corvux, \
+         choose Cancel.",
+        crate::commands::native_confirm::dialog_safe(roost, 160),
+        crate::commands::native_confirm::dialog_safe(mode, 20),
+    )
+}
+
 async fn active_native_roost(requested: &str, state: &RoostFsState) -> Result<String, String> {
     let backend = state
         .current()
@@ -159,19 +193,17 @@ pub async fn claude_desktop_mcp(
     state: State<'_, RoostFsState>,
 ) -> Result<String, String> {
     let bin = sidecar_path()?;
-    let roost = if action == "connect" {
+    let (roost, mode) = if action == "connect" {
         let requested = roost
             .as_deref()
             .ok_or_else(|| "Open a roost before connecting.".to_string())?;
         let confirmed_roost = active_native_roost(requested, state.inner()).await?;
-        let body = format!(
-            "Corvux is about to give Claude Desktop persistent read and write \
-             access to this roost:\n\n{}\n\n\
-             Claude Desktop will keep this access until you disconnect it.\
-             \n\nIf you did not just choose \u{201c}Connect\u{201d} in Corvux, \
-             choose Cancel.",
-            crate::commands::native_confirm::dialog_safe(&confirmed_roost, 160)
-        );
+        // The mode the webview chose is validated BEFORE the dialog, the dialog
+        // describes exactly that mode, and that same value is what reaches the
+        // helper below — the user is never shown one access level and given
+        // another (review AK-7).
+        let mode = normalized_mode(mode.as_deref())?.to_string();
+        let body = connect_confirm_body(&confirmed_roost, &mode);
         if !crate::commands::native_confirm::OsDialog(app)
             .confirm("Connect Claude Desktop to this roost?", &body, "Connect")
             .await
@@ -180,9 +212,9 @@ pub async fn claude_desktop_mcp(
                  Desktop was not given access."
                 .into());
         }
-        Some(confirmed_roost)
+        (Some(confirmed_roost), Some(mode))
     } else {
-        None
+        (None, mode)
     };
     let args: Vec<String> = build_mcp_args(&action, roost, mode)?;
 
@@ -295,6 +327,72 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
         assert_eq!(v["mcpServers"]["corvux"]["command"], bin);
         assert_eq!(v["mcpServers"]["corvux"]["args"][0], roost);
+    }
+
+    /// AK-7: the dialog used to say "read and write" whatever the webview asked
+    /// for, and never named the mode.
+    #[test]
+    fn the_connect_dialog_describes_the_mode_that_will_really_be_registered() {
+        let roost = "/home/u/Notes";
+        let read_only = connect_confirm_body(roost, "read-only");
+        assert!(read_only.contains("READ-ONLY"), "{read_only}");
+        assert!(read_only.contains("cannot change anything"), "{read_only}");
+        assert!(read_only.contains("Access mode: read-only"), "{read_only}");
+        assert!(!read_only.contains("READ AND CHANGE"), "{read_only}");
+        assert!(!read_only.contains("write"), "{read_only}");
+
+        let full = connect_confirm_body(roost, "full");
+        assert!(full.contains("READ AND CHANGE"), "{full}");
+        assert!(full.contains("edit and delete"), "{full}");
+        assert!(full.contains("Access mode: full"), "{full}");
+        assert!(!full.contains("READ-ONLY"), "{full}");
+
+        let capture = connect_confirm_body(roost, "capture-only");
+        assert!(capture.contains("CAPTURE-ONLY"), "{capture}");
+        assert!(
+            capture.contains("cannot read your existing notes"),
+            "{capture}"
+        );
+        assert!(capture.contains("Access mode: capture-only"), "{capture}");
+
+        // All three differ, and all keep the roost and the Cancel guidance.
+        assert!(read_only != full && full != capture && read_only != capture);
+        for body in [&read_only, &full, &capture] {
+            assert!(body.contains(roost), "{body}");
+            assert!(body.contains("choose Cancel"), "{body}");
+        }
+        // An unexpected value (normalized_mode rejects it earlier) is described
+        // as the narrowest level, never as the widest.
+        let odd = connect_confirm_body(roost, "bogus");
+        assert!(
+            odd.contains("READ-ONLY") && !odd.contains("READ AND CHANGE"),
+            "{odd}"
+        );
+    }
+
+    #[test]
+    fn the_connect_dialog_cannot_be_dressed_up_by_the_roost_path_or_the_mode() {
+        // A path with a line break, a bidi override and a very long padding must
+        // not forge text, reorder it, or push the real folder name out of view.
+        let hostile = format!(
+            "/home/u/{}\u{202E}\nAccess mode: read-only/Notes",
+            "pad/".repeat(80)
+        );
+        let body = connect_confirm_body(&hostile, "full");
+        assert!(!body.contains('\u{202E}'), "{body:?}");
+        let path_line = body.lines().nth(2).unwrap_or_default();
+        assert!(
+            path_line.ends_with("Notes"),
+            "tail of the path stays visible: {path_line}"
+        );
+        // The forged "Access mode:" text stays inside the one path line; the
+        // only line that BEGINS with it is the real one.
+        let starts: Vec<&str> = body
+            .lines()
+            .filter(|l| l.starts_with("Access mode:"))
+            .collect();
+        assert_eq!(starts, vec!["Access mode: full"], "{body}");
+        assert!(path_line.chars().count() <= 160, "{path_line}");
     }
 
     #[test]

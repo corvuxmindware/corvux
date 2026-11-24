@@ -1,4 +1,5 @@
 import yaml from "js-yaml";
+import { sameTag } from "./tags";
 
 export interface Frontmatter {
   [key: string]: string | string[] | number | boolean | null;
@@ -132,6 +133,8 @@ export function addTagToProperty(
   const parsed = parseNote(content);
   const fm = parsed.frontmatter || {};
   const current = Array.isArray(fm[key]) ? (fm[key] as string[]) : [];
-  if (current.includes(newTag)) return content;
+  // LR-6: `ML` is the same tag as an existing `ml` (identity, not exact string).
+  // (`String(t)`: YAML can hand back a number for `tags: [2024]`.)
+  if (current.some((t) => sameTag(String(t), newTag))) return content;
   return setProperty(content, key, [...current, newTag]);
 }

@@ -9,6 +9,7 @@
 import type { FileEntry } from "./bindings";
 import { errMsg } from "./error";
 import { lsGet, lsSet } from "./storage";
+import { isValidTagText, makeInlineTagRegex } from "./tags";
 import {
   getMockRoostPath,
   getBrowserRoostRoot,
@@ -427,7 +428,7 @@ export async function mockInvoke<T>(cmd: string, args?: Record<string, unknown>)
       mockGraph.links.length = 0;
       mockGraph.tags.length = 0;
       const linkRe = /\[\[([^\]\n|]+?)(?:\|[^\]\n]+?)?\]\]/g;
-      const tagRe = /(?:^|(?<=\s))#([\w][\w\-_/]*)/gm;
+      const tagRe = makeInlineTagRegex();
       for (const [path, content] of mockFiles.entries()) {
         // Mirror the Rust indexer: only markdown becomes a graph node.
         // Without this, `.corvux/` internals (index.json, chat sessions)
@@ -443,7 +444,7 @@ export async function mockInvoke<T>(cmd: string, args?: Record<string, unknown>)
         }
         tagRe.lastIndex = 0;
         while ((m = tagRe.exec(content)) !== null) {
-          mockGraph.tags.push({ note_id: id, tag: m[1] });
+          if (isValidTagText(m[1])) mockGraph.tags.push({ note_id: id, tag: m[1] });
         }
       }
       console.log(`[mock] Graph initialized: ${mockGraph.notes.size} notes, ${mockGraph.links.length} links, ${mockGraph.tags.length} tags`);
@@ -459,7 +460,7 @@ export async function mockInvoke<T>(cmd: string, args?: Record<string, unknown>)
       mockGraph.links.length = 0;
       mockGraph.tags.length = 0;
       const linkRe = /\[\[([^\]\n|]+?)(?:\|[^\]\n]+?)?\]\]/g;
-      const tagRe = /(?:^|(?<=\s))#([\w][\w\-_/]*)/gm;
+      const tagRe = makeInlineTagRegex();
       for (const [path, content] of mockFiles.entries()) {
         if (!path.endsWith(".md")) continue; // markdown only — see init_graph
         const name = path.split("/").pop()?.replace(".md", "") ?? "";
@@ -472,7 +473,7 @@ export async function mockInvoke<T>(cmd: string, args?: Record<string, unknown>)
         }
         tagRe.lastIndex = 0;
         while ((m = tagRe.exec(content)) !== null) {
-          mockGraph.tags.push({ note_id: id, tag: m[1] });
+          if (isValidTagText(m[1])) mockGraph.tags.push({ note_id: id, tag: m[1] });
         }
       }
       console.log(`[mock] rebuild_database complete: ${mockGraph.notes.size} notes`);
@@ -493,13 +494,13 @@ export async function mockInvoke<T>(cmd: string, args?: Record<string, unknown>)
       mockGraph.links = mockGraph.links.filter(l => l.from_id !== id);
       mockGraph.tags = mockGraph.tags.filter(t => t.note_id !== id);
       const linkRe = /\[\[([^\]\n|]+?)(?:\|[^\]\n]+?)?\]\]/g;
-      const tagRe = /(?:^|(?<=\s))#([\w][\w\-_/]*)/gm;
+      const tagRe = makeInlineTagRegex();
       let m: RegExpExecArray | null;
       while ((m = linkRe.exec(content)) !== null) {
         mockGraph.links.push({ from_id: id, to_id: m[1].trim().toLowerCase(), link_text: m[1].trim() });
       }
       while ((m = tagRe.exec(content)) !== null) {
-        mockGraph.tags.push({ note_id: id, tag: m[1] });
+        if (isValidTagText(m[1])) mockGraph.tags.push({ note_id: id, tag: m[1] });
       }
       // Mock backlinks: any link in the graph that targets this note's id.
       const backlinks = mockGraph.links
@@ -529,13 +530,13 @@ export async function mockInvoke<T>(cmd: string, args?: Record<string, unknown>)
       mockGraph.links = mockGraph.links.filter(l => l.from_id !== id);
       mockGraph.tags = mockGraph.tags.filter(t => t.note_id !== id);
       const linkRe = /\[\[([^\]\n|]+?)(?:\|[^\]\n]+?)?\]\]/g;
-      const tagRe = /(?:^|(?<=\s))#([\w][\w\-_/]*)/gm;
+      const tagRe = makeInlineTagRegex();
       let m: RegExpExecArray | null;
       while ((m = linkRe.exec(content)) !== null) {
         mockGraph.links.push({ from_id: id, to_id: m[1].trim().toLowerCase(), link_text: m[1].trim() });
       }
       while ((m = tagRe.exec(content)) !== null) {
-        mockGraph.tags.push({ note_id: id, tag: m[1] });
+        if (isValidTagText(m[1])) mockGraph.tags.push({ note_id: id, tag: m[1] });
       }
       return undefined as T;
     }
@@ -666,9 +667,10 @@ export async function mockInvoke<T>(cmd: string, args?: Record<string, unknown>)
     case "parse_tags": {
       const text = args?.content as string;
       const tags: Array<{ tag: string; start: number; end: number }> = [];
-      const re = /(?:^|(?<=\s))#([\w][\w\-_/]*)/gm;
+      const re = makeInlineTagRegex();
       let m: RegExpExecArray | null;
       while ((m = re.exec(text)) !== null) {
+        if (!isValidTagText(m[1])) continue;
         const tagStart = m.index + (m[0].startsWith("#") ? 0 : m[0].indexOf("#"));
         tags.push({
           tag: m[1],

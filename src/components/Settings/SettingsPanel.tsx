@@ -8,6 +8,7 @@ import {
   type JSX,
 } from "solid-js";
 import { isMobile } from "../../lib/platform";
+import { isSecurityCancel } from "../../lib/error";
 import AppearanceSection from "./AppearanceSection";
 // EditorSection is rendered inside AppearanceSection now (2026-05-20
 // merge — theme + typography are the same "look & feel" concern).
@@ -515,7 +516,7 @@ function About() {
     settingsStore.settings().support_endpoint ?? "",
   );
   const [supportSaveStatus, setSupportSaveStatus] = createSignal<
-    "" | "saving" | "saved" | "invalid"
+    "" | "saving" | "saved" | "invalid" | "cancelled"
   >("");
 
   onMount(async () => {
@@ -620,10 +621,12 @@ function About() {
           <button
             onClick={async () => {
               const trimmed = supportEndpoint().trim();
+              // mailto: or https:// only — the backend refuses plain http://
+              // (the report would travel in the clear to a page nobody checked).
               if (
                 trimmed &&
-                !trimmed.startsWith("mailto:") &&
-                !/^https?:\/\//i.test(trimmed)
+                !/^mailto:/i.test(trimmed) &&
+                !/^https:\/\//i.test(trimmed)
               ) {
                 setSupportSaveStatus("invalid");
                 return;
@@ -635,8 +638,17 @@ function About() {
                 });
                 setSupportSaveStatus("saved");
                 setTimeout(() => setSupportSaveStatus(""), 2000);
-              } catch {
-                setSupportSaveStatus("invalid");
+              } catch (e) {
+                // Changing where problem reports go asks for a native
+                // confirmation. Cancel is a choice: put the box back to what is
+                // stored and say so calmly, not "Use a mailto: or https:// URL".
+                if (isSecurityCancel(e)) {
+                  setSupportEndpoint(settingsStore.settings().support_endpoint ?? "");
+                  setSupportSaveStatus("cancelled");
+                  setTimeout(() => setSupportSaveStatus(""), 4000);
+                } else {
+                  setSupportSaveStatus("invalid");
+                }
               }
             }}
             class="px-3 py-1 rounded-lg bg-accent text-white text-xs font-medium hover:bg-accent-hover transition-colors"
@@ -648,6 +660,11 @@ function About() {
           </Show>
           <Show when={supportSaveStatus() === "saved"}>
             <span class="text-green text-[11px]">Saved.</span>
+          </Show>
+          <Show when={supportSaveStatus() === "cancelled"}>
+            <span class="text-text-muted text-[11px]">
+              Cancelled. Nothing was changed.
+            </span>
           </Show>
           <Show when={supportSaveStatus() === "invalid"}>
             <span class="text-red text-[11px]">

@@ -28,6 +28,10 @@ use crate::events;
 
 use super::provider::{ChatMessage, ChatRole, LLMProvider};
 use super::streaming::consumer::SseEvents;
+use super::streaming::{
+    push_capped, too_many_tool_calls_error, ByteCounter, MAX_STREAMED_TEXT_BYTES,
+    MAX_STREAMED_TOOL_ARG_BYTES, MAX_STREAMED_TOOL_CALLS,
+};
 use super::tool_protocol::{StopReason, StreamEvent, ToolCall as ProtoToolCall, ToolDef};
 use super::tool_translator::anthropic::{
     build_anthropic_messages, build_anthropic_tools, AnthropicMessage, AnthropicRequest,
@@ -44,22 +48,21 @@ pub const ANTHROPIC_BASE: &str = "https://api.anthropic.com/v1";
 const MAX_TOKENS: u32 = 8192;
 
 pub struct AnthropicChat {
-    client: Arc<Client>,
     api_key: crate::sensitive::SecretString,
     model: String,
 }
 
 impl AnthropicChat {
+    /// `_client` is accepted so existing call sites keep compiling, and is
+    /// deliberately ignored: the shared client follows redirects and reqwest
+    /// forwards `x-api-key` across hosts on one. Requests use
+    /// `ai::http::cloud_chat_client` instead (AK-6).
     pub fn new(
-        client: Arc<Client>,
+        _client: Arc<Client>,
         api_key: crate::sensitive::SecretString,
         model: String,
     ) -> Self {
-        Self {
-            client,
-            api_key,
-            model,
-        }
+        Self { api_key, model }
     }
 }
 
@@ -72,8 +75,9 @@ impl<R: tauri::Runtime + 'static> LLMProvider<R> for AnthropicChat {
         system_context: Option<String>,
         cancel: Arc<AtomicBool>,
     ) -> Result<String, String> {
+        let client = crate::ai::http::cloud_chat_client()?;
         stream_chat_impl(
-            &self.client,
+            &client,
             app,
             &self.api_key,
             &self.model,
@@ -92,8 +96,9 @@ impl<R: tauri::Runtime + 'static> LLMProvider<R> for AnthropicChat {
         tools: Vec<ToolDef>,
         cancel: Arc<AtomicBool>,
     ) -> Result<tokio::sync::mpsc::Receiver<StreamEvent>, String> {
+        let client = crate::ai::http::cloud_chat_client()?;
         stream_chat_with_tools_impl(
-            self.client.clone(),
+            client,
             app.clone(),
             self.api_key.clone(),
             self.model.clone(),
@@ -124,11 +129,64 @@ fn fingerprint(key: &str) -> String {
     format!("hash:{}", &hash.to_hex().as_str()[..8])
 }
 
-/// Attach the three headers every Messages API call needs.
-fn auth_headers(req: reqwest::RequestBuilder, api_key: &str) -> reqwest::RequestBuilder {
-    req.header("x-api-key", api_key)
+/// Attach the three headers every Messages API call needs. The key goes in via
+/// `secret_header`, which marks it sensitive (AK-9).
+fn auth_headers(
+    req: reqwest::RequestBuilder,
+    api_key: &str,
+) -> Result<reqwest::RequestBuilder, String> {
+    Ok(crate::ai::http::secret_header(req, "x-api-key", api_key)?
         .header("anthropic-version", ANTHROPIC_VERSION)
-        .header("content-type", "application/json")
+        .header("content-type", "application/json"))
+}
+
+/// Open a `tool_use` block. Bounded (AT-6): a stream that opens a new block with
+/// every event is stopped at the call cap, and the id + name count toward the
+/// tool-call data cap.
+fn start_tool_use(
+    partials: &mut BTreeMap<usize, PartialToolUse>,
+    bytes: &mut ByteCounter,
+    index: usize,
+    id: String,
+    name: String,
+) -> Result<(), String> {
+    if !partials.contains_key(&index) && partials.len() >= MAX_STREAMED_TOOL_CALLS {
+        return Err(too_many_tool_calls_error());
+    }
+    bytes.add(
+        id.len() + name.len(),
+        MAX_STREAMED_TOOL_ARG_BYTES,
+        "tool-call data",
+    )?;
+    partials.insert(
+        index,
+        PartialToolUse {
+            id,
+            name,
+            json: String::new(),
+        },
+    );
+    Ok(())
+}
+
+/// Fold one `input_json_delta` fragment into its block. Bounded (AT-6): the JSON
+/// of every call is held until the stream ends, so the total is capped. A
+/// fragment for a block that was never opened is ignored, as before.
+fn append_tool_json(
+    partials: &mut BTreeMap<usize, PartialToolUse>,
+    bytes: &mut ByteCounter,
+    index: usize,
+    fragment: &str,
+) -> Result<(), String> {
+    if let Some(p) = partials.get_mut(&index) {
+        bytes.add(
+            fragment.len(),
+            MAX_STREAMED_TOOL_ARG_BYTES,
+            "tool-call data",
+        )?;
+        p.json.push_str(fragment);
+    }
+    Ok(())
 }
 
 // ── Legacy (text-only) path ─────────────────────────────────────────
@@ -176,7 +234,7 @@ async fn stream_chat_impl<R: tauri::Runtime>(
         thinking: ThinkingConfig::disabled(),
     };
 
-    let response = auth_headers(client.post(&url), api_key)
+    let response = auth_headers(client.post(&url), api_key)?
         .json(&body)
         .send()
         .await
@@ -220,7 +278,8 @@ async fn stream_chat_impl<R: tauri::Runtime>(
                     if delta.delta_type == "text_delta" {
                         if let Some(t) = delta.text {
                             if !t.is_empty() {
-                                full_text.push_str(&t);
+                                // AT-6: bounded; past the cap the reply is stopped.
+                                push_capped(&mut full_text, &t, MAX_STREAMED_TEXT_BYTES, "text")?;
                                 events::AiChunk(t).emit(app).ok();
                             }
                         }
@@ -269,7 +328,7 @@ async fn stream_chat_with_tools_impl<R: tauri::Runtime + 'static>(
         thinking: ThinkingConfig::disabled(),
     };
 
-    let response = auth_headers(client.post(&url), &api_key)
+    let response = auth_headers(client.post(&url), &api_key)?
         .json(&body)
         .send()
         .await
@@ -296,6 +355,10 @@ async fn stream_chat_with_tools_impl<R: tauri::Runtime + 'static>(
         // flush iterates in the order Claude emitted the blocks.
         let mut partials: BTreeMap<usize, PartialToolUse> = BTreeMap::new();
         let mut stop_reason: Option<String> = None;
+        // AT-6: bounded accumulators. Tool-call data is held until flush; text is
+        // only forwarded, so it is counted here and nowhere else.
+        let mut tool_bytes = ByteCounter::default();
+        let mut text_bytes = ByteCounter::default();
 
         'outer: loop {
             let event = match events.next_event().await {
@@ -333,14 +396,16 @@ async fn stream_chat_with_tools_impl<R: tauri::Runtime + 'static>(
                         content_block,
                     } => {
                         if content_block.block_type == "tool_use" {
-                            partials.insert(
+                            if let Err(msg) = start_tool_use(
+                                &mut partials,
+                                &mut tool_bytes,
                                 index,
-                                PartialToolUse {
-                                    id: content_block.id.unwrap_or_default(),
-                                    name: content_block.name.unwrap_or_default(),
-                                    json: String::new(),
-                                },
-                            );
+                                content_block.id.unwrap_or_default(),
+                                content_block.name.unwrap_or_default(),
+                            ) {
+                                let _ = tx.send(StreamEvent::Stop(StopReason::Other(msg))).await;
+                                return;
+                            }
                         }
                     }
                     StreamEventWire::ContentBlockDelta { index, delta } => {
@@ -348,6 +413,14 @@ async fn stream_chat_with_tools_impl<R: tauri::Runtime + 'static>(
                             "text_delta" => {
                                 if let Some(t) = delta.text {
                                     if !t.is_empty() {
+                                        if let Err(msg) =
+                                            text_bytes.add(t.len(), MAX_STREAMED_TEXT_BYTES, "text")
+                                        {
+                                            let _ = tx
+                                                .send(StreamEvent::Stop(StopReason::Other(msg)))
+                                                .await;
+                                            return;
+                                        }
                                         let _ = events::AiChunk(t.clone()).emit(&app);
                                         if tx.send(StreamEvent::TextChunk(t)).await.is_err() {
                                             break 'outer;
@@ -357,8 +430,13 @@ async fn stream_chat_with_tools_impl<R: tauri::Runtime + 'static>(
                             }
                             "input_json_delta" => {
                                 if let Some(pj) = delta.partial_json {
-                                    if let Some(p) = partials.get_mut(&index) {
-                                        p.json.push_str(&pj);
+                                    if let Err(msg) =
+                                        append_tool_json(&mut partials, &mut tool_bytes, index, &pj)
+                                    {
+                                        let _ = tx
+                                            .send(StreamEvent::Stop(StopReason::Other(msg)))
+                                            .await;
+                                        return;
                                     }
                                 }
                             }
@@ -440,6 +518,78 @@ mod tests {
         assert!(fp.starts_with("hash:"));
         assert!(!fp.contains("secret"));
         assert_eq!(fingerprint("   ").as_str(), "<empty>");
+    }
+
+    /// AT-6: a stream that opens a new `tool_use` block with every event is
+    /// stopped at the call cap instead of growing the map forever.
+    #[test]
+    fn endless_new_tool_blocks_are_stopped_at_the_call_cap() {
+        let mut partials = BTreeMap::new();
+        let mut bytes = ByteCounter::default();
+        for i in 0..MAX_STREAMED_TOOL_CALLS {
+            start_tool_use(&mut partials, &mut bytes, i, "id".into(), "t".into()).unwrap();
+        }
+        let err = start_tool_use(
+            &mut partials,
+            &mut bytes,
+            MAX_STREAMED_TOOL_CALLS,
+            "id".into(),
+            "t".into(),
+        )
+        .unwrap_err();
+        assert!(err.contains("tool calls"), "{err}");
+        // Re-opening an existing index is not a new call.
+        start_tool_use(&mut partials, &mut bytes, 0, "id".into(), "t".into()).unwrap();
+    }
+
+    /// AT-6: one call whose JSON never stops arriving is stopped at the data cap
+    /// (the Anthropic twin of the OpenAI-compat accumulator test).
+    #[test]
+    fn endless_tool_json_is_stopped_at_the_data_cap() {
+        let mut partials = BTreeMap::new();
+        let mut bytes = ByteCounter::default();
+        start_tool_use(&mut partials, &mut bytes, 0, String::new(), String::new()).unwrap();
+        let mib = "x".repeat(1024 * 1024);
+        for _ in 0..MAX_STREAMED_TOOL_ARG_BYTES / mib.len() {
+            append_tool_json(&mut partials, &mut bytes, 0, &mib).unwrap();
+        }
+        let err = append_tool_json(&mut partials, &mut bytes, 0, "y").unwrap_err();
+        assert!(err.contains("tool-call data"), "{err}");
+        assert_eq!(partials[&0].json.len(), MAX_STREAMED_TOOL_ARG_BYTES);
+    }
+
+    #[test]
+    fn json_for_a_block_that_was_never_opened_is_ignored_and_not_counted() {
+        let mut partials = BTreeMap::new();
+        let mut bytes = ByteCounter::default();
+        append_tool_json(&mut partials, &mut bytes, 7, "{\"a\":1}").unwrap();
+        assert!(partials.is_empty());
+        // Nothing was charged, so the whole budget is still available.
+        let big = "x".repeat(MAX_STREAMED_TOOL_ARG_BYTES);
+        start_tool_use(&mut partials, &mut bytes, 0, String::new(), String::new()).unwrap();
+        append_tool_json(&mut partials, &mut bytes, 0, &big).unwrap();
+    }
+
+    /// AK-9: the key header is built by `secret_header`, so it is sensitive.
+    #[test]
+    fn the_api_key_header_is_marked_sensitive() {
+        let req = auth_headers(
+            reqwest::Client::new().get("http://localhost/"),
+            "sk-ant-secret",
+        )
+        .unwrap()
+        .build()
+        .unwrap();
+        assert!(req.headers().get("x-api-key").unwrap().is_sensitive());
+        assert_eq!(
+            req.headers().get("anthropic-version").unwrap(),
+            ANTHROPIC_VERSION
+        );
+        // A key with a line break is refused with a readable message.
+        let err = auth_headers(reqwest::Client::new().get("http://localhost/"), "bad\nkey")
+            .err()
+            .unwrap();
+        assert!(err.contains("API key"), "{err}");
     }
 
     #[test]

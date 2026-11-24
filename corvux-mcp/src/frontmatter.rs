@@ -12,6 +12,8 @@
 //!     - a
 //!     - b
 
+use unicode_normalization::{char::is_combining_mark, UnicodeNormalization};
+
 /// A parsed property value.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PropValue {
@@ -70,8 +72,10 @@ pub fn parse(fm_inner: &str) -> Vec<(String, PropValue)> {
             while j < lines.len() {
                 let l = lines[j];
                 let t = l.trim_start();
-                if l.starts_with([' ', '\t']) && t.starts_with("- ") {
-                    items.push(unquote(t[2..].trim()));
+                // YAML lets a block sequence sit at the SAME column as its key
+                // (`tags:\n- a\n- b`) — the app's indexer accepts it, so must we.
+                if let Some(item) = t.strip_prefix("- ") {
+                    items.push(unquote(item.trim()));
                     j += 1;
                 } else {
                     break;
@@ -119,19 +123,17 @@ pub fn render(props: &[(String, PropValue)]) -> String {
 pub fn matches(content: &str, key: &str, value: &str) -> bool {
     let key_l = key.to_lowercase();
     let val_l = value.trim().trim_start_matches('#').to_lowercase();
-    let (fm, body) = split(content);
 
     if key_l == "tag" || key_l == "tags" {
-        if let Some(fm_inner) = &fm {
-            for (k, v) in parse(fm_inner) {
-                if k.eq_ignore_ascii_case("tags") && value_contains(&v, &val_l) {
-                    return true;
-                }
-            }
-        }
-        return body_has_inline_tag(&body, &val_l);
+        // LR-6/LR-7: tag membership is IDENTITY (`fold_tag`) over exactly the
+        // tags `all_tags` reports — the same set the app indexes — so a
+        // filter, the vocabulary counts and the app's graph can never
+        // disagree about whether a note carries `#ML` / `#café`.
+        let want = fold_tag(value.trim().trim_start_matches('#'));
+        return !want.is_empty() && all_tags(content).iter().any(|t| fold_tag(t) == want);
     }
 
+    let (fm, _body) = split(content);
     if let Some(fm_inner) = fm {
         for (k, v) in parse(&fm_inner) {
             if k.to_lowercase() == key_l {
@@ -198,7 +200,7 @@ pub fn add_tags(content: &str, new_tags: &[String]) -> Result<String, String> {
 
     let mut merged = existing;
     for t in &clean {
-        if !merged.iter().any(|e| e.eq_ignore_ascii_case(t)) {
+        if !merged.iter().any(|e| same_tag(e, t)) {
             merged.push(t.clone());
         }
     }
@@ -308,10 +310,13 @@ fn quote_and_escape(s: &str) -> String {
 }
 
 /// Every tag in a note: frontmatter `tags`/`tag` plus inline `#tags` in the
-/// body — the same two sources Corvux's indexer turns into graph tags. Tags
-/// keep their original casing; de-duplication is the caller's job. Powers the
-/// `list_tags` vocabulary tool and the write-path canonicalizer so an LLM can
-/// reuse existing tags instead of forking near-duplicates (#ml vs #ML).
+/// body — the same two sources, under the same acceptance rule, as Corvux's
+/// indexer ([`is_tag_char`] / [`is_valid_tag_text`]; a frontmatter value the
+/// app would not index, e.g. `two words` or `2024`, is not a tag here either).
+/// Tags keep their original spelling; de-duplication is the caller's job and
+/// goes through [`fold_tag`]. Powers the `list_tags` vocabulary tool and the
+/// write-path canonicalizer so an LLM can reuse existing tags instead of
+/// forking near-duplicates (#ml vs #ML).
 pub fn all_tags(content: &str) -> Vec<String> {
     let (fm, body) = split(content);
     let mut out = Vec::new();
@@ -320,23 +325,86 @@ pub fn all_tags(content: &str) -> Vec<String> {
             if k.eq_ignore_ascii_case("tags") || k.eq_ignore_ascii_case("tag") {
                 match v {
                     PropValue::List(items) => {
-                        out.extend(items.into_iter().map(|t| clean_tag(&t)));
+                        out.extend(items.iter().filter_map(|t| clean_frontmatter_tag(t)));
                     }
-                    PropValue::Scalar(s) if !s.trim().is_empty() => out.push(clean_tag(&s)),
-                    _ => {}
+                    // `tags: a, b/c` — the app splits a scalar on commas.
+                    PropValue::Scalar(s) => {
+                        out.extend(s.split(',').filter_map(clean_frontmatter_tag));
+                    }
                 }
             }
         }
     }
     out.extend(extract_inline_tags(&body));
-    out.retain(|t| !t.is_empty());
     out
 }
 
+// ── tag identity (LR-6 / LR-7) ──────────────────────────────────────────
+//
+// TWIN of `src-tauri/src/parser/tags.rs` ("Tag identity" section). The MCP is
+// a standalone binary that must not link the app, so the rule is duplicated;
+// `shared_tag_identity_fixture_matches` below asserts BOTH copies against the
+// same `tests/fixtures/tag_identity.json`. Change one, change the other.
+//
+// * Characters: Unicode letters/numbers/combining marks + `_` `-` `/`.
+//   Whitespace, punctuation (ASCII or CJK) and emoji end a tag.
+// * Identity: Unicode lowercase of the NFC form. The spelling a note was
+//   written with is never altered — identity is applied when comparing,
+//   grouping and counting.
+
+/// May `c` appear inside a tag?
+pub fn is_tag_char(c: char) -> bool {
+    c.is_alphanumeric() || matches!(c, '_' | '-' | '/') || is_combining_mark(c)
+}
+
+/// A tag needs at least one non-numeric, non-mark character (so `#1`, `#2026`
+/// aren't tags). Empty text is never a tag.
+pub fn is_valid_tag_text(tag: &str) -> bool {
+    tag.chars()
+        .any(|c| !c.is_numeric() && !is_combining_mark(c))
+}
+
+/// Tag identity key: Unicode lowercase of the NFC form (`#ML` == `#ml`,
+/// NFC `café` == NFD `café`).
+pub fn fold_tag(tag: &str) -> String {
+    if tag.is_ascii() {
+        return tag.to_ascii_lowercase();
+    }
+    let nfc: String = tag.nfc().collect();
+    nfc.to_lowercase().nfc().collect()
+}
+
+/// Are `a` and `b` the same tag?
+pub fn same_tag(a: &str, b: &str) -> bool {
+    fold_tag(a) == fold_tag(b)
+}
+
+/// If the `#` at byte `hash` of `line` starts a tag, the byte offset just past
+/// the tag text; otherwise `None`. The `#` must open the line or follow
+/// whitespace (any Unicode whitespace) and the text must pass
+/// [`is_valid_tag_text`]. `hash` must index a `#` byte.
+fn scan_inline_tag(line: &str, hash: usize) -> Option<usize> {
+    let preceded_ok = hash == 0
+        || line[..hash]
+            .chars()
+            .next_back()
+            .is_some_and(char::is_whitespace);
+    if !preceded_ok {
+        return None;
+    }
+    let start = hash + 1;
+    let end = start
+        + line[start..]
+            .char_indices()
+            .find(|&(_, c)| !is_tag_char(c))
+            .map_or(line.len() - start, |(i, _)| i);
+    is_valid_tag_text(&line[start..end]).then_some(end)
+}
+
 /// Inline `#tags` in body text. Mirrors the app parser's rules: the `#` must
-/// be at line start or preceded by whitespace; tag chars are alphanumeric /
-/// `-` / `_` / `/`; a tag must contain at least one non-digit (so `#1` /
-/// `#2026` aren't tags); fenced/inline code and `# headings` are skipped.
+/// be at line start or preceded by whitespace; tag characters per
+/// [`is_tag_char`]; a tag must contain at least one non-numeric character (so
+/// `#1` / `#2026` aren't tags); fenced/inline code and `# headings` are skipped.
 fn extract_inline_tags(body: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut in_code_block = false;
@@ -366,20 +434,13 @@ fn extract_inline_tags(body: &str) -> Vec<String> {
                 i += 1;
                 continue;
             }
-            if bytes[i] == b'#' && (i == 0 || bytes[i - 1].is_ascii_whitespace()) {
-                i += 1;
-                let start = i;
-                while i < bytes.len() {
-                    let c = bytes[i];
-                    if c.is_ascii_alphanumeric() || c == b'-' || c == b'_' || c == b'/' {
-                        i += 1;
-                    } else {
-                        break;
+            if bytes[i] == b'#' {
+                match scan_inline_tag(line, i) {
+                    Some(end) => {
+                        out.push(line[i + 1..end].to_string());
+                        i = end;
                     }
-                }
-                let tag = &line[start..i];
-                if !tag.is_empty() && tag.chars().any(|c| !c.is_ascii_digit()) {
-                    out.push(tag.to_string());
+                    None => i += 1,
                 }
             } else {
                 i += 1;
@@ -389,14 +450,15 @@ fn extract_inline_tags(body: &str) -> Vec<String> {
     out
 }
 
-/// Normalize one tag string the way both write tools and the indexer expect:
-/// trim, drop a leading `#`, strip wrapping quotes.
-fn clean_tag(raw: &str) -> String {
-    raw.trim()
-        .trim_matches(['"', '\''])
-        .trim_start_matches('#')
-        .trim()
-        .to_string()
+/// One frontmatter tag value as the app's indexer accepts it: trim, strip
+/// wrapping quotes and a leading `#`, then require every char to be a tag char
+/// and at least one to be non-numeric. `None` = the app would not index it.
+fn clean_frontmatter_tag(raw: &str) -> Option<String> {
+    let clean = raw.trim().trim_matches(['"', '\'']).trim_start_matches('#');
+    if clean.is_empty() || !clean.chars().all(is_tag_char) || !is_valid_tag_text(clean) {
+        return None;
+    }
+    Some(clean.to_string())
 }
 
 // ── internals ───────────────────────────────────────────────────────────
@@ -416,7 +478,11 @@ fn remove_key(fm_inner: &str, key: &str) -> Vec<String> {
                     // YAML key, whether it is a list, nested mapping, folded
                     // scalar, or comment. Removing only `- ` list items left
                     // orphaned nested mappings and malformed frontmatter.
-                    while i < lines.len() && lines[i].starts_with([' ', '\t']) {
+                    // (A block sequence may also sit at the key's own column:
+                    // `tags:\n- a` — drop those items too, or they orphan.)
+                    while i < lines.len()
+                        && (lines[i].starts_with([' ', '\t']) || lines[i].starts_with("- "))
+                    {
                         i += 1;
                     }
                     continue;
@@ -451,12 +517,6 @@ fn value_contains(v: &PropValue, val_l: &str) -> bool {
         PropValue::Scalar(s) => s.to_lowercase() == *val_l,
         PropValue::List(items) => items.iter().any(|x| x.to_lowercase() == *val_l),
     }
-}
-
-fn body_has_inline_tag(body: &str, tag_l: &str) -> bool {
-    let needle = format!("#{tag_l}");
-    body.split(|c: char| !(c.is_alphanumeric() || matches!(c, '#' | '_' | '-' | '/')))
-        .any(|tok| tok.to_lowercase() == needle)
 }
 
 fn unquote(s: &str) -> String {
@@ -723,5 +783,138 @@ mod tests {
     #[test]
     fn all_tags_empty_when_none() {
         assert!(all_tags("# Just prose\n\nno tags, no frontmatter").is_empty());
+    }
+
+    // ── LR-6 / LR-7: tag identity ────────────────────────────────────
+
+    #[test]
+    fn lr7_inline_unicode_tags_are_whole() {
+        // Regression: the inline scanner was ASCII-only (`#café` -> `caf`,
+        // `#日本語` dropped) while `body_has_inline_tag` used unicode
+        // `is_alphanumeric` — three answers for one note.
+        assert_eq!(all_tags("Le #café ici"), vec!["café"]);
+        assert_eq!(all_tags("#日本語 と #タグ。"), vec!["日本語", "タグ"]);
+        assert_eq!(
+            all_tags("#ప్రాజెక్ట్ #తెలుగు #हिंदी"),
+            vec!["ప్రాజెక్ట్", "తెలుగు", "हिंदी"]
+        );
+        assert_eq!(all_tags("ship #🚀 and #launch🚀"), vec!["launch"]);
+        // Arabic-Indic digits are numbers: not a tag.
+        assert!(all_tags("#١٢٣ #2024").is_empty());
+    }
+
+    #[test]
+    fn lr7_unicode_whitespace_boundary_and_url_fragments() {
+        assert_eq!(
+            all_tags("nbsp\u{a0}#nbsp wide\u{3000}#wide"),
+            vec!["nbsp", "wide"]
+        );
+        assert!(all_tags("https://x.y/page#section and foo#bar").is_empty());
+    }
+
+    #[test]
+    fn lr7_frontmatter_accepts_exactly_what_the_app_indexes() {
+        // `[café]` was accepted here but rejected by the app; `two words` and
+        // `2024` were accepted here but dropped by the app.
+        assert_eq!(
+            all_tags("---\ntags: [café, 日本語, 2024, two words, \"#Q4\"]\n---\nx"),
+            vec!["café", "日本語", "Q4"]
+        );
+        // The app splits a scalar on commas.
+        assert_eq!(
+            all_tags("---\ntags: a, b/c, Café\n---\nx"),
+            vec!["a", "b/c", "Café"]
+        );
+    }
+
+    #[test]
+    fn lr7_block_list_at_the_keys_own_column_is_read_and_rewritten() {
+        // The app accepts `tags:\n- a`; the MCP used to read it as EMPTY and
+        // `add_tags` then left the old `- a` lines orphaned in the YAML.
+        let note = "---\ntitle: T\ntags:\n- a\n- b\nstatus: open\n---\n\nbody";
+        assert_eq!(all_tags(note), vec!["a", "b"]);
+        let out = add_tags(note, &["c".into()]).unwrap();
+        assert_eq!(all_tags(&out), vec!["a", "b", "c"]);
+        assert_eq!(out.matches("- a").count(), 1, "no orphaned items: {out}");
+        assert!(out.contains("title: T") && out.contains("status: open"));
+        assert!(out.ends_with("body"));
+    }
+
+    #[test]
+    fn lr6_matches_is_identity_not_exact_string() {
+        let note = "---\ntags:\n  - ML\n  - Café\n---\n\n#Inline and #日本語\n";
+        assert!(matches(note, "tag", "ml"));
+        assert!(matches(note, "tags", "#ML"));
+        assert!(matches(note, "tag", "CAFE\u{301}")); // NFD + upper case
+        assert!(matches(note, "tag", "inline"));
+        assert!(matches(note, "tag", "日本語"));
+        assert!(!matches(note, "tag", "m"));
+        assert!(!matches(note, "tag", ""));
+        // The singular `tag:` key counts too (it always did in `all_tags`).
+        assert!(matches("---\ntag: Solo\n---\nx", "tag", "solo"));
+    }
+
+    #[test]
+    fn lr6_add_tags_dedupes_by_identity() {
+        let out = add_tags(NOTE, &["CHAT".into(), "MCP".into(), "café".into()]).unwrap();
+        assert_eq!(all_tags(&out), vec!["chat", "mcp", "café"]);
+        let again = add_tags(&out, &["CAFE\u{301}".into()]).unwrap();
+        assert_eq!(
+            again, out,
+            "an NFD/upper spelling of an existing tag adds nothing"
+        );
+    }
+
+    #[test]
+    fn lr6_fold_is_case_and_normalization_insensitive_and_idempotent() {
+        assert!(same_tag("ML", "ml"));
+        assert!(same_tag("café", "cafe\u{301}"));
+        assert!(!same_tag("ml", "ml2"));
+        assert!(!same_tag("a/b", "a-b"));
+        for s in [
+            "ML",
+            "CAFÉ",
+            "cafe\u{301}",
+            "İstanbul",
+            "ΣΑΣ",
+            "日本語",
+            "x/Y_z-9",
+        ] {
+            let once = fold_tag(s);
+            assert_eq!(fold_tag(&once), once, "fold must be idempotent for {s:?}");
+        }
+    }
+
+    /// Shared contract — the SAME fixture is asserted against the app parser
+    /// (`src-tauri/src/parser/tags.rs`) and the frontend
+    /// (`tests/unit/tags.test.ts`). If any of the three drifts, one fails.
+    #[test]
+    fn shared_tag_identity_fixture_matches() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("fixtures")
+            .join("tag_identity.json");
+        let raw = std::fs::read_to_string(&path).expect("read tag_identity.json");
+        let fixture: serde_json::Value = serde_json::from_str(&raw).expect("parse fixture");
+
+        let parse_cases = fixture["parse"].as_array().expect("parse array");
+        assert!(parse_cases.len() >= 20, "fixture looks truncated");
+        for case in parse_cases {
+            let name = case["name"].as_str().unwrap();
+            let content = case["content"].as_str().unwrap();
+            let want: Vec<String> = case["tags"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|t| t.as_str().unwrap().to_string())
+                .collect();
+            assert_eq!(all_tags(content), want, "parse case {name:?}");
+        }
+
+        for pair in fixture["fold"].as_array().expect("fold array") {
+            let input = pair[0].as_str().unwrap();
+            let key = pair[1].as_str().unwrap();
+            assert_eq!(fold_tag(input), key, "fold case {input:?}");
+        }
     }
 }

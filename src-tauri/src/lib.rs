@@ -843,17 +843,14 @@ pub fn run() {
                 std::sync::Mutex::new(initial_subagent_watcher),
             ));
 
-            // Shared HTTP client — one connection pool for the fixed-host cloud
-            // chat providers and the model download. It keeps reqwest's default
-            // redirect policy on purpose: the HuggingFace download redirects to
-            // its CDN. Requests to a user-chosen address (Ollama chat, every
-            // connection / model-list probe) use `ai::http::no_redirect_client`
-            // instead (review AK-1). `User-Agent` is useful for HuggingFace
-            // rate-limit friendliness.
-            let http = reqwest::Client::builder()
-                .user_agent(concat!("Corvux/", env!("CARGO_PKG_VERSION")))
-                .build()
-                .map_err(|e| format!("Failed to build HTTP client: {e}"))?;
+            // Shared HTTP client — now only the model download's client. It
+            // keeps reqwest's default redirect policy on purpose (the
+            // HuggingFace download redirects to its CDN), plus a connect and a
+            // per-read idle timeout (no total timeout: a download runs as long
+            // as bytes arrive). Chat providers use `ai::http::cloud_chat_client`
+            // and user-chosen addresses use `ai::http::no_redirect_client`
+            // (reviews AK-1 / AK-6 / AT-6); see `ai/http.rs`.
+            let http = crate::ai::http::build_shared_client()?;
             app.manage(HttpClient(Arc::new(http)));
 
             // Embeddings subsystem removed — retrieval is FTS-driven (the

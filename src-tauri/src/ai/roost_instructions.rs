@@ -32,6 +32,14 @@
 //!    signals > RAG/note content. AGENTS.md can refine conventions;
 //!    it cannot lower safety gates.
 
+/// The roost-root file loaded into EVERY chat as user-curated instructions the
+/// system prompt tells the model to follow. The one spelling of its name: chat
+/// reads it through this constant and `ai::tools::write_gate` reserves exactly
+/// it, so the two cannot drift apart — what the loader trusts is what the agent
+/// is forbidden to write. Only the ROOT file is loaded; an `AGENTS.md` in a
+/// subfolder is an ordinary note.
+pub const ROOST_INSTRUCTIONS_FILE: &str = "AGENTS.md";
+
 /// Maximum body size loaded into the prompt. ~1 K tokens at typical
 /// markdown density. Larger files are truncated, not rejected — the
 /// user shouldn't lose work for being verbose.
@@ -130,71 +138,120 @@ fn utf8_safe_truncate(s: &str, cap: usize) -> (String, bool) {
 /// Returns the cleaned string + the list of distinct tag names that
 /// were stripped (deduped, in `SANITIZED_TAGS` order).
 fn sanitize(body: &str) -> (String, Vec<&'static str>) {
-    let mut out = body.to_string();
-    let mut stripped: Vec<&'static str> = Vec::new();
-    for tag in SANITIZED_TAGS {
-        let before = out.len();
-        // Strip `<tag>`, `</tag>`, `<tag ...>`, `<tag/>`. Cheap loop
-        // over case-insensitive substring matches — we don't need a
-        // real parser for four fixed tag names.
-        out = strip_tag(&out, tag);
-        if out.len() != before {
-            stripped.push(*tag);
-        }
-    }
-    (out, stripped)
+    strip_tags_to_fixed_point(body, SANITIZED_TAGS)
 }
 
-/// Remove every occurrence of `<tag>`, `</tag>`, and `<tag ...>` from
-/// `s`, leaving the surrounding text intact. Case-insensitive. Bounded
-/// search — no regex, no allocation per match beyond the output buffer.
-fn strip_tag(s: &str, tag: &str) -> String {
-    // Tag names are ASCII. Preserve the original string's byte offsets.
-    let lower = s.to_ascii_lowercase();
-    let needles = [
-        format!("</{tag}>"),
-        format!("<{tag}>"),
-        format!("<{tag} "),
-        format!("<{tag}/>"),
-        format!("<{tag}>"),
-    ];
+/// Upper bound on strip passes. Every pass that changes the text removes at
+/// least one tag, and the body is capped at [`MAX_BYTES`], so honest input
+/// converges in one or two; only deliberately nested input comes close.
+const MAX_STRIP_PASSES: usize = 16;
 
-    let mut out = String::with_capacity(s.len());
-    let mut i = 0;
-    while i < s.len() {
-        // Find the next occurrence of ANY needle from position i.
-        let mut earliest: Option<(usize, usize)> = None; // (pos, needle_len_to_consume)
-        for n in needles.iter() {
-            if let Some(p) = lower[i..].find(n.as_str()) {
-                let abs = i + p;
-                // For `<tag ` we must consume up to the matching `>`.
-                let consume = if n.ends_with(' ') {
-                    match lower[abs..].find('>') {
-                        Some(close) => close + 1,
-                        None => n.len(),
-                    }
-                } else {
-                    n.len()
-                };
-                let candidate = (abs, consume);
-                earliest = match earliest {
-                    Some((e, _)) if e <= abs => earliest,
-                    _ => Some(candidate),
-                };
+/// Strip every tag in `tags` from `s` until a full round over all of them
+/// changes nothing (AT-7). A single pass is not enough: removing a tag can
+/// splice its neighbours into a NEW tag (`<tool_c<tool_call>all>` becomes
+/// `<tool_call>`), and removing one family can re-form another
+/// (`<tool_<external_content>call>`). If the input is still changing after
+/// [`MAX_STRIP_PASSES`] rounds it is adversarially nested, so fail closed:
+/// every `<` that is left is turned into `&lt;`, which cannot form a tag.
+/// Returns the cleaned text and the distinct families that were stripped, in
+/// `tags` order.
+fn strip_tags_to_fixed_point(s: &str, tags: &[&'static str]) -> (String, Vec<&'static str>) {
+    let mut cur = s.to_string();
+    let mut hit = vec![false; tags.len()];
+    let names = |hit: &[bool]| -> Vec<&'static str> {
+        tags.iter()
+            .zip(hit)
+            .filter_map(|(t, h)| h.then_some(*t))
+            .collect()
+    };
+    for _ in 0..MAX_STRIP_PASSES {
+        let mut changed = false;
+        for (idx, tag) in tags.iter().enumerate() {
+            let next = strip_tag_once(&cur, tag);
+            // Stripping only removes bytes, so a different length is a change.
+            if next.len() != cur.len() {
+                hit[idx] = true;
+                changed = true;
+                cur = next;
             }
         }
-        match earliest {
-            None => {
-                out.push_str(&s[i..]);
-                break;
-            }
-            Some((pos, consume)) => {
-                out.push_str(&s[i..pos]);
-                i = pos + consume;
-            }
+        if !changed {
+            return (cur, names(&hit));
         }
     }
+    (cur.replace('<', "&lt;"), names(&hit))
+}
+
+/// Remove every occurrence of `<tag>`, `</tag>`, `<tag/>` and `<tag ...>`
+/// from `s`, leaving the surrounding text intact, until none is left (a
+/// fixed point — see [`strip_tags_to_fixed_point`]). Case-insensitive.
+fn strip_tag(s: &str, tag: &'static str) -> String {
+    strip_tags_to_fixed_point(s, &[tag]).0
+}
+
+/// ONE left-to-right pass of the strip. Callers must not rely on a single
+/// pass: use [`strip_tag`] / [`strip_tags_to_fixed_point`].
+///
+/// Matches `<`, optional whitespace, optional `/`, optional whitespace, the
+/// tag name (ASCII case-insensitive), then `>`, `/`, whitespace or the end of
+/// the text (so `<tool_calls>` is NOT a `tool_call` tag). A match that has
+/// attributes or a space before the `>` is consumed up to and including the
+/// next `>`. The scan is byte-wise over ASCII delimiters only, so slices always
+/// fall on char boundaries — no lowercase copy, whose offsets would drift for
+/// characters like U+0130 whose lowercase has a different length.
+fn strip_tag_once(s: &str, tag: &str) -> String {
+    let bytes = s.as_bytes();
+    let name = tag.as_bytes();
+    let mut out = String::with_capacity(s.len());
+    let mut copied = 0usize;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] == b'<' {
+            if let Some(end) = tag_match_end(bytes, i, name) {
+                out.push_str(&s[copied..i]);
+                copied = end;
+                i = end;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    out.push_str(&s[copied..]);
     out
+}
+
+/// If a tag named `name` starts at `bytes[at]` (which is `<`), the exclusive
+/// end of the span to strip.
+fn tag_match_end(bytes: &[u8], at: usize, name: &[u8]) -> Option<usize> {
+    let skip_ws = |mut j: usize| {
+        while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+            j += 1;
+        }
+        j
+    };
+    let mut j = skip_ws(at + 1);
+    if bytes.get(j) == Some(&b'/') {
+        j = skip_ws(j + 1);
+    }
+    let name_end = j.checked_add(name.len())?;
+    if name_end > bytes.len() || !bytes[j..name_end].eq_ignore_ascii_case(name) {
+        return None;
+    }
+    match bytes.get(name_end) {
+        Some(b'>') => Some(name_end + 1),
+        Some(&c) if c == b'/' || c.is_ascii_whitespace() => {
+            // Attributes / `<tag/>` / `</tag >`: consume through the next `>`;
+            // with no `>` at all, drop just the tag name.
+            match bytes[name_end..].iter().position(|&b| b == b'>') {
+                Some(p) => Some(name_end + p + 1),
+                None => Some(name_end),
+            }
+        }
+        // `<tag` cut off by the end of the text: drop it.
+        None => Some(name_end),
+        // `<tool_calls>`, `<tool_call_x>`: a different name.
+        Some(_) => None,
+    }
 }
 
 #[cfg(test)]
@@ -294,6 +351,121 @@ mod tests {
         assert!(!v.body.contains("<Tool_Call>"));
         assert!(v.body.contains("x"));
         assert!(v.body.contains("y"));
+    }
+
+    // ── AT-7: the strip must reach a fixed point ─────────────────────
+
+    /// True when any sanitized family still has a tag the strip would remove.
+    fn has_any_tag(s: &str) -> bool {
+        SANITIZED_TAGS.iter().any(|t| {
+            let b = s.as_bytes();
+            (0..b.len()).any(|i| b[i] == b'<' && tag_match_end(b, i, t.as_bytes()).is_some())
+        })
+    }
+
+    #[test]
+    fn nested_tag_that_splices_a_new_tag_is_stripped_to_nothing() {
+        // Removing the inner `<tool_call>` joins `<tool_c` + `all>` into a
+        // fresh `<tool_call>`: one pass leaves it behind, a fixed point doesn't.
+        assert_eq!(strip_tag("<tool_c<tool_call>all>", "tool_call"), "");
+        assert_eq!(
+            strip_tag("a</tool_c</tool_call>all>b", "tool_call"),
+            "ab",
+            "closing form"
+        );
+        let v = load_text("keep <tool_c<tool_call>all> me").expect("load");
+        assert_eq!(v.body, "keep  me");
+        assert!(v.stripped_tags.contains(&"tool_call"));
+    }
+
+    #[test]
+    fn stripping_one_family_cannot_re_form_another() {
+        // `external_content` is stripped AFTER `tool_call` in tag order; the
+        // splice `<tool_` + `call>` only appears once it is gone.
+        let v = load_text("x <tool_<external_content>call> y").expect("load");
+        assert!(!has_any_tag(&v.body), "{:?}", v.body);
+        assert!(v.stripped_tags.contains(&"external_content"));
+        assert!(v.stripped_tags.contains(&"tool_call"));
+        // Stripped tags are reported in SANITIZED_TAGS order, once each.
+        let order: Vec<_> = SANITIZED_TAGS
+            .iter()
+            .filter(|t| v.stripped_tags.contains(t))
+            .copied()
+            .collect();
+        assert_eq!(v.stripped_tags, order);
+    }
+
+    #[test]
+    fn deeply_nested_input_fails_closed() {
+        // Needs more rounds than MAX_STRIP_PASSES; whatever is left must not
+        // contain a `<` at all.
+        let depth = MAX_STRIP_PASSES * 3;
+        let hostile = format!(
+            "{}<tool_call>{}",
+            "<tool_c".repeat(depth),
+            "all>".repeat(depth)
+        );
+        let v = load_text(&hostile).expect("load");
+        assert!(!has_any_tag(&v.body));
+        assert!(!v.body.contains('<'), "left-over `<` could form a tag");
+        assert!(v.stripped_tags.contains(&"tool_call"));
+    }
+
+    #[test]
+    fn whitespace_and_slash_variants_are_stripped_and_lookalikes_kept() {
+        assert_eq!(strip_tag("a<tool_call\n x=\"1\">b", "tool_call"), "ab");
+        assert_eq!(strip_tag("a</tool_call >b", "tool_call"), "ab");
+        assert_eq!(strip_tag("a< / tool_call>b", "tool_call"), "ab");
+        assert_eq!(strip_tag("a<TOOL_CALL/>b", "tool_call"), "ab");
+        assert_eq!(strip_tag("a<tool_call", "tool_call"), "a", "cut-off tag");
+        // Different names are not this tag.
+        let kept = "a<tool_calls>b<tool_call_x>c</tool_caller>d";
+        assert_eq!(strip_tag(kept, "tool_call"), kept);
+    }
+
+    #[test]
+    fn random_tag_soup_never_leaves_a_tag_behind() {
+        let frags = [
+            "<",
+            ">",
+            "/",
+            "</",
+            "tool_",
+            "call",
+            "tool_call",
+            "TOOL_CALL",
+            "external_content",
+            "external_",
+            "content",
+            "tool_result",
+            "roost_instructions",
+            "roost_",
+            "instructions",
+            " ",
+            "\n",
+            "<tool_call>",
+            "</tool_call>",
+            "<external_content>",
+            "é",
+            "界",
+            "<x>",
+        ];
+        let mut state: u64 = 0xD1B5_4A32_D192_ED03;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for _ in 0..4000 {
+            let n = (next() % 16 + 1) as usize;
+            let mut s = String::new();
+            for _ in 0..n {
+                s.push_str(frags[(next() % frags.len() as u64) as usize]);
+            }
+            let (out, _) = sanitize(&s);
+            assert!(!has_any_tag(&out), "tag left behind for {s:?} -> {out:?}");
+        }
     }
 
     #[test]

@@ -6,6 +6,15 @@ use cozo::{DataValue, DbInstance, Num, ScriptMutability};
 use std::collections::{BTreeMap, HashMap};
 
 use super::types::{BacklinkEntry, FullGraph, GraphEdge, GraphNode, GraphStats, NoteLinkEntry};
+use crate::parser::tags::{fold_tag, TagIdentities};
+
+/// Graph node id of a tag: `tag:` + its identity key (LR-6). Stored `tags`
+/// rows stay verbatim; the folded key is applied HERE, at read time, so
+/// `#ML` / `#ml` / NFD-vs-NFC spellings — old rows and new rows alike — are one
+/// node. The `tag:` prefix keeps tag ids from colliding with note ids.
+fn tag_node_id(key: &str) -> String {
+    format!("tag:{key}")
+}
 
 /// Get all notes that link TO the given note (backlinks).
 pub fn get_backlinks(db: &DbInstance, note_id: &str) -> Result<Vec<BacklinkEntry>, String> {
@@ -77,7 +86,9 @@ pub fn get_note_links(db: &DbInstance, note_id: &str) -> Result<Vec<NoteLinkEntr
     Ok(entries)
 }
 
-/// Get all tags for a given note.
+/// Get all tags for a given note. Spellings that differ only by case /
+/// normalization (`#ML` and `#ml` in one note) are one tag: the first stored
+/// spelling is returned, so the list matches what the graph shows (LR-6).
 pub fn get_note_tags(db: &DbInstance, note_id: &str) -> Result<Vec<String>, String> {
     // AUDIT-023: callers must pass already-canonical (lowercased,
     // forward-slash, roost-relative) ids. See `queries::mod.rs`.
@@ -97,10 +108,12 @@ pub fn get_note_tags(db: &DbInstance, note_id: &str) -> Result<Vec<String>, Stri
         )
         .map_err(|e| format!("Tags query failed: {e}"))?;
 
+    let mut seen = std::collections::HashSet::new();
     let tags = result
         .rows
         .iter()
         .filter_map(|row| row.first()?.get_str().map(|s| s.to_string()))
+        .filter(|tag| seen.insert(fold_tag(tag)))
         .collect();
 
     Ok(tags)
@@ -328,6 +341,11 @@ pub fn get_full_graph(db: &DbInstance, max_nodes: usize) -> Result<FullGraph, St
     }
 
     let mut tag_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // LR-6: a tag node is an IDENTITY (folded key), not a stored spelling.
+    // `seen_note_tags` keeps a note that carries `#ML` and `#ml` to ONE edge.
+    let mut tag_identities = TagIdentities::default();
+    let mut seen_note_tags: std::collections::HashSet<(String, String)> =
+        std::collections::HashSet::new();
     let max_tag_nodes = (max_nodes / 4).max(1);
     for row in &tags_result.rows {
         let Some(note_id) = row.first().and_then(|v| v.get_str()).map(String::from) else {
@@ -339,7 +357,11 @@ pub fn get_full_graph(db: &DbInstance, max_nodes: usize) -> Result<FullGraph, St
         if tag.is_empty() || !selected_ids.contains(&note_id) {
             continue;
         }
-        let tag_id = format!("tag:{tag}");
+        let key = tag_identities.add(&tag, 1);
+        if !seen_note_tags.insert((note_id.clone(), key.clone())) {
+            continue;
+        }
+        let tag_id = tag_node_id(&key);
         if !tag_ids.contains(&tag_id) && tag_ids.len() >= max_tag_nodes {
             continue;
         }
@@ -372,7 +394,10 @@ pub fn get_full_graph(db: &DbInstance, max_nodes: usize) -> Result<FullGraph, St
 
     // Append tag nodes adjacent to kept notes.
     for tag_id in &tag_ids {
-        let tag_name = tag_id.strip_prefix("tag:").unwrap_or(tag_id);
+        let key = tag_id.strip_prefix("tag:").unwrap_or(tag_id);
+        // Show a real stored spelling (most used among the kept notes), not
+        // the lower-cased key, so `#Q4` still reads `#Q4`.
+        let tag_name = tag_identities.display(key).unwrap_or(key);
         nodes.push(GraphNode {
             id: tag_id.clone(),
             title: format!("#{tag_name}"),
@@ -413,6 +438,15 @@ pub fn get_graph_window(
             edges: Vec::new(),
         });
     }
+
+    // LR-6: tag node ids carry the folded identity key. A focus id remembered
+    // from before (e.g. a stale `tag:ML`) is folded onto the same key so it
+    // still names the node the edges below produce.
+    let focus_id = match focus_id.strip_prefix("tag:") {
+        Some(rest) => tag_node_id(&fold_tag(rest)),
+        None => focus_id.to_string(),
+    };
+    let focus_id = focus_id.as_str();
 
     // BFS state. `visited[id] = first_hop_seen` so we never revisit and
     // closer-by nodes always win ties when we hit the cap.
@@ -539,7 +573,10 @@ pub fn get_graph_window(
     // resulting `tag:<tag>` id must also be in the visited set. The note
     // side is filtered in Datalog; the tag-side membership check still
     // happens in Rust because `visited_set` includes the synthetic
-    // `tag:<tag>` ids that the BFS added (those don't exist in `*tags`).
+    // `tag:<key>` ids that the BFS added (those don't exist in `*tags`).
+    let mut tag_identities = TagIdentities::default();
+    let mut seen_note_tags: std::collections::HashSet<(String, String)> =
+        std::collections::HashSet::new();
     let mut tag_titles: HashMap<String, String> = HashMap::new();
     if !note_id_rows.is_empty() {
         let mut tag_params = BTreeMap::new();
@@ -562,19 +599,31 @@ pub fn get_graph_window(
             if tag.is_empty() {
                 continue;
             }
-            let tag_id = format!("tag:{tag}");
+            let key = fold_tag(&tag);
+            let tag_id = tag_node_id(&key);
             if !visited_set.contains(&tag_id) {
                 continue;
             }
-            tag_titles
-                .entry(tag_id.clone())
-                .or_insert_with(|| format!("#{tag}"));
+            tag_identities.add(&tag, 1);
+            // A note carrying `#ML` and `#ml` gets ONE edge to the one node.
+            if !seen_note_tags.insert((note_id.clone(), key)) {
+                continue;
+            }
             *degree.entry(note_id.clone()).or_default() += 1;
             *degree.entry(tag_id.clone()).or_default() += 1;
             edges.push(GraphEdge {
                 source: note_id,
                 target: tag_id,
             });
+        }
+        // Title = a real stored spelling (most used in this window), so
+        // `#Q4` still reads `#Q4`; the node id carries the folded key.
+        for id in &visited_set {
+            if let Some(key) = id.strip_prefix("tag:") {
+                if let Some(display) = tag_identities.display(key) {
+                    tag_titles.insert(id.clone(), format!("#{display}"));
+                }
+            }
         }
     }
 
@@ -943,6 +992,159 @@ mod window_tests {
         add_note(&db, "lowercase/id");
         assert!(get_backlinks(&db, "lowercase/id").is_ok());
     }
+
+    // ── LR-6 / LR-7: tag identity in the graph ───────────────────────────
+    // Stored rows are VERBATIM (`add_tag` below writes them exactly as the
+    // indexer would); every read folds them onto one identity.
+
+    fn tag_nodes(g: &FullGraph) -> Vec<&GraphNode> {
+        g.nodes.iter().filter(|n| n.kind == "tag").collect()
+    }
+
+    #[test]
+    fn lr6_full_graph_merges_case_variants_into_one_tag_node() {
+        let db = mem_db_with_graph();
+        for n in ["a", "b", "c"] {
+            add_note(&db, n);
+        }
+        add_tag(&db, "a", "ML");
+        add_tag(&db, "a", "ml"); // same note, two spellings
+        add_tag(&db, "b", "ml");
+        add_tag(&db, "c", "Ml");
+
+        let full = get_full_graph(&db, 1000).expect("full");
+        let tags = tag_nodes(&full);
+        assert_eq!(tags.len(), 1, "ML / ml / Ml are ONE tag node: {tags:?}");
+        assert_eq!(tags[0].id, "tag:ml");
+        assert_eq!(tags[0].title, "#ml", "most-used stored spelling is shown");
+        assert_eq!(
+            full.edges.len(),
+            3,
+            "one edge per NOTE, not per stored spelling"
+        );
+        assert_eq!(tags[0].link_count, 3);
+        // Storage is untouched, so the stats cache (row counts) stays exact.
+        assert_eq!(get_graph_stats(&db).unwrap().tags, 4);
+    }
+
+    #[test]
+    fn lr6_tag_node_keeps_a_real_spelling_in_its_title() {
+        let db = mem_db_with_graph();
+        add_note(&db, "a");
+        add_tag(&db, "a", "Q4");
+
+        let full = get_full_graph(&db, 1000).expect("full");
+        let tags = tag_nodes(&full);
+        assert_eq!(
+            (tags[0].id.as_str(), tags[0].title.as_str()),
+            ("tag:q4", "#Q4")
+        );
+        let win = get_graph_window(&db, "a", 1, 100).expect("window");
+        let wtags = tag_nodes(&win);
+        assert_eq!(
+            (wtags[0].id.as_str(), wtags[0].title.as_str()),
+            ("tag:q4", "#Q4")
+        );
+    }
+
+    #[test]
+    fn lr6_window_scalar_frontier_merges_case_variants() {
+        let db = mem_db_with_graph();
+        add_note(&db, "a");
+        add_note(&db, "b");
+        add_link(&db, "a", "b");
+        add_tag(&db, "a", "ML");
+        add_tag(&db, "b", "ml");
+
+        let g = get_graph_window(&db, "a", 1, 100).expect("window");
+        assert_eq!(tag_nodes(&g).len(), 1);
+        assert_eq!(tag_nodes(&g)[0].id, "tag:ml");
+        // a→b, a→tag, b→tag
+        assert_eq!(g.edges.len(), 3);
+    }
+
+    #[test]
+    fn lr6_window_batched_frontier_merges_case_variants() {
+        // > 32 frontier notes at hop 2 takes the batched (list-rule) path.
+        let db = mem_db_with_graph();
+        add_note(&db, "a");
+        for i in 0..40 {
+            let id = format!("n{i}");
+            add_note(&db, &id);
+            add_link(&db, "a", &id);
+            add_tag(&db, &id, if i % 2 == 0 { "ML" } else { "ml" });
+        }
+        let g = get_graph_window(&db, "a", 2, 200).expect("window");
+        let tags = tag_nodes(&g);
+        assert_eq!(tags.len(), 1, "both spellings reached via the batched path");
+        assert_eq!(tags[0].id, "tag:ml");
+        assert_eq!(
+            g.edges.iter().filter(|e| e.target == "tag:ml").count(),
+            40,
+            "one edge per note"
+        );
+    }
+
+    #[test]
+    fn lr6_window_focus_on_a_stale_tag_id_is_folded() {
+        let db = mem_db_with_graph();
+        add_note(&db, "a");
+        add_tag(&db, "a", "ML");
+        let g = get_graph_window(&db, "tag:ML", 0, 10).expect("window");
+        assert_eq!(g.nodes.len(), 1);
+        assert_eq!(g.nodes[0].id, "tag:ml");
+    }
+
+    #[test]
+    fn lr6_get_note_tags_lists_one_entry_per_identity() {
+        let db = mem_db_with_graph();
+        add_note(&db, "a");
+        add_tag(&db, "a", "ML");
+        add_tag(&db, "a", "ml");
+        add_tag(&db, "a", "Other");
+        let tags = get_note_tags(&db, "a").unwrap();
+        assert_eq!(tags.len(), 2, "{tags:?}");
+        assert!(tags.contains(&"Other".to_string()));
+    }
+
+    #[test]
+    fn lr7_nfc_and_nfd_spellings_are_one_graph_tag() {
+        let db = mem_db_with_graph();
+        add_note(&db, "a");
+        add_note(&db, "b");
+        add_tag(&db, "a", "Café");
+        add_tag(&db, "b", "cafe\u{301}"); // decomposed
+        let full = get_full_graph(&db, 1000).expect("full");
+        let tags = tag_nodes(&full);
+        assert_eq!(tags.len(), 1);
+        assert_eq!(tags[0].id, "tag:café");
+    }
+
+    /// Old graph.db compat: rows written before this change (verbatim,
+    /// mixed case, a truncated `caf` from the ASCII-only parser) fold with
+    /// rows written after it — no migration, no reindex.
+    #[test]
+    fn lr6_rows_from_before_and_after_the_change_share_identities() {
+        let db = mem_db_with_graph();
+        add_note(&db, "old");
+        add_note(&db, "new");
+        add_tag(&db, "old", "Ideas"); // indexed by the old parser
+        add_tag(&db, "old", "caf"); // old parser truncated `#café`
+        add_tag(&db, "new", "ideas"); // indexed by the new parser
+        add_tag(&db, "new", "café");
+        let full = get_full_graph(&db, 1000).expect("full");
+        let ids: std::collections::BTreeSet<_> =
+            tag_nodes(&full).iter().map(|n| n.id.clone()).collect();
+        assert_eq!(
+            ids,
+            ["tag:caf", "tag:café", "tag:ideas"]
+                .into_iter()
+                .map(String::from)
+                .collect(),
+            "`Ideas`/`ideas` merge; the stale truncated `caf` stays a separate \
+             (known, self-healing on re-save) residual"
+        );
+    }
 }
 
 /// Batched neighbor expansion for an entire BFS frontier — note→note
@@ -1027,7 +1229,7 @@ fn neighbors_of_frontier(
                     if let Some(value) = row.first().and_then(|v| v.get_str()) {
                         if !value.is_empty() {
                             out.push(if prefix_tag {
-                                format!("tag:{value}")
+                                tag_node_id(&fold_tag(value))
                             } else {
                                 value.to_string()
                             });
@@ -1089,7 +1291,7 @@ fn neighbors_of_frontier(
         for row in &note_tags.rows {
             if let Some(s) = row.first().and_then(|v| v.get_str()) {
                 if !s.is_empty() {
-                    out.push(format!("tag:{s}"));
+                    out.push(tag_node_id(&fold_tag(s)));
                 }
             }
         }

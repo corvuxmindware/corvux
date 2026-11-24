@@ -430,17 +430,27 @@ fn saf_exists_propagates_provider_errors() {
 #[test]
 fn recovery_of_missing_files_is_create_only() {
     let src = read("src/sync/engine/scan.rs");
+    // The loop (`recover_missing_files`) and the per-note step it delegates to
+    // (`recover_missing_note`, split out of it later): together they must write
+    // create-only and must never overwrite. Checking the union keeps the guard
+    // true across that split instead of pinning one function's current shape.
+    let mut body = String::new();
     let start = src
         .find("pub async fn recover_missing_files")
         .expect("recover_missing_files");
-    let body = &src[start..start + src[start..].find("\n    }\n").expect("end of fn")];
+    body.push_str(&src[start..start + src[start..].find("\n    }\n").expect("end of fn")]);
+    if let Some(note_fn) = src.find("async fn recover_missing_note(") {
+        body.push_str(
+            &src[note_fn..note_fn + src[note_fn..].find("\n    }\n").expect("end of fn")],
+        );
+    }
     assert!(
         body.contains("create_recovered_note("),
-        "recover_missing_files must write with create_recovered_note (create-only)"
+        "startup recovery must write with create_recovered_note (create-only)"
     );
     assert!(
         !body.contains("write_recovered_note(") && !body.contains("write_atomic("),
-        "recover_missing_files must never overwrite"
+        "startup recovery must never overwrite"
     );
     // And the shared writer must use `create` for the create-only mode.
     let inner = src
@@ -482,6 +492,103 @@ fn native_overwrite_gating_uses_the_checked_existence_helper() {
             "{name} must publish through atomic::rename_no_replace (fails if the target exists — no TOCTOU window)"
         );
     }
+}
+
+/// RF-4: the no-replace rename has a fallback for storage that lacks the kernel
+/// primitive (FAT/exFAT, FUSE, old NFS/SMB, old kernels). Pin its SHAPE so it
+/// can never become "check, then overwrite": the only plain `rename` is the
+/// step that replaces the empty placeholder this call just made, the fallback
+/// tries a hard link first and then reserves the name, and nothing in the
+/// module tests existence before acting.
+#[test]
+fn no_replace_rename_fallback_never_checks_then_overwrites() {
+    let src = read("src/roostfs/atomic.rs").replace("\r\n", "\n");
+    let prod = &src[..src.find("#[cfg(test)]\nmod tests {").expect("tests mod")];
+    // Comments may talk about all of this; code may not do it.
+    let code: String = prod
+        .lines()
+        .map(|l| l.find("//").map_or(l, |i| &l[..i]))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    for forbidden in [".exists()", "try_exists(", "fs::metadata("] {
+        assert!(
+            !code.contains(forbidden),
+            "atomic.rs must not test existence before renaming ({forbidden}): that is the TOCTOU the primitive exists to avoid"
+        );
+    }
+    assert_eq!(
+        code.matches("std::fs::rename(").count(),
+        1,
+        "exactly one plain rename in atomic.rs: the placeholder replace"
+    );
+    // `rfind`: the first `fn replace(` is the trait declaration, the last is OsOps's impl.
+    let replace_fn = code
+        .rfind("fn replace(")
+        .expect("NoReplaceOps::replace impl");
+    let rename_call = code.find("std::fs::rename(").unwrap();
+    assert!(
+        rename_call > replace_fn && code[replace_fn..rename_call].matches("fn ").count() == 1,
+        "the plain rename must live inside OsOps::replace"
+    );
+
+    let pos = |needle: &str| {
+        code.find(needle)
+            .unwrap_or_else(|| panic!("atomic.rs lost `{needle}`"))
+    };
+    // The fallback runs only when the primitive says "unsupported", and tries
+    // the hard link before reserving a name.
+    assert!(pos("ops.primitive(") < pos("is_unsupported(&error)"));
+    assert!(pos("ops.hard_link(") < pos("reserve_then_replace(ops, from, to, is_dir)"));
+    // Reserve (an exclusive create) strictly before replace.
+    let body_start = pos("fn reserve_then_replace(");
+    let body = &code[body_start..];
+    assert!(
+        body.find("ops.reserve(").unwrap() < body.find("ops.replace(").unwrap(),
+        "the name must be reserved before anything is renamed onto it"
+    );
+    // ...and the placeholder must be proven still ours in between: another
+    // writer can swap or fill it, and the rename would destroy their data.
+    let reserve_at = body.find("ops.reserve(").unwrap();
+    let verify_at = body
+        .find("still_ours(")
+        .expect("reserve_then_replace must verify the placeholder (still_ours)");
+    let replace_at = body.find("ops.replace(").unwrap();
+    assert!(
+        reserve_at < verify_at && verify_at < replace_at,
+        "the placeholder must be verified (still_ours) after reserve and BEFORE the replacing rename"
+    );
+    assert!(
+        code.contains("create_new(true)"),
+        "the file placeholder must be an exclusive create (O_EXCL)"
+    );
+
+    // Android never makes the raw `renameat2` syscall: on API 26-29 the app's
+    // seccomp filter can answer it with SIGSYS, which kills the process — an
+    // errno fallback cannot catch that. So: the decision function exists, the
+    // public entry routes through it, the skip comes BEFORE the primitive is
+    // touched, and no `#[cfg(..)]` arm around the kernel call mentions Android.
+    assert!(
+        code.contains("fn kernel_primitive_allowed() -> bool")
+            && code.contains("!cfg!(target_os = \"android\")"),
+        "atomic.rs must keep kernel_primitive_allowed() = !cfg!(target_os = \"android\")"
+    );
+    assert!(
+        code.contains("rename_no_replace_with(ops, !kernel_primitive_allowed(), from, to)"),
+        "rename_no_replace must route through kernel_primitive_allowed() so Android never makes the syscall"
+    );
+    let with_fn = pos("fn rename_no_replace_with(");
+    let with_body = &code[with_fn..];
+    assert!(
+        with_body.find("if prefer_fallback").unwrap() < with_body.find("ops.primitive(").unwrap(),
+        "the Android skip must come before the kernel primitive is called"
+    );
+    assert!(
+        !code
+            .lines()
+            .any(|l| l.contains("#[cfg(") && l.contains("android")),
+        "no #[cfg] arm in atomic.rs may include Android: the raw renameat2 syscall must not be compiled there"
+    );
 }
 
 /// The ONLY way an original is removed on SAF is the last step of the gated

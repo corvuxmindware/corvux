@@ -110,7 +110,7 @@ impl RoostFs for ValidatedFs {
         // an error — an error here would turn the probe into an oracle.
         match gate(rel) {
             Ok(()) => self.inner.exists(rel).await,
-            Err(RoostError::OutsideRoost(_)) => Ok(false),
+            Err(e) if e.is_path_refusal() => Ok(false),
             Err(e) => Err(e),
         }
     }

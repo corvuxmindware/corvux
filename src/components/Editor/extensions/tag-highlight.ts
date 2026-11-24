@@ -14,10 +14,13 @@ import {
   ViewUpdate,
 } from "@codemirror/view";
 import { RangeSetBuilder } from "@codemirror/state";
+import { isValidTagText, makeInlineTagRegex } from "../../../lib/tags";
 
-// Tag regex: # followed by word chars, hyphens, underscores, slashes
-// Must be preceded by whitespace or start of line
-const TAG_RE = /(?:^|(?<=\s))#([\w][\w\-_/]*)/g;
+// Tag regex: # followed by Unicode letters/numbers/marks, hyphens,
+// underscores, slashes (LR-7 — `\w` was ASCII-only, so `#café` highlighted as
+// `#caf`). Must be preceded by whitespace or start of line. One rule shared
+// with the backend indexer: see `lib/tags.ts`.
+const TAG_RE = makeInlineTagRegex();
 
 // Catppuccin Mocha tag colors (same palette as Properties panel)
 const TAG_COLORS = [
@@ -71,6 +74,8 @@ function buildDecorations(view: EditorView): DecorationSet {
     let match: RegExpExecArray | null;
 
     while ((match = TAG_RE.exec(text)) !== null) {
+      // `#2024` / `#1` are not tags (the indexer skips them) — don't pill them.
+      if (!isValidTagText(match[1])) continue;
       const tagStart = match.index + (match[0].startsWith("#") ? 0 : match[0].indexOf("#"));
       const tagEnd = tagStart + 1 + match[1].length; // # + tag text
 

@@ -37,7 +37,7 @@ use futures_util::StreamExt;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use super::sse::find_sse_boundary;
 
@@ -50,6 +50,25 @@ const POLL_TIMEOUT: Duration = Duration::from_millis(100);
 
 /// Bound incomplete frames and coalesced events before copying network bytes.
 const MAX_SSE_BUFFER_BYTES: usize = 1024 * 1024;
+
+/// Bound on everything read off the wire in ONE stream (AT-6). Every provider
+/// reads through `SseEvents`, so this single cap bounds every accumulator
+/// downstream of it at once: the text buffers, the tool-call accumulators and the
+/// agent loop's own copy can never hold more than the wire delivered. An honest
+/// reply is well under 1 MB on the wire; 64 MiB is two orders of magnitude of
+/// headroom (Ollama's per-token JSON envelope is the heaviest framing).
+const MAX_STREAM_WIRE_BYTES: usize = 64 * 1024 * 1024;
+
+/// Absolute ceiling on how long ONE stream may stay open. Not a request timeout
+/// (the HTTP client deliberately has none; legit streams run long) — a backstop
+/// for the legacy `stream_chat` paths that have no agent budget watching them:
+/// a server that drips keep-alive comments forever would otherwise hold the chat
+/// open until the user presses Stop. On the native-tools path the agent loop
+/// adds its own limit (`agent_loop/stream.rs`): the much tighter wall-clock
+/// budget for cloud providers, and an idle limit only for a local model server
+/// (Ollama), which may legitimately stream slowly for a long time — so for that
+/// case this 30 minutes, the byte caps and Stop are the only bounds.
+const MAX_STREAM_DURATION: Duration = Duration::from_secs(30 * 60);
 
 /// Async iterator over the SSE events in a streaming HTTP body.
 ///
@@ -64,6 +83,10 @@ where
     stream: S,
     cancel: Arc<AtomicBool>,
     buffer: Vec<u8>,
+    total_bytes: usize,
+    max_total_bytes: usize,
+    started: Instant,
+    max_duration: Duration,
 }
 
 impl<S> SseEvents<S>
@@ -75,6 +98,26 @@ where
             stream,
             cancel,
             buffer: Vec::new(),
+            total_bytes: 0,
+            max_total_bytes: MAX_STREAM_WIRE_BYTES,
+            started: Instant::now(),
+            max_duration: MAX_STREAM_DURATION,
+        }
+    }
+
+    /// Same iterator with small limits, so a test can reach them without
+    /// streaming 64 MiB or waiting 30 minutes.
+    #[cfg(test)]
+    fn with_limits(
+        stream: S,
+        cancel: Arc<AtomicBool>,
+        max_total_bytes: usize,
+        max_duration: Duration,
+    ) -> Self {
+        Self {
+            max_total_bytes,
+            max_duration,
+            ..Self::new(stream, cancel)
         }
     }
 
@@ -97,6 +140,12 @@ where
             if self.cancel.load(Ordering::Relaxed) {
                 return Ok(None);
             }
+            if self.started.elapsed() > self.max_duration {
+                return Err(format!(
+                    "The AI provider's reply was stopped: it kept streaming for more than {} minutes.",
+                    self.max_duration.as_secs() / 60
+                ));
+            }
             let chunk = match tokio::time::timeout(POLL_TIMEOUT, self.stream.next()).await {
                 Ok(Some(Ok(c))) => c,
                 Ok(Some(Err(e))) => return Err(format!("stream read error: {e}")),
@@ -109,6 +158,10 @@ where
             };
             if self.buffer.len().saturating_add(chunk.len()) > MAX_SSE_BUFFER_BYTES {
                 return Err("provider SSE buffer exceeded its 1 MiB limit".into());
+            }
+            self.total_bytes = self.total_bytes.saturating_add(chunk.len());
+            if self.total_bytes > self.max_total_bytes {
+                return Err(super::limit_error("data", self.max_total_bytes));
             }
             self.buffer.extend_from_slice(&chunk);
             if let Some(event) = self.drain_buffered_event()? {
@@ -277,6 +330,64 @@ mod tests {
         let mut events = SseEvents::new(stream, cancel);
         assert_eq!(events.next_event().await.unwrap(), None);
     }
+
+    /// AT-6: the SUM of what a stream sends is bounded, not just one frame.
+    #[tokio::test]
+    async fn stops_a_stream_that_sends_more_than_the_wire_cap() {
+        // Each frame is 9 bytes; a 20-byte cap allows two and refuses the third.
+        let stream = make_stream(vec![
+            Ok("data: a\n\n"),
+            Ok("data: b\n\n"),
+            Ok("data: c\n\n"),
+        ]);
+        let mut events = SseEvents::with_limits(
+            stream,
+            Arc::new(AtomicBool::new(false)),
+            20,
+            Duration::from_secs(60),
+        );
+        assert_eq!(
+            events.next_event().await.unwrap().as_deref(),
+            Some("data: a\n\n")
+        );
+        assert_eq!(
+            events.next_event().await.unwrap().as_deref(),
+            Some("data: b\n\n")
+        );
+        let err = events.next_event().await.unwrap_err();
+        assert!(err.contains("stopped") && err.contains("data"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn stops_a_stream_that_stays_open_past_the_duration_cap() {
+        // A server that sends nothing and never closes (or drips keep-alives).
+        let stream = stream::pending::<reqwest::Result<Bytes>>();
+        let mut events = SseEvents::with_limits(
+            stream,
+            Arc::new(AtomicBool::new(false)),
+            MAX_STREAM_WIRE_BYTES,
+            Duration::from_millis(150),
+        );
+        let result = tokio::time::timeout(Duration::from_secs(5), events.next_event())
+            .await
+            .expect("the duration cap must end the wait");
+        assert!(result.unwrap_err().contains("stopped"));
+    }
+
+    #[tokio::test]
+    async fn the_duration_cap_does_not_override_a_user_stop() {
+        let stream = stream::pending::<reqwest::Result<Bytes>>();
+        let cancel = Arc::new(AtomicBool::new(true));
+        let mut events =
+            SseEvents::with_limits(stream, cancel, MAX_STREAM_WIRE_BYTES, Duration::ZERO);
+        // Cancel is checked first: Stop still reads as a clean end, not an error.
+        assert_eq!(events.next_event().await.unwrap(), None);
+    }
+
+    // 64 MiB on the wire and half an hour: far past a 10 000-token answer.
+    // Compile-time checks, so lowering a cap below honest use fails the build.
+    const _: () = assert!(MAX_STREAM_WIRE_BYTES >= 32 * 1024 * 1024);
+    const _: () = assert!(MAX_STREAM_DURATION.as_secs() >= 10 * 60);
 
     #[tokio::test]
     async fn trims_keepalive_newlines_between_events() {

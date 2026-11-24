@@ -454,22 +454,67 @@ impl<R: tauri::Runtime> NativeConfirm for OsDialog<R> {
     }
 }
 
+/// Characters that render as nothing (or reorder the text around them) and so
+/// let a hostile value look like something it is not: bidi embeddings /
+/// overrides / isolates and the LRM/RLM/ALM marks (a host that APPEARS to end
+/// in `.example.com`), zero-width and joiner characters, soft hyphen, invisible
+/// fillers, interlinear annotation marks and the Unicode "tag" block
+/// (invisible text smuggling). Review AK-7.
+fn is_invisible_or_reordering(c: char) -> bool {
+    matches!(
+        c as u32,
+        0x00AD                  // soft hyphen
+        | 0x034F                // combining grapheme joiner
+        | 0x061C                // Arabic letter mark
+        | 0x17B4..=0x17B5       // Khmer inherent vowels (invisible)
+        | 0x180B..=0x180E       // Mongolian free variation selectors / separator
+        | 0x200B..=0x200F       // zero-width space/joiners, LRM, RLM
+        | 0x202A..=0x202E       // bidi embeddings and overrides
+        | 0x2060..=0x206F       // word joiner, invisible operators, bidi isolates
+        | 0x3164                // Hangul filler
+        | 0xFEFF                // zero-width no-break space / BOM
+        | 0xFFA0                // halfwidth Hangul filler
+        | 0xFFF9..=0xFFFB       // interlinear annotation
+        | 0xE0000..=0xE0FFF     // tags + variation selectors supplement
+    )
+}
+
 /// Dialog text is built from renderer-influenced strings (host names, path
-/// globs, tool names). Keep it short and free of control characters so a
-/// hostile value cannot stretch the dialog, forge extra lines, or hide the real
-/// request behind its own text.
+/// globs, tool names). Keep it short and free of control, invisible and
+/// text-reordering characters so a hostile value cannot stretch the dialog,
+/// forge extra lines, or hide the real request behind its own text.
+///
+/// A value longer than `max_chars` is shortened in the MIDDLE, never from the
+/// right: the end of a host name is its registrable domain
+/// (`ollama.example.com.<padding>.evil.net`) and the end of a path is the file,
+/// so the tail is the part a reader needs to see. The result is at most
+/// `max_chars` characters.
 pub(crate) fn dialog_safe(s: &str, max_chars: usize) -> String {
     let cleaned: String = s
         .chars()
-        .map(|c| if c.is_control() { ' ' } else { c })
+        .filter_map(|c| {
+            if c.is_control() || c == '\u{2028}' || c == '\u{2029}' {
+                Some(' ')
+            } else if is_invisible_or_reordering(c) {
+                None
+            } else {
+                Some(c)
+            }
+        })
         .collect();
     let cleaned = cleaned.trim();
-    if cleaned.chars().count() <= max_chars {
-        cleaned.to_string()
-    } else {
-        let cut: String = cleaned.chars().take(max_chars).collect();
-        format!("{cut}…")
+    let count = cleaned.chars().count();
+    if count <= max_chars {
+        return cleaned.to_string();
     }
+    // One character is the ellipsis; split the rest between head and tail,
+    // giving the odd one to the tail.
+    let keep = max_chars.saturating_sub(1);
+    let head_len = keep / 2;
+    let tail_len = keep - head_len;
+    let head: String = cleaned.chars().take(head_len).collect();
+    let tail: String = cleaned.chars().skip(count - tail_len).collect();
+    format!("{head}…{tail}")
 }
 
 #[cfg(test)]
@@ -523,9 +568,74 @@ mod tests {
     fn dialog_safe_truncates_on_char_boundaries() {
         let s = "\u{754c}".repeat(100);
         let out = dialog_safe(&s, 10);
-        assert_eq!(out.chars().count(), 11, "10 chars + ellipsis");
-        assert!(out.ends_with('…'));
+        assert_eq!(out.chars().count(), 10, "never longer than the limit");
+        assert!(out.contains('…'));
         assert_eq!(dialog_safe("short", 10), "short");
+        // Exactly at the limit is untouched; one over is shortened.
+        assert_eq!(dialog_safe("abcdefghij", 10), "abcdefghij");
+        assert_eq!(dialog_safe("abcdefghijk", 10).chars().count(), 10);
+        // Degenerate limits do not panic.
+        assert_eq!(dialog_safe("abc", 0), "…");
+        assert_eq!(dialog_safe("abc", 1), "…");
+        assert_eq!(dialog_safe("", 5), "");
+    }
+
+    /// AK-7: the right-hand truncation hid the real registrable domain behind
+    /// padding. The middle is dropped instead, so both ends stay visible.
+    #[test]
+    fn dialog_safe_keeps_both_ends_so_padding_cannot_hide_the_real_domain() {
+        let host = format!("ollama.example.com.{}.evil.net", "a".repeat(200));
+        let out = dialog_safe(&host, 80);
+        assert!(out.chars().count() <= 80, "{} chars", out.chars().count());
+        assert!(out.starts_with("ollama.example.com."), "{out}");
+        assert!(out.ends_with(".evil.net"), "{out}");
+        assert!(out.contains('…'), "{out}");
+        // A long path keeps its file name.
+        let path = format!("Journal/{}/secret-plans.md", "x/".repeat(100));
+        let out = dialog_safe(&path, 60);
+        assert!(out.ends_with("/secret-plans.md"), "{out}");
+        assert!(out.starts_with("Journal/"), "{out}");
+    }
+
+    #[test]
+    fn dialog_safe_removes_bidi_and_invisible_characters() {
+        // RLO makes `moc.elpmaxe` display as `example.com`; the others render as
+        // nothing and could splice a look-alike together.
+        let spoof = "good\u{202E}moc.live\u{202C}.net";
+        assert_eq!(dialog_safe(spoof, 80), "goodmoc.live.net");
+        for c in [
+            '\u{202A}',
+            '\u{202B}',
+            '\u{202C}',
+            '\u{202D}',
+            '\u{202E}',
+            '\u{2066}',
+            '\u{2067}',
+            '\u{2068}',
+            '\u{2069}',
+            '\u{200E}',
+            '\u{200F}',
+            '\u{061C}',
+            '\u{200B}',
+            '\u{200C}',
+            '\u{200D}',
+            '\u{2060}',
+            '\u{FEFF}',
+            '\u{00AD}',
+            '\u{E0041}',
+            '\u{3164}',
+        ] {
+            assert_eq!(
+                dialog_safe(&format!("a{c}b"), 10),
+                "ab",
+                "U+{:04X}",
+                c as u32
+            );
+        }
+        // Line/paragraph separators become spaces, like other line breaks.
+        assert_eq!(dialog_safe("a\u{2028}b\u{2029}c", 10), "a b c");
+        // Ordinary non-ASCII text, including emoji and CJK, is untouched.
+        assert_eq!(dialog_safe("日本語 ✅ café", 20), "日本語 ✅ café");
     }
 }
 

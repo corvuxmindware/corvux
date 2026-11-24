@@ -1,3 +1,8 @@
+# Mobile / cross builds: this pin has no `targets`, so after a pull run
+# `rustup target add <triple> --toolchain 1.96.0` for each target you build
+# (Android: aarch64-linux-android, armv7-linux-androideabi, ...; iOS/macOS:
+# aarch64-apple-ios, aarch64-apple-darwin, ...). Targets installed for another
+# toolchain version are not picked up.
 [toolchain]
 channel = "1.96.0"
 profile = "minimal"

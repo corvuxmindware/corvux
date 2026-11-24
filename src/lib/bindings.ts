@@ -69,8 +69,8 @@ export const commands = {
 	 *  Roosts, so removing a roost you're done with reclaims its multi-MB index
 	 *  instead of orphaning it under `app_data_dir/vaults/`. ONLY the derived
 	 *  index is removed; the user's roost content (markdown) is never touched —
-	 *  `roost_db_dir` resolves the id-keyed index dir, which is a different
-	 *  directory from user content. Best-effort: a missing dir
+	 *  `paths::existing_index_dirs` resolves the id-keyed and legacy index dirs,
+	 *  which are different directories from user content. Best-effort: a missing dir
 	 *  is success. Intended for roosts that aren't currently open (an open roost
 	 *  holds its DB files, which can block deletion on Windows); the caller
 	 *  tolerates an error and still drops the registry entry.
@@ -2091,7 +2091,28 @@ export type SecretKind =
  *  digests, signing secrets, and similar. Low-confidence by
  *  design — frequently a false positive on legitimate hashes.
  */
-"long_hex";
+"long_hex" | 
+/**
+ *  Provider API key / token with a fixed, documented prefix and
+ *  length: OpenRouter (`sk-or-v1-` + 64 hex), OpenAI (`sk-proj-…`,
+ *  `sk-svcacct-…`, `sk-admin-…`, legacy `sk-` + 48 alphanumerics,
+ *  or a `sk-` key carrying the `T3BlbkFJ` marker), Anthropic
+ *  (`sk-ant-…`), GitHub (`ghp_`/`gho_`/`ghu_`/`ghs_`/`ghr_` + 36,
+ *  `github_pat_…`).
+ */
+"provider_api_key" | 
+/**
+ *  PEM private-key header (`-----BEGIN [RSA |EC |OPENSSH |…]PRIVATE
+ *  KEY-----`, PGP `PRIVATE KEY BLOCK`). The preview is the header
+ *  line itself, never key material.
+ */
+"private_key_block" | 
+/**
+ *  Not a finding: more distinct findings exist than fit the card
+ *  (or part of a huge string was not scanned). The preview says how
+ *  many (`12 more`, `200+ more`).
+ */
+"more_not_shown";
 
 /**
  *  One detection. `field` is a dotted path into the JSON args (e.g.

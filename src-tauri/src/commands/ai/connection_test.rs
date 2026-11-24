@@ -197,7 +197,8 @@ pub async fn test_gemini_connection(
     }
     let url = "https://generativelanguage.googleapis.com/v1beta/models";
     let client = no_redirect_client()?;
-    let req = client.get(url).header("x-goog-api-key", key);
+    // AK-9: the key header is marked sensitive (kept out of Debug output).
+    let req = crate::ai::http::secret_header(client.get(url), "x-goog-api-key", key)?;
     Ok(run_catalogue_probe("gemini", req, CatalogueField::Models).await)
 }
 
@@ -413,13 +414,16 @@ pub async fn test_anthropic_connection(
         ));
     }
     let client = no_redirect_client()?;
-    let req = client
-        .get(format!("{}/models", crate::ai::anthropic::ANTHROPIC_BASE))
-        .header("x-api-key", key)
-        .header(
-            "anthropic-version",
-            crate::ai::tool_translator::anthropic::ANTHROPIC_VERSION,
-        );
+    // AK-9: the key header is marked sensitive (kept out of Debug output).
+    let req = crate::ai::http::secret_header(
+        client.get(format!("{}/models", crate::ai::anthropic::ANTHROPIC_BASE)),
+        "x-api-key",
+        key,
+    )?
+    .header(
+        "anthropic-version",
+        crate::ai::tool_translator::anthropic::ANTHROPIC_VERSION,
+    );
     Ok(run_catalogue_probe("anthropic", req, CatalogueField::Data).await)
 }
 

@@ -6,10 +6,19 @@
 //! redirects and only the first hop is ever validated, so a user-supplied
 //! address that answers `302 Location: http://169.254.169.254/…` would walk the
 //! Rust client somewhere `validate_provider_base_url` never looked. The shared
-//! client is left as it is on purpose — the model download
+//! client keeps following redirects on purpose — the model download
 //! (`ai/models.rs::download_gemma4_e2b`) fetches from HuggingFace, which
-//! redirects to its CDN — and user-supplied addresses use
-//! [`no_redirect_client`] instead.
+//! redirects to its CDN — so there are THREE clients, by what they carry:
+//!
+//! * [`build_shared_client`] (Tauri state `HttpClient`): follows redirects, for
+//!   the unauthenticated model download only;
+//! * [`cloud_chat_client`]: no redirects, for the fixed-host cloud chat
+//!   providers (a redirect would replay `x-goog-api-key` / `x-api-key`);
+//! * [`no_redirect_client`]: no redirects, for any address the user chose
+//!   (Ollama chat and every probe).
+//!
+//! All three set a connect timeout and a per-read idle timeout and none sets a
+//! total timeout (AT-6): a stream or a download runs as long as bytes arrive.
 
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
@@ -36,16 +45,97 @@ pub(crate) const USER_URL_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// (`AgentBudget::max_wall_clock_secs`).
 pub(crate) const USER_URL_READ_TIMEOUT: Duration = Duration::from_secs(300);
 
+/// How long the cloud-chat client and the shared client wait to open a
+/// connection. Longer than the user-URL client's: these go over the public
+/// internet from phones too.
+pub(crate) const CLOUD_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Per-read idle limit for the cloud-chat client and the shared client (AT-6).
+/// Like [`USER_URL_READ_TIMEOUT`] this is NOT a total timeout — a reply, or the
+/// multi-gigabyte model download, may run as long as bytes keep arriving — and it
+/// is the same five minutes: a reasoning model can legitimately sit silent
+/// before its first token, and no stream that the agent loop's own wall-clock
+/// budget would let live can be cut by this first.
+pub(crate) const CLOUD_READ_TIMEOUT: Duration = USER_URL_READ_TIMEOUT;
+
+const USER_AGENT: &str = concat!("Corvux/", env!("CARGO_PKG_VERSION"));
+
+/// A builder with this module's connection hygiene already applied: the Corvux
+/// user agent, a connect timeout and a per-read idle timeout.
+fn base_builder(connect_timeout: Duration) -> reqwest::ClientBuilder {
+    reqwest::Client::builder()
+        .user_agent(USER_AGENT)
+        .connect_timeout(connect_timeout)
+        .read_timeout(CLOUD_READ_TIMEOUT)
+}
+
 /// Build a client that never follows redirects. A 3xx comes back to the caller
 /// as an ordinary response; see [`redirect_refused`].
 pub(crate) fn build_no_redirect_client() -> Result<reqwest::Client, String> {
-    reqwest::Client::builder()
-        .user_agent(concat!("Corvux/", env!("CARGO_PKG_VERSION")))
+    base_builder(USER_URL_CONNECT_TIMEOUT)
         .redirect(reqwest::redirect::Policy::none())
-        .connect_timeout(USER_URL_CONNECT_TIMEOUT)
-        .read_timeout(USER_URL_READ_TIMEOUT)
         .build()
         .map_err(|e| format!("Failed to build HTTP client: {e}"))
+}
+
+/// The process-wide shared client (`HttpClient` in Tauri state). It FOLLOWS
+/// redirects on purpose, because the model download
+/// (`ai/models.rs::download_gemma4_e2b`) fetches from HuggingFace, which
+/// redirects to its CDN. That makes it the wrong client for anything that
+/// carries a credential: reqwest 0.12 strips only `Authorization`, `Cookie`,
+/// `Proxy-Authorization` and `WWW-Authenticate` when a redirect crosses hosts,
+/// so `x-goog-api-key` / `x-api-key` would be forwarded to wherever the
+/// redirect points (review AK-6). Chat providers use [`cloud_chat_client`].
+pub(crate) fn build_shared_client() -> Result<reqwest::Client, String> {
+    base_builder(CLOUD_CONNECT_TIMEOUT)
+        .build()
+        .map_err(|e| format!("Failed to build HTTP client: {e}"))
+}
+
+/// A client for the fixed-host cloud chat providers (Gemini, OpenAI, Anthropic,
+/// OpenRouter): no redirects, so an API-key header can never be replayed to a
+/// second host; connect + per-read idle timeouts.
+///
+/// None of those four APIs redirects a chat request in normal operation, so
+/// refusing redirects costs nothing; a 3xx now surfaces as the provider's HTTP
+/// error instead of silently sending the key elsewhere. Providers use this
+/// client themselves and ignore any client they are handed — the same
+/// arrangement as `OllamaChat` — so a caller cannot pass the redirect-following
+/// shared client by mistake.
+pub(crate) fn build_cloud_chat_client() -> Result<reqwest::Client, String> {
+    base_builder(CLOUD_CONNECT_TIMEOUT)
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|e| format!("Failed to build HTTP client: {e}"))
+}
+
+/// The process-wide cloud-chat client (one connection pool).
+pub(crate) fn cloud_chat_client() -> Result<Arc<reqwest::Client>, String> {
+    static CLIENT: OnceLock<Result<Arc<reqwest::Client>, String>> = OnceLock::new();
+    CLIENT
+        .get_or_init(|| build_cloud_chat_client().map(Arc::new))
+        .clone()
+}
+
+const BAD_SECRET_HEADER: &str = "The API key contains characters that cannot be sent in a request \
+                                 header (a stray line break or control character). Open Settings \
+                                 \u{2192} AI and paste the key again.";
+
+/// Attach a secret as a request header, marked SENSITIVE (excluded from `Debug`
+/// output and from HTTP/2 header compression tables). Use this for every
+/// credential header that `reqwest`'s own `bearer_auth` does not cover
+/// (`x-goog-api-key`, `x-api-key`); `bearer_auth` already marks its value, and
+/// a hand-built `Authorization` header must never be written (review AK-9; the
+/// `credential_headers_are_always_marked_sensitive` test enforces both).
+pub(crate) fn secret_header(
+    req: reqwest::RequestBuilder,
+    name: &'static str,
+    secret: &str,
+) -> Result<reqwest::RequestBuilder, String> {
+    let mut value = reqwest::header::HeaderValue::from_str(secret)
+        .map_err(|_| BAD_SECRET_HEADER.to_string())?;
+    value.set_sensitive(true);
+    Ok(req.header(name, value))
 }
 
 /// The process-wide no-redirect client (one connection pool). Used by the
@@ -302,6 +392,144 @@ mod tests {
             "Location is not echoed"
         );
         assert_never_dialed(&hits).await;
+    }
+
+    /// AK-6: the cloud-chat client must never follow a redirect, so a vendor
+    /// host (or whatever answers in its place) cannot make it replay the API-key
+    /// header at a second address. The second address here is a loopback
+    /// listener that counts connections.
+    #[tokio::test]
+    async fn the_cloud_chat_client_never_follows_a_redirect_with_the_api_key() {
+        let (first, _target, hits) = redirect_trap().await;
+        let client = build_cloud_chat_client().unwrap();
+        let req = client.post(format!("http://{first}/v1/messages"));
+        let resp = secret_header(req, "x-api-key", "sk-test-secret")
+            .unwrap()
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::FOUND);
+        assert_never_dialed(&hits).await;
+    }
+
+    /// The flip side, pinned on purpose: the SHARED client keeps following
+    /// redirects because the HuggingFace model download depends on it. If this
+    /// starts failing, someone made the shared client refuse redirects — fine for
+    /// security, but then `download_gemma4_e2b` needs its own client first.
+    #[tokio::test]
+    async fn the_shared_client_still_follows_redirects_for_the_model_download() {
+        let (first, _target, hits) = redirect_trap().await;
+        let client = build_shared_client().unwrap();
+        // The target accepts and drops the connection, so the request itself
+        // errors; what matters is that the connection was made.
+        let _ = client
+            .get(format!("http://{first}/model.gguf"))
+            .send()
+            .await;
+        for _ in 0..40 {
+            if hits.load(std::sync::atomic::Ordering::SeqCst) > 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            hits.load(std::sync::atomic::Ordering::SeqCst) >= 1,
+            "the shared client no longer follows redirects"
+        );
+    }
+
+    // Idle timeouts, not a total timeout (a stream or the model download runs as
+    // long as bytes keep arriving); compile-time so editing them past a bound
+    // fails the build.
+    const _: () =
+        assert!(CLOUD_CONNECT_TIMEOUT.as_secs() >= 5 && CLOUD_CONNECT_TIMEOUT.as_secs() <= 60);
+    const _: () = assert!(CLOUD_READ_TIMEOUT.as_secs() >= 120);
+
+    #[test]
+    fn secret_header_marks_the_value_sensitive_and_rejects_line_breaks() {
+        let req = secret_header(
+            reqwest::Client::new().get("http://localhost/"),
+            "x-api-key",
+            "sk-test-secret",
+        )
+        .unwrap()
+        .build()
+        .unwrap();
+        let value = req.headers().get("x-api-key").unwrap();
+        assert!(value.is_sensitive());
+        assert!(!format!("{value:?}").contains("sk-test-secret"));
+
+        let err = secret_header(
+            reqwest::Client::new().get("http://localhost/"),
+            "x-api-key",
+            "sk-test\nsecret",
+        )
+        .err()
+        .unwrap();
+        assert!(err.contains("API key") && !err.contains("sk-test"), "{err}");
+    }
+
+    /// `bearer_auth` is the sensitive-marking Authorization form; pin that this
+    /// is what reqwest does so the AK-9 rule below ("never hand-build it") stays
+    /// grounded in behaviour, not folklore.
+    #[test]
+    fn bearer_auth_marks_the_authorization_value_sensitive() {
+        let req = reqwest::Client::new()
+            .get("http://localhost/")
+            .bearer_auth("sk-test-secret")
+            .build()
+            .unwrap();
+        assert!(req
+            .headers()
+            .get(reqwest::header::AUTHORIZATION)
+            .unwrap()
+            .is_sensitive());
+    }
+
+    /// AK-9 class guard. Every credential header in `src/ai` must go through a
+    /// sensitive-marking form: `bearer_auth` for `Authorization`, `secret_header`
+    /// for `x-goog-api-key` / `x-api-key`. A hand-built header is an unwiped,
+    /// unmarked copy that shows up in `Debug` output. Needles are assembled at
+    /// run time so this file does not match itself.
+    #[test]
+    fn credential_headers_are_always_marked_sensitive() {
+        fn collect(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for entry in std::fs::read_dir(dir).unwrap().flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    collect(&path, out);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    out.push(path);
+                }
+            }
+        }
+        let open = ".header(\"";
+        let needles = [
+            format!("{open}{}", "Authorization"),
+            format!("{open}{}", "authorization"),
+            format!("{open}{}", "x-goog-api-key"),
+            format!("{open}{}", "x-api-key"),
+            format!("header({}", "AUTHORIZATION"),
+            format!("header(reqwest::header::{}", "AUTHORIZATION"),
+        ];
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/ai");
+        let mut files = Vec::new();
+        collect(&root, &mut files);
+        assert!(files.len() > 20, "scanned too few files: {}", files.len());
+        let mut offenders = Vec::new();
+        for file in files {
+            let text = std::fs::read_to_string(&file).unwrap();
+            for (n, line) in text.lines().enumerate() {
+                if needles.iter().any(|needle| line.contains(needle.as_str())) {
+                    offenders.push(format!("{}:{}: {}", file.display(), n + 1, line.trim()));
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "hand-built credential header(s); use bearer_auth / http::secret_header:\n{}",
+            offenders.join("\n")
+        );
     }
 
     #[test]

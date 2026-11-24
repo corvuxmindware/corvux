@@ -1087,6 +1087,12 @@ pub async fn write_roost_manifest(app: tauri::AppHandle, json: String) -> Result
             &dir,
             &unconfirmed_removals(prev_paths, &next, &Default::default()),
         );
+        // SY-5b: ...and its hosting-PIN secret slots (keyed by the roost PATH,
+        // so nothing else can ever find them again) leave the keychain.
+        super::sync::purge_hosting_pins(
+            &unconfirmed_removals(prev_paths, &next, &Default::default()),
+            &next,
+        );
     }
 
     // A confirmed removal is single-use: once the manifest no longer lists the
@@ -1280,8 +1286,8 @@ fn read_manifest_file(path: PathBuf) -> Result<Option<String>, String> {
 /// Roosts, so removing a roost you're done with reclaims its multi-MB index
 /// instead of orphaning it under `app_data_dir/vaults/`. ONLY the derived
 /// index is removed; the user's roost content (markdown) is never touched —
-/// `roost_db_dir` resolves the id-keyed index dir, which is a different
-/// directory from user content. Best-effort: a missing dir
+/// `paths::existing_index_dirs` resolves the id-keyed and legacy index dirs,
+/// which are different directories from user content. Best-effort: a missing dir
 /// is success. Intended for roosts that aren't currently open (an open roost
 /// holds its DB files, which can block deletion on Windows); the caller
 /// tolerates an error and still drops the registry entry.
@@ -1298,18 +1304,28 @@ pub async fn delete_roost_index(app: tauri::AppHandle, roost_path: String) -> Re
         &super::native_confirm::OsDialog(app.clone()),
     )
     .await?;
-    let dir = crate::paths::roost_db_dir(&app, &roost_path)?;
-    // SYN-I11: this roost's sync credentials live in the keychain under a
-    // scope only its `sync/peers.bin` knows — delete them before the file goes.
-    crate::sync::store::peer_store::purge_registry_secrets(&dir.join("sync"));
-    let result = match fs::remove_dir_all(&dir) {
-        Ok(()) => {
-            tracing::info!(dir = %dir.display(), "roost: deleted local index dir");
-            Ok(())
+    // RF-6: FIND the index dirs, never `roost_db_dir` — that writes
+    // `.corvux/vault-id.bin` into the folder being removed (a folder this call
+    // only knows from a webview-supplied string), just to delete the dir it
+    // names. `existing_index_dirs` is read-only and returns the id-keyed and
+    // the legacy path-hash dir when they exist.
+    let data = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| format!("app_data_dir: {e}"))?;
+    let mut result = Ok(());
+    for dir in crate::paths::existing_index_dirs(&data, &roost_path) {
+        // SYN-I11: this roost's sync credentials live in the keychain under a
+        // scope only its `sync/peers.bin` knows — delete them before the file goes.
+        crate::sync::store::peer_store::purge_registry_secrets(&dir.join("sync"));
+        match fs::remove_dir_all(&dir) {
+            Ok(()) => {
+                tracing::info!(dir = %dir.display(), "roost: deleted local index dir");
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => result = Err(format!("delete index dir {}: {e}", dir.display())),
         }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(format!("delete index dir {}: {e}", dir.display())),
-    };
+    }
     if result.is_ok() {
         if let Ok(mut confirmed) = CONFIRMED_REMOVALS.lock() {
             confirmed.insert(crate::paths::normalize_key(&roost_path));
@@ -1530,6 +1546,12 @@ fn ensure_stignore(roost: &Path) -> std::io::Result<()> {
         ".corvux-trash",
         "*.md.tmp",
         "*.md.corvux.tmp",
+        // RF-8: every staging file we write ends `.corvux.tmp` — `write_atomic`
+        // (`note.md.corvux.tmp`) AND `create` (`note.md.<uuid>.corvux.tmp`,
+        // which the `*.md.corvux.tmp` line never matched). One generic suffix
+        // so a crash-orphaned staging file cannot sync or index. Existing
+        // roosts get the line appended on their next open.
+        "*.corvux.tmp",
     ];
     let path = roost.join(".stignore");
     // AUDIT-079: refuse to touch a symlink — `fs::write` follows it and
@@ -1610,6 +1632,32 @@ mod stignore_tests {
             i_neg < i_exc,
             "negations must precede the .corvux exclusion (Syncthing first-match-wins)"
         );
+    }
+
+    /// RF-8: `create` stages as `<name>.<uuid>.corvux.tmp`, which the old
+    /// `*.md.corvux.tmp` line never matched, so a crash left a file that
+    /// folder sync would replicate. The generic suffix covers it, and an
+    /// existing `.stignore` written by an earlier build is upgraded in place.
+    #[test]
+    fn stignore_covers_every_staging_file_and_upgrades_older_files() {
+        let dir = TempDir::new().unwrap();
+        ensure_stignore(dir.path()).unwrap();
+        let body = std::fs::read_to_string(dir.path().join(".stignore")).unwrap();
+        assert!(body.lines().any(|l| l.trim() == "*.corvux.tmp"), "{body}");
+
+        // An .stignore from the previous build: the six old patterns, one user line.
+        let old = "// Managed by Corvux.\nmine\n!.corvux/skills\n!.corvux/agents\n.corvux\n.corvux-trash\n*.md.tmp\n*.md.corvux.tmp\n";
+        std::fs::write(dir.path().join(".stignore"), old).unwrap();
+        ensure_stignore(dir.path()).unwrap();
+        let upgraded = std::fs::read_to_string(dir.path().join(".stignore")).unwrap();
+        assert!(
+            upgraded.starts_with(old),
+            "existing lines stay as they were"
+        );
+        assert!(upgraded.lines().any(|l| l.trim() == "*.corvux.tmp"));
+        assert_eq!(upgraded.matches("*.corvux.tmp").count(), 1);
+        // (That every staging name `NativeFs` writes ends in `.corvux.tmp` is
+        // pinned in `roostfs/native.rs`: `create_staging_name_ends_in_corvux_tmp…`.)
     }
 
     #[test]

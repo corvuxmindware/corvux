@@ -24,7 +24,7 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use tauri::State;
 
-use super::provider_url::{validate_provider_base_url, HostClass};
+use super::provider_url::{redact_userinfo, validate_provider_base_url, HostClass};
 use super::types::{Settings, SettingsState};
 use crate::commands::native_confirm::{dialog_safe, NativeConfirm, OsDialog};
 
@@ -35,8 +35,7 @@ pub(super) const OLLAMA_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 /// Returned when the user presses Cancel on the probe confirmation. Contains
 /// "confirmation was cancelled", one of the markers the frontend's
 /// `isSecurityCancel` recognizes, so a caller can show it as a choice rather
-/// than a failure. (Today `OllamaProvider.tsx` shows it inline as the
-/// test/model-list error text.)
+/// than a failure (`OllamaProvider.tsx` does: a neutral note, not a red error).
 pub(crate) const PROBE_DECLINED: &str =
     "The test request confirmation was cancelled — nothing was sent.";
 
@@ -80,7 +79,9 @@ pub(super) static PROBE_APPROVALS: ProbeApprovals = ProbeApprovals::new();
 /// Everything a probe needs, decided before any network I/O. `Debug` is
 /// hand-written so the token can never reach a log line.
 pub(super) struct OllamaProbe {
-    /// Validated, normalized base URL (no trailing slash).
+    /// Validated, normalized base URL (no trailing slash). Carries `user:pass@`
+    /// only when it IS the saved (legacy) server address — see
+    /// [`resolve_ollama_probe`]; never show it, use [`Self::display_url`].
     pub url: String,
     /// Lowercased host, for the dialog.
     pub host: String,
@@ -88,18 +89,30 @@ pub(super) struct OllamaProbe {
     pub plaintext: bool,
     /// Bearer token to attach, if any (see [`resolve_ollama_probe`]).
     pub key: Option<String>,
-    /// A public host that is not the saved server: ask the user first.
+    /// An internet or link-local host that is not the saved server: ask the
+    /// user first.
     pub needs_confirm: bool,
+    /// The host is a link-local address (`169.254.0.0/16`, `fe80::/10`), not an
+    /// internet name — the dialog describes it as such.
+    pub link_local: bool,
+}
+
+impl OllamaProbe {
+    /// [`Self::url`] without credentials, for dialogs, logs and `Debug`.
+    pub(super) fn display_url(&self) -> String {
+        redact_userinfo(&self.url)
+    }
 }
 
 impl std::fmt::Debug for OllamaProbe {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("OllamaProbe")
-            .field("url", &self.url)
+            .field("url", &self.display_url())
             .field("host", &self.host)
             .field("plaintext", &self.plaintext)
             .field("key", &self.key.as_ref().map(|_| "<redacted>"))
             .field("needs_confirm", &self.needs_confirm)
+            .field("link_local", &self.link_local)
             .finish()
     }
 }
@@ -139,22 +152,34 @@ struct TagsModel {
 /// * The SAVED token is attached only when the probe targets the saved server:
 ///   the webview no longer holds saved keys, so "test with the saved key"
 ///   cannot be allowed to mean "send the saved key to this URL I supplied".
-/// * A host on the open internet that is not the saved server needs the user's
-///   native confirmation (review AK-1): otherwise a script in the webview could
-///   use the probe as a silent fetch of any internet URL, with note text in the
-///   path. The saved server was confirmed when it was saved; loopback and
-///   private-network hosts stay prompt-free, matching `save_settings` (the
-///   by-name classing is the documented AK-8 residual).
+/// * A host on the open internet (or a link-local address — the cloud-metadata
+///   range, review AK-8) that is not the saved server needs the user's native
+///   confirmation (review AK-1): otherwise a script in the webview could use the
+///   probe as a silent fetch of any such URL, with note text in the path. The
+///   saved server was confirmed when it was saved; loopback and private-network
+///   hosts stay prompt-free, matching `save_settings` (a private LAN Ollama is
+///   the normal case; the by-name classing is the documented residual).
+/// * `user:pass@` is accepted ONLY when the address is exactly the saved one (a
+///   legacy value, review AK-9 — so "Test" keeps working for it); any other
+///   address with credentials is refused like in `save_settings`.
 pub(super) fn resolve_ollama_probe(
     base_url: &str,
     typed_key: Option<&str>,
     saved: &Settings,
 ) -> Result<OllamaProbe, String> {
+    // The tolerant validator, so the comparison with the saved value is exact;
+    // the credential rule is applied right below.
     let target = validate_provider_base_url(base_url)
         .map_err(|e| format!("The Ollama server address {e}"))?;
     let is_saved_server = validate_provider_base_url(&saved.ollama_base_url)
         .ok()
         .is_some_and(|s| s.url == target.url);
+    if target.has_userinfo && !is_saved_server {
+        return Err(
+            "The Ollama server address must not contain user:password@ — remove the credentials"
+                .to_string(),
+        );
+    }
     let typed = typed_key.map(str::trim).filter(|k| !k.is_empty());
     let key = match typed {
         Some(k) => Some(k.to_string()),
@@ -166,8 +191,10 @@ pub(super) fn resolve_ollama_probe(
         None => None,
     };
     Ok(OllamaProbe {
-        needs_confirm: target.class == HostClass::Public && !is_saved_server,
+        needs_confirm: matches!(target.class, HostClass::Public | HostClass::LinkLocal)
+            && !is_saved_server,
         plaintext: target.plaintext,
+        link_local: target.class == HostClass::LinkLocal,
         host: target.host,
         url: target.url,
         key,
@@ -175,16 +202,22 @@ pub(super) fn resolve_ollama_probe(
 }
 
 /// Dialog text for a probe that needs confirming. Host and address are
-/// renderer-influenced, so both go through `dialog_safe`.
+/// renderer-influenced, so both go through `dialog_safe` (which keeps the END of
+/// a long value visible); the address is shown without any credentials.
 fn probe_confirm_body(probe: &OllamaProbe) -> String {
+    let what = if probe.link_local {
+        "a link-local address (the range cloud services use for internal credentials)"
+    } else {
+        "a host on the open internet"
+    };
     let mut body = format!(
         "Send a test request to {}?\n\n\
          Full address: {}\n\n\
-         This is not your saved Ollama server — it is a host on the open internet. \
+         This is not your saved Ollama server — it is {what}. \
          Continue only if you just typed this address in Settings \u{2192} AI yourself. \
          If you did not, press Cancel.",
         dialog_safe(&probe.host, 80),
-        dialog_safe(&probe.url, 160),
+        dialog_safe(&probe.display_url(), 160),
     );
     if probe.plaintext {
         body.push_str("\n\nThe address uses plain http://, so the request is UNENCRYPTED.");
@@ -422,6 +455,11 @@ mod tests {
         assert!(needs("https://ollama.mine.example/other"));
         assert!(needs("https://x.tail1234.ts.net"));
 
+        // AK-8: link-local (cloud metadata range) and `x.localhost` ask too.
+        assert!(needs("http://169.254.10.10:11434"));
+        assert!(needs("http://[fe80::1]:11434"));
+        assert!(needs("http://ollama.localhost:11434"));
+
         // The saved server (any cosmetic spelling) → silent.
         assert!(!needs("https://ollama.mine.example"));
         assert!(!needs("https://Ollama.Mine.Example/"));
@@ -437,6 +475,62 @@ mod tests {
         ] {
             assert!(!needs(url), "{url}");
         }
+    }
+
+    #[test]
+    fn a_probe_to_the_cloud_metadata_service_is_refused_before_any_dialog() {
+        let s = saved("http://localhost:11434", None);
+        for url in [
+            "http://169.254.169.254",
+            "http://169.254.169.254/latest/meta-data/iam",
+            "http://metadata.google.internal",
+        ] {
+            let e = resolve_ollama_probe(url, None, &s).unwrap_err();
+            assert!(e.contains("metadata"), "{url}: {e}");
+        }
+    }
+
+    #[test]
+    fn a_link_local_probe_dialog_says_what_the_address_is() {
+        let p = probe("http://169.254.10.10:11434", None);
+        assert!(p.link_local && p.needs_confirm);
+        let body = probe_confirm_body(&p);
+        assert!(body.contains("link-local"), "{body}");
+        assert!(!body.contains("open internet"), "{body}");
+        let net = probe_confirm_body(&probe("https://attacker.example", None));
+        assert!(
+            net.contains("open internet") && !net.contains("link-local"),
+            "{net}"
+        );
+    }
+
+    // ── AK-9: a legacy credentialed saved address can still be tested ────
+
+    #[test]
+    fn credentials_in_the_address_are_accepted_only_for_the_saved_server() {
+        let legacy = "http://alice:s3cret@proxy.lan:11434";
+        let s = saved(legacy, Some("TOKEN"));
+        // Testing the saved server as it is saved keeps working…
+        let p = resolve_ollama_probe(legacy, None, &s).unwrap();
+        assert!(!p.needs_confirm);
+        assert_eq!(p.key.as_deref(), Some("TOKEN"));
+        assert_eq!(p.url, "http://alice:s3cret@proxy.lan:11434");
+        // …and nothing a human or a log sees carries the password.
+        assert_eq!(p.display_url(), "http://proxy.lan:11434");
+        let dbg = format!("{p:?}");
+        assert!(!dbg.contains("s3cret") && !dbg.contains("alice"), "{dbg}");
+        // Any OTHER address with credentials is refused, saved server or not.
+        for other in [
+            "http://bob:pw@proxy.lan:11434",
+            "http://alice:s3cret@other.lan:11434",
+            "http://localhost:11434@evil.example",
+        ] {
+            let e = resolve_ollama_probe(other, None, &s).unwrap_err();
+            assert!(e.contains("user:password@"), "{other}: {e}");
+        }
+        // With a different saved server, even that exact address is not trusted.
+        let elsewhere = saved("http://localhost:11434", None);
+        assert!(resolve_ollama_probe(legacy, None, &elsewhere).is_err());
     }
 
     #[test]

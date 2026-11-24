@@ -45,6 +45,10 @@ mod agent_loop;
 pub mod approval;
 mod bundle;
 mod compact;
+// AT-2: the ONE builder of `<external_content>` data fences (escapes body and
+// attributes). pub(crate) so `commands::ai::chat` fences note/memory/context
+// text the same way the agent loop fences tool results.
+pub(crate) mod external_content;
 mod glob;
 // pub(crate): the path sanitizers (sanitize_for_llm / scrub_roost_paths) are
 // exercised by the AI-8 privacy-boundary tests in `ai::tool_translator`.
@@ -319,6 +323,12 @@ mod no_raw_fs_writes_test {
     /// guard. Scan that entire tree for raw file-content reads as well.
     /// Existing non-backend reads are pinned to exact lines and occurrence
     /// counts, so an exception cannot silently allow new reads in that file.
+    ///
+    /// AT-5: the same leak existed one directory over — the skill and subagent
+    /// registries read `<roost>/.corvux/skills|agents` with raw `std::fs` — so
+    /// `ai/skills` and `ai/subagents` are scanned too. Their only raw reads are
+    /// of the user's GLOBAL folder; roost-local reads go through
+    /// `ai/skills/roost_scan.rs` and the roost filesystem.
     #[test]
     fn no_raw_command_reads_outside_allowlist() {
         const RAW_READS: &[&str] = &["fs::read(", "fs::read_to_string(", "File::open("];
@@ -330,9 +340,15 @@ mod no_raw_fs_writes_test {
                 "consent ledger in app-data, not note content",
             ),
             (
+                "ai/settings.rs",
+                "let Ok(text) = std::fs::read_to_string(path) else {",
+                1,
+                "settings.json in app-data, read to learn which provider keys the file holds (F2/N3), not note content",
+            ),
+            (
                 "graph.rs",
                 "let content = std::fs::read_to_string(abs_path)",
-                2,
+                1,
                 "test-only (#[cfg(test)]) index_roost_two_pass fixture; the shipped indexer uses RoostFs",
             ),
             (
@@ -349,7 +365,7 @@ mod no_raw_fs_writes_test {
             ),
             (
                 "sync.rs",
-                "let bytes = match std::fs::read(&path) {",
+                "let bytes = match std::fs::read(path) {",
                 1,
                 "sync preferences in app-data",
             ),
@@ -367,7 +383,7 @@ mod no_raw_fs_writes_test {
             ),
             (
                 "sync_endpoint.rs",
-                "let Ok(text) = std::fs::read_to_string(confirmed_peers_file(dir)) else {",
+                "let text = match std::fs::read_to_string(confirmed_peers_file(dir)) {",
                 1,
                 "confirmed first-pair peers record in app-data (R1)",
             ),
@@ -377,10 +393,28 @@ mod no_raw_fs_writes_test {
                 1,
                 "missed-notification ledger in app-data",
             ),
+            (
+                "ai/skills/manifest.rs",
+                "let content = std::fs::read_to_string(skill_md_path)",
+                1,
+                "the user's GLOBAL ~/.corvux/skills folder only (not a roost; symlinks allowed)",
+            ),
+            (
+                "ai/subagents/manifest.rs",
+                "let content = std::fs::read_to_string(agent_md_path)",
+                1,
+                "the user's GLOBAL ~/.corvux/agents folder only (not a roost; symlinks allowed)",
+            ),
         ];
 
-        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/commands");
-        let mut pending = vec![root.clone()];
+        // Keys are relative to `src/commands` for the commands tree (as they
+        // always were) and to `src/` for the two roost-definition trees.
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut pending = vec![
+            root.join("commands"),
+            root.join("ai/skills"),
+            root.join("ai/subagents"),
+        ];
         let mut seen = vec![0; ALLOWED.len()];
         let mut violations = Vec::new();
         while let Some(dir) = pending.pop() {
@@ -400,6 +434,10 @@ mod no_raw_fs_writes_test {
                     .unwrap()
                     .to_string_lossy()
                     .replace('\\', "/");
+                let name = name
+                    .strip_prefix("commands/")
+                    .map(str::to_string)
+                    .unwrap_or(name);
                 let src = fs::read_to_string(&path)
                     .expect("read command source")
                     .replace("\r\n", "\n");
@@ -419,15 +457,24 @@ mod no_raw_fs_writes_test {
                 }
             }
         }
-        for (index, (file, _, count, reason)) in ALLOWED.iter().enumerate() {
-            assert_eq!(
-                seen[index], *count,
-                "review raw-read exception for {file}: {reason}"
-            );
-        }
+        // Report EVERY stale exception at once (not just the first), so one run
+        // shows the whole drift.
+        let stale: Vec<String> = ALLOWED
+            .iter()
+            .enumerate()
+            .filter(|(index, (_, _, count, _))| seen[*index] != *count)
+            .map(|(index, (file, line, count, reason))| {
+                format!(
+                    "{file} `{line}`: expected {count}, found {} ({reason})",
+                    seen[index]
+                )
+            })
+            .collect();
         assert!(
-            violations.is_empty(),
-            "Raw command reads must use RoostFs or have a narrowly documented exception:\n{}",
+            stale.is_empty() && violations.is_empty(),
+            "Raw command reads must use RoostFs or have a narrowly documented exception.\n\
+             Stale exception(s) to review:\n{}\nUnlisted raw read(s):\n{}",
+            stale.join("\n"),
             violations.join("\n")
         );
     }

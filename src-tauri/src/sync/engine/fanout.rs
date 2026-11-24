@@ -8,6 +8,8 @@
 //!
 //! Split off `engine.rs` to keep the orchestrator focused on lifecycle.
 
+use std::time::Instant;
+
 use tracing::{debug, info, warn};
 
 use crate::sync::crdt::NoteDoc;
@@ -17,6 +19,7 @@ use crate::sync::protocol::NotePath;
 
 use super::engine::SyncEngine;
 use super::peer::PeerHandle;
+use super::removal_guard::RemovalVerdict;
 use super::state::SyncEvent;
 use super::util::clone_handle;
 use super::watcher::LocalChange;
@@ -31,6 +34,21 @@ use super::watcher::LocalChange;
 /// (the reap used to use the 30-day queue TTL) is what fixed the
 /// "offline 45 days → deletes resurrect" surprise.
 pub(super) const TOMBSTONE_RETENTION_SECS: u64 = 180 * 24 * 60 * 60;
+
+/// Where a tombstone request came from. Decides what [`SyncEngine::commit_tombstone`]
+/// must re-verify under the note lock before it commits.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum TombstoneOrigin {
+    /// A user / IPC delete. The caller already trashed the file (or is renaming
+    /// it away); the intent is authoritative, so the commit stands and the disk
+    /// is reconciled afterwards (a copy a racing adopt recreated is re-trashed).
+    Intentional,
+    /// Inferred from a watcher event or a rescan diff ("the file looked gone").
+    /// Only a guess: committed only if the doc is not already deleted AND the
+    /// file is still absent, both checked under the note lock. Never touches
+    /// the disk.
+    InferredFromDisk,
+}
 
 // Compile-time guard: tombstone retention must outlast the queue TTL. If it
 // were shorter, a tombstone could be reaped while an offline peer still had a
@@ -174,6 +192,10 @@ impl SyncEngine {
                 else {
                     return Ok(false);
                 };
+                // The read just succeeded under the note lock: the file exists.
+                // That is the evidence a later overflow reconcile needs before
+                // it may turn this note's disappearance into a tombstone.
+                self.inner.disk_seen.mark(path);
                 let text = match String::from_utf8(bytes) {
                     Ok(text) => text,
                     Err(_) => {
@@ -257,7 +279,10 @@ impl SyncEngine {
                 )
                 .await
                 {
-                    Ok(RenderOutcome::Wrote | RenderOutcome::Unchanged) => {}
+                    Ok(RenderOutcome::Wrote | RenderOutcome::Unchanged) => {
+                        // Disk now holds this note (see the `Modified` arm).
+                        self.inner.disk_seen.mark(path);
+                    }
                     // SYN-I5 (mirrors reconcile_doc_to_roost, H-6): a hard write
                     // failure OR the data-loss-guard skip means disk doesn't hold
                     // what the DocStore — and the peers we're about to fan out to
@@ -539,12 +564,54 @@ impl SyncEngine {
     /// the guard drops, and disk can never be left disagreeing with the
     /// tombstone. Idempotent (a no-op when the file is already gone).
     pub async fn mark_note_deleted(&self, note_path: NotePath) {
+        self.commit_tombstone(note_path, TombstoneOrigin::Intentional, Instant::now())
+            .await;
+    }
+
+    /// The ONE tombstone writer. Both entry points funnel here:
+    /// [`Self::mark_note_deleted`] (`Intentional`: the user/IPC delete, whose
+    /// caller already trashed the file) and the watcher-inferred path
+    /// (`InferredFromDisk`, via `verify_then_tombstone`).
+    ///
+    /// An inferred tombstone is only a GUESS from "the file looked gone a moment
+    /// ago", so everything that guess rests on is re-checked UNDER the per-note
+    /// lock, in the same critical section as the CRDT commit (SYN-I3): the doc
+    /// is not already deleted, and the file is STILL absent. A file recreated
+    /// between the watcher's check and this lock (editor atomic save, git
+    /// checkout, the user re-creating the note) is therefore never tombstoned and
+    /// never trashed. An inferred tombstone also never touches the disk: absence
+    /// was just verified under the lock, so there is nothing to trash.
+    ///
+    /// `scheduled_at` is when an inferred removal was scheduled (ignored for
+    /// `Intentional`). The roost look it relies on must have started AFTER it: an
+    /// older cached "allow" cannot vouch for a removal it never saw.
+    pub(super) async fn commit_tombstone(
+        &self,
+        note_path: NotePath,
+        origin: TombstoneOrigin,
+        scheduled_at: Instant,
+    ) {
         // Same roost-switch guard as `apply_local_change` (L-6): a delete
         // dequeued just before a roost switch could otherwise write a tombstone
         // into the OLD roost's DocStore after the new engine is up. Bail if the
         // engine has been stopped.
         if self.is_stopped() {
             return;
+        }
+        // An INFERRED delete is judged against the whole roost first (BEFORE the
+        // note lock: the look walks the roost): a missing/empty/unreadable root or
+        // a mass vanish is an unmounted drive or a cloud eviction, never a user
+        // deleting hundreds of notes at once. See `removal_guard`.
+        if origin == TombstoneOrigin::InferredFromDisk {
+            let verdict = self.removal_verdict(scheduled_at).await;
+            if !verdict.is_allow() {
+                warn!(
+                    note = %note_path,
+                    ?verdict,
+                    "inferred removal suppressed: the roost looks unavailable or mass-emptied — no tombstone written"
+                );
+                return;
+            }
         }
         // Commit the tombstone AND reconcile the disk trash as ONE guarded unit
         // (commit+disk atomicity — see `note_locks`). `newly_deleted` gates the
@@ -554,23 +621,77 @@ impl SyncEngine {
         let newly_deleted;
         {
             let _note_guard = self.inner.note_locks.lock(&note_path).await;
+            if origin == TombstoneOrigin::InferredFromDisk {
+                // Existence is decided UNDER the lock — never on a pre-lock
+                // check (that is the recreate race). An unreadable probe means
+                // "don't know", and we never delete on doubt.
+                match self.note_exists_on_disk(&note_path).await {
+                    Ok(false) => {}
+                    Ok(true) => {
+                        info!(
+                            note = %note_path,
+                            "inferred removal not confirmed — file present under the note lock; skipping tombstone (transient FS event, not a real delete)"
+                        );
+                        return;
+                    }
+                    Err(e) => {
+                        warn!(
+                            note = %note_path,
+                            error = %e,
+                            "inferred removal: existence check failed — skipping tombstone (fail-safe: never delete on uncertainty)"
+                        );
+                        return;
+                    }
+                }
+            }
             // 1. Persist the tombstone.
             {
                 let store = self.inner.doc_store.lock().await;
                 match store.load_or_create(&note_path) {
                     Ok(mut doc) => match doc.is_deleted() {
+                        // Inferred removal of an already-deleted note: nothing to
+                        // do, and the disk must NOT be reconciled (a present
+                        // file here is a user recreation the scan deliberately
+                        // leaves alone — see `scan_roost`).
+                        Ok(true) if origin == TombstoneOrigin::InferredFromDisk => {
+                            self.inner.disk_seen.forget(&note_path);
+                            return;
+                        }
                         // Already tombstoned (double-fire). Skip the redundant
                         // CRDT op — writing a second tombstone would clobber
                         // `deleted_at` — but still fall through to the disk
                         // reconcile below in case a copy was recreated.
                         Ok(true) => newly_deleted = false,
                         Ok(false) => {
+                            // Rule 3 of the breaker, enforced ATOMICALLY at the
+                            // commit: the roost look is a snapshot and may be
+                            // stale by now, so the rolling count of inferred
+                            // tombstones has the last word. Reserved only here,
+                            // once the file is confirmed absent under the lock, so
+                            // every reservation is a real commit.
+                            let reserved = origin == TombstoneOrigin::InferredFromDisk;
+                            if reserved {
+                                if let Err(recent) =
+                                    self.inner.removal_guard.reserve(Instant::now())
+                                {
+                                    self.announce_removal_suppressed(RemovalVerdict::RateLimited {
+                                        recent,
+                                    });
+                                    return;
+                                }
+                            }
                             if let Err(e) = doc.mark_deleted(super::util::now_millis()) {
                                 warn!(note = %note_path, error = %e, "mark_note_deleted: mark_deleted failed");
+                                if reserved {
+                                    self.inner.removal_guard.release();
+                                }
                                 return;
                             }
                             if let Err(e) = store.save(&note_path, &mut doc) {
                                 warn!(note = %note_path, error = %e, "mark_note_deleted: docstore save failed");
+                                if reserved {
+                                    self.inner.removal_guard.release();
+                                }
                                 return;
                             }
                             newly_deleted = true;
@@ -586,35 +707,27 @@ impl SyncEngine {
                     }
                 }
             }
-            // 2. Reconcile disk under the SAME guard: make the file agree with
-            //    the tombstone. Normal path — already trashed by the caller —
-            //    returns Ok(false) (nothing to remove). If a concurrent adopt
-            //    recreated the file, `Ok(true)` means we just re-trashed it, so
-            //    emit NoteDeleted for UIs without a live watcher (SAF).
-            match self.trash_note(&note_path).await {
-                Ok(true) => {
-                    let _ = self.inner.events.send(SyncEvent::NoteDeleted {
-                        path: note_path.0.clone(),
-                    });
-                }
-                Ok(false) => {}
-                // SYN-I5/B8: the tombstone is committed but the disk trash
-                // failed. The startup scan does NOT re-reconcile (it SKIPS
-                // tombstoned-present notes to avoid auto-un-deleting a user's
-                // recreated file — `scan.rs`), so without this the file would
-                // survive silently. Surface it AND enroll for durable retry —
-                // the supervisor re-attempts the trash each tick (twin of the
-                // live receive path).
-                Err(e) => {
-                    warn!(note = %note_path, error = %e, "mark_note_deleted: disk reconcile-trash failed — enrolling for retry");
-                    let _ = self.inner.events.send(SyncEvent::NoteSyncFailed {
-                        path: note_path.0.clone(),
-                        reason: format!("could not trash deleted note: {e}"),
-                    });
-                    if let Err(e) = self.inner.pending_trash.lock().await.insert(&note_path) {
-                        warn!(note = %note_path, error = %e, "mark_note_deleted: pending_trash insert failed");
-                    }
-                }
+            // The note now has a tombstone; it needs no "was on disk" evidence
+            // any more (a later recreation is re-marked by the scan/watcher).
+            self.inner.disk_seen.forget(&note_path);
+            // 2. Reconcile disk under the SAME guard. An INFERRED tombstone
+            //    verified the file absent a few lines up, under this same
+            //    guard, so there is nothing to reconcile — and it must not trash
+            //    anything the user could have written since.
+            if origin == TombstoneOrigin::Intentional {
+                self.reconcile_trash_under_guard(&note_path).await;
+            } else if newly_deleted {
+                // IP-12: an INFERRED delete (external removal while sync is on)
+                // is the one delete no other component announces: the index
+                // watcher goes inert while sync runs, and the disk trash above is
+                // skipped (the file is already gone), so nothing else would tell
+                // the graph / search / edit history the note is gone. Emit
+                // `NoteDeleted` once, here, under the same lock as the commit
+                // (`newly_deleted` is false on a second inference, which returns
+                // earlier still). The frontend re-probes the file before it purges.
+                let _ = self.inner.events.send(SyncEvent::NoteDeleted {
+                    path: note_path.0.clone(),
+                });
             }
         }
         // Already tombstoned: the first pass fanned out + queued; only the disk
@@ -658,6 +771,39 @@ impl SyncEngine {
         //    carries `deleted=true`, so an offline peer learns of the delete
         //    on its next pull — no separate delete protocol needed.
         self.queue_push_to_offline_peers(note_path).await;
+    }
+
+    /// Make the disk agree with a tombstone that was JUST committed. The caller
+    /// holds the note's guard. Normal path — already trashed by the caller —
+    /// returns `Ok(false)` (nothing to remove). If a concurrent adopt recreated
+    /// the file, `Ok(true)` means we just re-trashed it, so emit `NoteDeleted`
+    /// for UIs without a live watcher (SAF).
+    async fn reconcile_trash_under_guard(&self, note_path: &NotePath) {
+        match self.trash_note(note_path).await {
+            Ok(true) => {
+                let _ = self.inner.events.send(SyncEvent::NoteDeleted {
+                    path: note_path.0.clone(),
+                });
+            }
+            Ok(false) => {}
+            // SYN-I5/B8: the tombstone is committed but the disk trash
+            // failed. The startup scan does NOT re-reconcile (it SKIPS
+            // tombstoned-present notes to avoid auto-un-deleting a user's
+            // recreated file — `scan.rs`), so without this the file would
+            // survive silently. Surface it AND enroll for durable retry —
+            // the supervisor re-attempts the trash each tick (twin of the
+            // live receive path).
+            Err(e) => {
+                warn!(note = %note_path, error = %e, "mark_note_deleted: disk reconcile-trash failed — enrolling for retry");
+                let _ = self.inner.events.send(SyncEvent::NoteSyncFailed {
+                    path: note_path.0.clone(),
+                    reason: format!("could not trash deleted note: {e}"),
+                });
+                if let Err(e) = self.inner.pending_trash.lock().await.insert(note_path) {
+                    warn!(note = %note_path, error = %e, "mark_note_deleted: pending_trash insert failed");
+                }
+            }
+        }
     }
 
     /// Clear a note's tombstone (the inverse of `mark_note_deleted`). This is

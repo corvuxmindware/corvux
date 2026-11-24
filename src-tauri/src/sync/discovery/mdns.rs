@@ -108,33 +108,113 @@ pub struct Discovery {
 const MAX_SEEN_PEERS: usize = 256;
 const SEEN_TTL: std::time::Duration = std::time::Duration::from_secs(5 * 60);
 
+/// Async "is this device a peer we paired with?" lookup, supplied by whoever
+/// owns the pairing list (the engine). The browser asks it for every resolved
+/// advertisement so the bounded peer cache can protect paired peers from an
+/// unpaired flood. Build one with [`paired_lookup`].
+pub type PairedLookup = Arc<
+    dyn Fn(DeviceId) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>>
+        + Send
+        + Sync,
+>;
+
+/// Wrap an `async` closure as a [`PairedLookup`].
+pub fn paired_lookup<F, Fut>(lookup: F) -> PairedLookup
+where
+    F: Fn(DeviceId) -> Fut + Send + Sync + 'static,
+    Fut: std::future::Future<Output = bool> + Send + 'static,
+{
+    Arc::new(move |id| Box::pin(lookup(id)))
+}
+
 struct SeenPeer {
     peer: DiscoveredPeer,
     last_seen: std::time::Instant,
+    /// Paired when last seen. Paired entries carry the LAN address hint the
+    /// dialer needs, so they are never evicted to make room for an unpaired one.
+    paired: bool,
 }
 
+/// What [`remember_peer`] did.
+struct Remembered {
+    /// The caller should emit `Found` (new peer, or the advert changed).
+    emit: bool,
+    /// An older entry was dropped to make room. Its UI row is now orphaned (no
+    /// cache entry left to expire it), so the caller must emit `Lost` for it.
+    evicted: Option<DeviceId>,
+}
+
+/// Oldest entry satisfying `pick`, ties broken by device id so the choice is
+/// deterministic.
+fn oldest_entry(
+    seen: &HashMap<DeviceId, SeenPeer>,
+    pick: impl Fn(&SeenPeer) -> bool,
+) -> Option<DeviceId> {
+    seen.iter()
+        .filter(|(_, entry)| pick(entry))
+        .min_by(|a, b| {
+            a.1.last_seen
+                .cmp(&b.1.last_seen)
+                .then_with(|| a.0 .0.cmp(&b.0 .0))
+        })
+        .map(|(id, _)| *id)
+}
+
+/// Insert or refresh `peer` in the bounded cache.
+///
+/// At capacity the OLDEST UNPAIRED entry is evicted to make room. Anyone on the
+/// LAN can advertise `_corvux-sync._tcp` with any number of fake device ids; if a
+/// full cache simply rejected newcomers (as it once did), 256 fake adverts would
+/// keep every real paired peer out, and with it its LAN address hint. So an
+/// unpaired newcomer can only ever displace another unpaired entry (and is
+/// dropped when the cache holds nothing but paired peers), while a paired
+/// newcomer may displace an unpaired entry, or, in the unreachable all-paired
+/// case, the oldest paired one.
 fn remember_peer(
     seen: &mut HashMap<DeviceId, SeenPeer>,
     peer: DiscoveredPeer,
+    paired: bool,
     now: std::time::Instant,
-) -> bool {
+) -> Remembered {
     if let Some(entry) = seen.get_mut(&peer.device_id) {
         let changed = entry.peer != peer;
         entry.peer = peer;
         entry.last_seen = now;
-        return changed;
+        entry.paired = paired;
+        return Remembered {
+            emit: changed,
+            evicted: None,
+        };
     }
+    let mut evicted = None;
     if seen.len() >= MAX_SEEN_PEERS {
-        return false;
+        let victim = oldest_entry(seen, |entry| !entry.paired)
+            .or_else(|| paired.then(|| oldest_entry(seen, |_| true)).flatten());
+        match victim {
+            Some(id) => {
+                seen.remove(&id);
+                evicted = Some(id);
+            }
+            None => {
+                return Remembered {
+                    emit: false,
+                    evicted: None,
+                }
+            }
+        }
     }
     seen.insert(
         peer.device_id,
         SeenPeer {
             peer,
             last_seen: now,
+            paired,
         },
     );
-    true
+    Remembered {
+        emit: true,
+        evicted,
+    }
 }
 
 fn expire_seen(seen: &mut HashMap<DeviceId, SeenPeer>, now: std::time::Instant) -> Vec<DeviceId> {
@@ -236,10 +316,24 @@ impl Discovery {
         }
     }
 
-    /// Start a browser and forward `DiscoveryEvent`s on `out`. The returned
-    /// task handle runs until the daemon is shut down; callers normally
-    /// keep it alive inside a `JoinHandle` field on the engine.
+    /// [`Self::browse_with_paired`] with NO pairing knowledge: every peer counts
+    /// as unpaired, so a flood of fake adverts can evict real paired peers from
+    /// the bounded cache. Production callers must use `browse_with_paired`.
+    #[allow(dead_code)] // superseded by `browse_with_paired` at the call site
     pub fn browse(&self, out: mpsc::UnboundedSender<DiscoveryEvent>) -> SyncResult<()> {
+        self.browse_with_paired(out, paired_lookup(|_| async { false }))
+    }
+
+    /// Start a browser and forward `DiscoveryEvent`s on `out`. The spawned
+    /// task runs until the daemon is shut down. `is_paired` tells the bounded
+    /// peer cache which advertisers are paired peers (SY-6): when the cache is
+    /// full it evicts the oldest UNPAIRED entry first, so fake adverts can never
+    /// push a real paired peer out. An evicted entry is reported as `Lost`.
+    pub fn browse_with_paired(
+        &self,
+        out: mpsc::UnboundedSender<DiscoveryEvent>,
+        is_paired: PairedLookup,
+    ) -> SyncResult<()> {
         let receiver =
             self.inner.daemon.browse(SERVICE_TYPE).map_err(|e| {
                 SyncError::Engine(EngineError::Discovery(format!("mdns browse: {e}")))
@@ -263,14 +357,24 @@ impl Discovery {
                     ServiceEvent::ServiceResolved(info) => {
                         match parse_peer(&info, inner.our_device_id) {
                             Ok(Some(peer)) => {
+                                // Ask BEFORE taking the cache lock: the lookup
+                                // may await the pairing store.
+                                let paired = is_paired(peer.device_id).await;
                                 let mut seen = inner.seen.lock().await;
-                                let emit = remember_peer(
+                                let remembered = remember_peer(
                                     &mut seen,
                                     peer.clone(),
+                                    paired,
                                     std::time::Instant::now(),
                                 );
                                 drop(seen);
-                                if emit && out.send(DiscoveryEvent::Found(peer)).is_err() {
+                                if let Some(device_id) = remembered.evicted {
+                                    if out.send(DiscoveryEvent::Lost { device_id }).is_err() {
+                                        return;
+                                    }
+                                }
+                                if remembered.emit && out.send(DiscoveryEvent::Found(peer)).is_err()
+                                {
                                     return;
                                 }
                             }
@@ -489,36 +593,158 @@ fn full_name_matches(peer: &DiscoveredPeer, full_name: &str) -> bool {
 #[cfg(test)]
 mod tests {
 
+    fn fake_peer(index: u16) -> DiscoveredPeer {
+        let mut id = [0u8; 16];
+        id[..2].copy_from_slice(&index.to_le_bytes());
+        DiscoveredPeer {
+            device_id: DeviceId(id),
+            display_name: format!("peer-{index}"),
+            roost_name: "roost".into(),
+            addr: "127.0.0.1".into(),
+            port: 1234,
+            node_id: None,
+            iroh_addrs: Vec::new(),
+        }
+    }
+
+    fn secs(n: u64) -> std::time::Duration {
+        std::time::Duration::from_secs(n)
+    }
+
     #[test]
     fn peer_cache_is_bounded_expires_and_refreshes_existing_devices() {
-        fn peer(index: u16) -> DiscoveredPeer {
-            let mut id = [0u8; 16];
-            id[..2].copy_from_slice(&index.to_le_bytes());
-            DiscoveredPeer {
-                device_id: DeviceId(id),
-                display_name: format!("peer-{index}"),
-                roost_name: "roost".into(),
-                addr: "127.0.0.1".into(),
-                port: 1234,
-                node_id: None,
-                iroh_addrs: Vec::new(),
-            }
-        }
         let now = std::time::Instant::now();
         let mut seen = HashMap::new();
         for index in 0..MAX_SEEN_PEERS {
-            assert!(remember_peer(&mut seen, peer(index as u16), now));
+            assert!(remember_peer(&mut seen, fake_peer(index as u16), false, now).emit);
         }
-        assert!(!remember_peer(&mut seen, peer(MAX_SEEN_PEERS as u16), now));
         assert_eq!(seen.len(), MAX_SEEN_PEERS);
-        assert!(!remember_peer(
+        // Refreshing a device already cached neither grows the cache nor evicts.
+        let refreshed = remember_peer(&mut seen, fake_peer(0), false, now + secs(1));
+        assert!(!refreshed.emit && refreshed.evicted.is_none());
+        assert_eq!(seen.len(), MAX_SEEN_PEERS);
+        // At capacity a newcomer evicts an older unpaired entry; the cache stays
+        // at its bound and the freshly-seen device 0 survives.
+        let newcomer = remember_peer(
             &mut seen,
-            peer(0),
-            now + std::time::Duration::from_secs(1)
-        ));
+            fake_peer(MAX_SEEN_PEERS as u16),
+            false,
+            now + secs(2),
+        );
+        assert!(newcomer.emit);
+        assert!(newcomer.evicted.is_some());
+        assert_ne!(newcomer.evicted, Some(fake_peer(0).device_id));
+        assert_eq!(seen.len(), MAX_SEEN_PEERS);
+        assert!(seen.contains_key(&fake_peer(0).device_id));
+        // Everything last seen at `now` ages out; device 0 and the newcomer stay.
         let expired = expire_seen(&mut seen, now + SEEN_TTL);
-        assert_eq!(expired.len(), MAX_SEEN_PEERS - 1);
-        assert_eq!(seen.len(), 1);
+        assert_eq!(expired.len(), MAX_SEEN_PEERS - 2);
+        assert_eq!(seen.len(), 2);
+    }
+
+    /// SY-6: 256 fake LAN adverts used to fill the cache and lock real paired
+    /// peers out. A flood of unpaired adverts, far past the bound, must never
+    /// evict a paired peer, even one that is the oldest entry in the cache.
+    #[test]
+    fn unpaired_flood_never_evicts_a_paired_peer() {
+        let now = std::time::Instant::now();
+        let mut seen = HashMap::new();
+        let paired = fake_peer(60_000);
+        remember_peer(&mut seen, paired.clone(), true, now);
+        for index in 0..(MAX_SEEN_PEERS - 1) {
+            remember_peer(&mut seen, fake_peer(index as u16), false, now + secs(1));
+        }
+        assert_eq!(seen.len(), MAX_SEEN_PEERS);
+        for index in 0..1000u16 {
+            let r = remember_peer(
+                &mut seen,
+                fake_peer(10_000 + index),
+                false,
+                now + secs(2 + u64::from(index)),
+            );
+            assert!(r.emit, "an unpaired newcomer displaces an unpaired entry");
+            assert_ne!(r.evicted, Some(paired.device_id));
+            assert!(seen.len() <= MAX_SEEN_PEERS);
+            assert!(
+                seen.contains_key(&paired.device_id),
+                "paired peer evicted after {} fake adverts",
+                index + 1
+            );
+        }
+    }
+
+    /// The real peer must still get IN while the cache is full of fakes: it
+    /// evicts the OLDEST unpaired entry, and the eviction is reported so the UI
+    /// row of the dropped entry can be removed.
+    #[test]
+    fn paired_peer_gets_in_when_full_by_evicting_the_oldest_unpaired() {
+        let now = std::time::Instant::now();
+        let mut seen = HashMap::new();
+        for index in 0..MAX_SEEN_PEERS {
+            remember_peer(
+                &mut seen,
+                fake_peer(index as u16),
+                false,
+                now + secs(index as u64),
+            );
+        }
+        let real = fake_peer(60_001);
+        let r = remember_peer(&mut seen, real.clone(), true, now + secs(1000));
+        assert!(r.emit, "the paired peer must be remembered and announced");
+        assert_eq!(
+            r.evicted,
+            Some(fake_peer(0).device_id),
+            "the oldest unpaired entry is the victim"
+        );
+        assert!(seen.contains_key(&real.device_id));
+        assert_eq!(seen.len(), MAX_SEEN_PEERS);
+    }
+
+    /// An unpaired advert never displaces a paired entry; with nothing unpaired
+    /// to evict it is simply dropped. (A paired newcomer may displace the oldest
+    /// paired entry only in this all-paired corner case.)
+    #[test]
+    fn all_paired_cache_rejects_unpaired_but_admits_paired() {
+        let now = std::time::Instant::now();
+        let mut seen = HashMap::new();
+        for index in 0..MAX_SEEN_PEERS {
+            remember_peer(
+                &mut seen,
+                fake_peer(index as u16),
+                true,
+                now + secs(index as u64),
+            );
+        }
+        let stranger = remember_peer(&mut seen, fake_peer(60_002), false, now + secs(900));
+        assert!(!stranger.emit && stranger.evicted.is_none());
+        assert!(!seen.contains_key(&fake_peer(60_002).device_id));
+        assert_eq!(seen.len(), MAX_SEEN_PEERS);
+
+        let friend = remember_peer(&mut seen, fake_peer(60_003), true, now + secs(901));
+        assert!(friend.emit);
+        assert_eq!(friend.evicted, Some(fake_peer(0).device_id));
+        assert_eq!(seen.len(), MAX_SEEN_PEERS);
+    }
+
+    /// Pairing can happen after a device was first seen: a later sighting must
+    /// upgrade the cached entry to paired, protecting it from then on.
+    #[test]
+    fn a_later_sighting_upgrades_the_paired_flag() {
+        let now = std::time::Instant::now();
+        let mut seen = HashMap::new();
+        let peer = fake_peer(7);
+        remember_peer(&mut seen, peer.clone(), false, now);
+        assert!(!seen[&peer.device_id].paired);
+        remember_peer(&mut seen, peer.clone(), true, now + secs(1));
+        assert!(seen[&peer.device_id].paired);
+    }
+
+    #[tokio::test]
+    async fn paired_lookup_wraps_an_async_closure() {
+        let known = DeviceId([9; 16]);
+        let lookup = paired_lookup(move |id| async move { id == known });
+        assert!(lookup(known).await);
+        assert!(!lookup(DeviceId([8; 16])).await);
     }
     use super::*;
 

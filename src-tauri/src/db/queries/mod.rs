@@ -31,10 +31,14 @@ pub use ai_signals::{
 };
 
 pub use edit_events::{
-    compute_diff, content_hash, get_event as get_edit_event, latest_after_hash, list_all_events,
-    list_events as list_edit_events, mark_reverted, migrate_events_to_new_id, purge_all_events,
-    purge_note_events, purge_note_history, record_event as record_edit_event, Actor, EditEvent,
-    Intent,
+    compute_diff, content_hash, delete_global_victims, get_event as get_edit_event,
+    latest_after_hash, list_all_events, list_events as list_edit_events, list_note_ids,
+    mark_reverted, mark_reverted_if_present, migrate_events_to_new_id, note_event_sizes,
+    orphan_candidates, plan_global_prune, prune_stats, purge_all_events, purge_note_events,
+    purge_note_history, reap_note_if_still_orphan, record_event as record_edit_event,
+    record_prune_stats, sweep_orphan_after_hashes, Actor, EditEvent, EventSize, GlobalVictim,
+    Intent, OrphanCandidate, PruneReport, PruneStats, EVENTS_PER_NOTE_CAP, GLOBAL_BYTES_BUDGET,
+    NOTE_BYTES_BUDGET, ORPHAN_HISTORY_RETENTION_SECS,
 };
 
 pub use algorithms::{
@@ -48,12 +52,15 @@ pub use graph::{
 };
 pub use notes::{
     all_tag_names, bulk_index_pass1, bulk_index_pass2, check_links, dangling_count,
-    file_mtime_secs, index_note_full, index_note_full_with_resolver, index_note_pass1,
-    index_note_pass2, index_note_tasks, list_all_notes, lookup_note_id_by_path,
-    lookup_notes_by_ids, note_ids_set, note_paths_under_dir, note_updated_ats,
-    promote_dangling_links, purge_note, reconcile_deleted_notes, top_tags, LinkReport,
-    LinkResolution, LinkResolver,
+    file_mtime_secs, index_note_full, index_note_full_with_resolver, index_note_tasks,
+    list_all_notes, lookup_note_id_by_path, lookup_notes_by_ids, note_ids_set,
+    note_paths_under_dir, note_updated_ats, promote_dangling_links, purge_note,
+    reconcile_deleted_notes, top_tags, LinkReport, LinkResolution, LinkResolver, NoteIndexOutcome,
 };
+// DB-4 test fail-point (see `notes::tx_fail_point`): lets command-level tests
+// kill a per-note index transaction after its writes ran.
+#[cfg(test)]
+pub(crate) use notes::tx_fail_point;
 #[allow(unused_imports)] // tests use these; retain for public-API stability.
 pub use path::{note_id_from_abs_path, note_rel_dir};
 pub use types::NoteIndexEntry;

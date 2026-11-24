@@ -3,4 +3,4 @@
 
 pub mod mdns;
 
-pub use mdns::{DiscoveredPeer, Discovery, DiscoveryEvent};
+pub use mdns::{DiscoveredPeer, Discovery, DiscoveryEvent, PairedLookup};

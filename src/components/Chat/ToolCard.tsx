@@ -292,6 +292,12 @@ function secretLabel(kind: SecretKind): string {
       return "URL w/ creds";
     case "long_hex":
       return "long hex blob";
+    case "provider_api_key":
+      return "API key / token shape";
+    case "private_key_block":
+      return "private key block";
+    case "more_not_shown":
+      return "more not shown";
   }
 }
 

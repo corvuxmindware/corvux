@@ -130,7 +130,7 @@ impl NativeFs {
     pub(crate) fn exists_blocking(&self, rel: &str) -> Result<bool, RoostError> {
         match resolve_within(&self.root, &self.canonical_root, rel) {
             Ok(p) => exists_checked(&p),
-            Err(RoostError::OutsideRoost(_)) => Ok(false),
+            Err(e) if e.is_path_refusal() => Ok(false),
             Err(e) => Err(e),
         }
     }
@@ -244,6 +244,18 @@ fn resolve_within(root: &Path, canonical_root: &Path, rel: &str) -> Result<PathB
     Ok(final_path)
 }
 
+/// Staging name for [`NativeFs::create`]: `<file name>.<uuid>.corvux.tmp`, next
+/// to the target. Appended, never swapped for the extension, so the file name
+/// always ends in `.corvux.tmp`: the one suffix the watcher (`*.tmp`), the note
+/// walkers (not `.md`/`.markdown`) and `.stignore` (`*.corvux.tmp`) all skip.
+/// A crash between the write and the rename can leave this file behind; it is
+/// never read as a note, and never replaced by or confused with a real one.
+fn create_tmp_path(target: &Path) -> PathBuf {
+    let mut name = target.as_os_str().to_os_string();
+    name.push(format!(".{}.corvux.tmp", uuid::Uuid::new_v4()));
+    PathBuf::from(name)
+}
+
 /// Existence that tells "absent" from "could not tell". `Path::exists()` is
 /// `false` for EACCES, EIO, or an expired iOS folder grant, and callers read
 /// `false` as "not there" — then create or replace a file that is. Only
@@ -352,7 +364,7 @@ impl RoostFs for NativeFs {
         if let Some(parent) = target.parent() {
             fs::create_dir_all(parent).await?;
         }
-        let tmp = target.with_extension(format!("{}.corvux.tmp", uuid::Uuid::new_v4()));
+        let tmp = create_tmp_path(&target);
         let result = async {
             let mut file = fs::OpenOptions::new()
                 .write(true)
@@ -451,7 +463,7 @@ impl RoostFs for NativeFs {
         // file existence info via the IPC return value.
         match self.safe_resolve(rel).await {
             Ok(p) => exists_checked(&p),
-            Err(RoostError::OutsideRoost(_)) => Ok(false),
+            Err(e) if e.is_path_refusal() => Ok(false),
             Err(e) => Err(e),
         }
     }
@@ -504,6 +516,45 @@ mod tests {
         let dir = TempDir::new().expect("tempdir");
         let fs = NativeFs::new(dir.path());
         (dir, fs)
+    }
+
+    /// RF-8: the staging file of `create` must carry the suffix every scanner
+    /// already skips, and must never look like a note.
+    #[test]
+    fn create_staging_name_ends_in_corvux_tmp_and_is_never_a_note() {
+        for target in [
+            "/roost/Daily/2026-11-12.md",
+            "/roost/no-extension",
+            "/roost/dotted.name.v2.markdown",
+        ] {
+            let target = Path::new(target);
+            let a = create_tmp_path(target);
+            let b = create_tmp_path(target);
+            assert_ne!(a, b, "unique per call");
+            assert_eq!(a.parent(), target.parent(), "next to the target");
+            let name = a.file_name().unwrap().to_string_lossy().into_owned();
+            let own = target.file_name().unwrap().to_string_lossy().into_owned();
+            assert!(name.starts_with(&format!("{own}.")), "{name}");
+            assert!(name.ends_with(".corvux.tmp"), "{name}");
+            assert!(!super::super::walk::is_markdown_name(&name), "{name}");
+        }
+    }
+
+    #[tokio::test]
+    async fn create_leaves_no_staging_file_on_success_or_refusal() {
+        let (dir, fs) = fresh();
+        fs.create("a.md", b"x").await.unwrap();
+        assert!(matches!(
+            fs.create("a.md", b"y").await,
+            Err(RoostError::AlreadyExists(_))
+        ));
+        let names: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec!["a.md".to_string()]);
+        assert_eq!(fs.read("a.md").await.unwrap(), b"x");
     }
 
     #[tokio::test]

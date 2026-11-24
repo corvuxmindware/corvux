@@ -17,6 +17,7 @@ import { errMsg } from "../../../lib/error";
 import { confirmDialog } from "../../../lib/confirm";
 import { reportActionError } from "../../../lib/action-error";
 import { settingsStore } from "../../../stores/settings";
+import { reportProviderSaveFailure } from "./saveOutcome";
 
 /** Curated Gemini models. The picker is for discoverability, not
  *  enforcement — the Rust backend forwards whatever model id string
@@ -79,8 +80,9 @@ export default function GeminiProvider() {
       setGeminiTest(null);
       setTimeout(() => setSaved(false), 2000);
     } catch (e) {
-      const msg = errMsg(e);
-      setGeminiSaveError(msg);
+      // Declining the native key confirmation is a choice, not a failure: the
+      // typed key stays in the box so the user can try again.
+      reportProviderSaveFailure(e, setGeminiSaveError);
     }
   }
 
@@ -118,7 +120,7 @@ export default function GeminiProvider() {
       setEditingGemini(false);
       setGeminiTest(null);
     } catch (e) {
-      setGeminiSaveError(errMsg(e));
+      reportProviderSaveFailure(e, setGeminiSaveError);
     }
   }
 

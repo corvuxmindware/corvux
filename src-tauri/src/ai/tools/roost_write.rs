@@ -110,11 +110,13 @@ impl Tool for RoostWriteTool {
                     if let Some(db) = db_guard.as_ref() {
                         match queries::all_tag_names(db) {
                             Ok(known) if !known.is_empty() => {
-                                let unknown: Vec<&str> = tags
-                                    .iter()
-                                    .filter(|t| !known.contains(t.as_str()))
-                                    .map(String::as_str)
-                                    .collect();
+                                // LR-6: compare by tag IDENTITY, not exact
+                                // string — `#ML` is not invented when `#ml`
+                                // exists in the roost.
+                                let unknown: Vec<&str> = crate::parser::tags::tags_not_in(
+                                    tags.iter().map(String::as_str),
+                                    &known,
+                                );
                                 if !unknown.is_empty() {
                                     // Pull a few example existing tags so
                                     // the LLM has a concrete "use these
@@ -231,16 +233,25 @@ pub(crate) fn planned_rel(args: &Value) -> Result<String, ToolError> {
     })
 }
 
-/// Build the link resolver from the graph DB and return a `link_warnings`
-/// JSON value when `content`'s wiki-links include dangling or ambiguous
-/// targets. `None` if the graph is unavailable or every link resolves
-/// cleanly. Shared by `roost_write` and `roost_edit`.
+/// Resolve `content`'s wiki-links against the graph and return a
+/// `link_warnings` JSON value when they include dangling or ambiguous targets.
+/// `None` if the graph is unavailable or every link resolves cleanly. Shared by
+/// `roost_write` and `roost_edit`.
+///
+/// IP-A3 / DB-3: borrows `GraphDb`'s CACHED resolver (built once, maintained
+/// incrementally by every indexing path, invalidated by every id-removing path)
+/// instead of rebuilding one from a full `*notes` scan on every AI write — that
+/// scan was O(roost) per `roost_write` / `roost_edit` call.
 pub(super) fn link_warnings_for(ctx: &ToolContext, content: &str, rel_dir: &str) -> Option<Value> {
     let graph = ctx.app.try_state::<GraphDb>()?;
     let guard = graph.db.lock().ok()?;
     let db = guard.as_ref()?;
-    let resolver = queries::LinkResolver::build(db).ok()?;
-    link_report_to_json(&queries::check_links(content, &resolver, rel_dir))
+    let report = graph
+        .with_cached_resolver(db, |resolver| {
+            queries::check_links(content, resolver, rel_dir)
+        })
+        .ok()?;
+    link_report_to_json(&report)
 }
 
 /// Format a [`queries::LinkReport`] into the `link_warnings` payload the agent

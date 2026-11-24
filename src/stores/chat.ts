@@ -79,7 +79,10 @@ export type SecretKind =
   | "base64_blob"
   | "url_credentials"
   | "gemini_api_key"
-  | "long_hex";
+  | "long_hex"
+  | "provider_api_key"
+  | "private_key_block"
+  | "more_not_shown";
 
 export interface SecretWarning {
   kind: SecretKind;

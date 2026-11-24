@@ -28,6 +28,7 @@ use crate::events;
 use super::provider::{ChatMessage, ChatRole, LLMProvider};
 use super::streaming::consumer::SseEvents;
 use super::streaming::openai_compat_chat::spawn_openai_compat_chat;
+use super::streaming::{push_capped, MAX_STREAMED_TEXT_BYTES};
 use super::tool_protocol::{StreamEvent, ToolDef};
 // Test-only — the test module builds fixture ProtoToolCall + StopReason
 // values to exercise the OpenAI-compat translator and ToolsStreamChunk
@@ -52,22 +53,20 @@ const ATTRIBUTION_REFERER: &str = "https://corvux.app";
 const ATTRIBUTION_TITLE: &str = "Corvux";
 
 pub struct OpenRouterChat {
-    client: Arc<Client>,
     api_key: crate::sensitive::SecretString,
     model: String,
 }
 
 impl OpenRouterChat {
+    /// `_client` is accepted so existing call sites keep compiling, and is
+    /// deliberately ignored: requests use `ai::http::cloud_chat_client` (no
+    /// redirects, connect + idle timeouts) instead of the shared client (AK-6).
     pub fn new(
-        client: Arc<Client>,
+        _client: Arc<Client>,
         api_key: crate::sensitive::SecretString,
         model: String,
     ) -> Self {
-        Self {
-            client,
-            api_key,
-            model,
-        }
+        Self { api_key, model }
     }
 }
 
@@ -80,8 +79,9 @@ impl<R: tauri::Runtime + 'static> LLMProvider<R> for OpenRouterChat {
         system_context: Option<String>,
         cancel: Arc<AtomicBool>,
     ) -> Result<String, String> {
+        let client = crate::ai::http::cloud_chat_client()?;
         stream_chat_impl(
-            &self.client,
+            &client,
             app,
             &self.api_key,
             &self.model,
@@ -100,8 +100,9 @@ impl<R: tauri::Runtime + 'static> LLMProvider<R> for OpenRouterChat {
         tools: Vec<ToolDef>,
         cancel: Arc<AtomicBool>,
     ) -> Result<tokio::sync::mpsc::Receiver<StreamEvent>, String> {
+        let client = crate::ai::http::cloud_chat_client()?;
         stream_chat_with_tools_impl(
-            self.client.clone(),
+            client,
             app.clone(),
             self.api_key.clone(),
             self.model.clone(),
@@ -240,9 +241,11 @@ async fn stream_chat_impl<R: tauri::Runtime>(
         stop: vec!["</tool_call>".to_string()],
     };
 
+    // `bearer_auth` marks the value sensitive; a hand-built Authorization
+    // header does not (AK-9).
     let response = client
         .post(&url)
-        .header("Authorization", format!("Bearer {api_key}"))
+        .bearer_auth(api_key)
         .header("HTTP-Referer", ATTRIBUTION_REFERER)
         .header("X-Title", ATTRIBUTION_TITLE)
         .json(&body)
@@ -303,7 +306,8 @@ async fn stream_chat_impl<R: tauri::Runtime>(
             if text.is_empty() {
                 continue;
             }
-            full_text.push_str(text);
+            // AT-6: bounded; past the cap the reply is stopped.
+            push_capped(&mut full_text, text, MAX_STREAMED_TEXT_BYTES, "text")?;
             events::AiChunk(text.to_string()).emit(app).ok();
         }
     }

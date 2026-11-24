@@ -53,6 +53,62 @@ pub fn ensure_vault_id_sync(roost_root: &Path) -> io::Result<[u8; 16]> {
     }
 }
 
+/// RF-6: the READ-ONLY twin of [`ensure_vault_id_sync`] — it never creates,
+/// repairs or writes anything, so it is safe to call on a path nobody has
+/// confirmed as a roost (the startup index GC walks every path the webview-
+/// writable manifest lists). `Ok(None)` means "this folder has no usable id
+/// yet" (no file, or a wrong-sized one that `ensure` would regenerate); a
+/// non-directory path (SAF URI, unplugged drive) gets the same derived id
+/// `ensure` gives it, so both resolve to the same index-dir name. `Err` means
+/// the folder could not be checked (the caller must not treat that as absent).
+pub fn lookup_vault_id_sync(roost_root: &Path) -> io::Result<Option<[u8; 16]>> {
+    if !roost_root.is_dir() {
+        return Ok(Some(derive_id_from_string(&roost_root.to_string_lossy())));
+    }
+    match read_native_vault_id(&native_view(roost_root))? {
+        StoredId::Valid(id) => Ok(Some(id)),
+        StoredId::Absent | StoredId::WrongSize(_) => Ok(None),
+    }
+}
+
+/// What `<roost>/.corvux/vault-id.bin` holds right now.
+enum StoredId {
+    Absent,
+    WrongSize(usize),
+    Valid([u8; 16]),
+}
+
+/// The one construction of the unlocked view both the reader and the writer
+/// use (the open roost already holds the lock elsewhere; only the symlink-safe
+/// path rules are needed here).
+fn native_view(roost_root: &Path) -> crate::roostfs::native::NativeFs {
+    crate::roostfs::native::NativeFs::new(roost_root)
+}
+
+fn vault_id_rel() -> String {
+    format!(".corvux/{VAULT_ID_FILE}")
+}
+
+fn to_io(e: crate::roostfs::RoostError) -> io::Error {
+    io::Error::other(e.to_string())
+}
+
+/// Read-only: classify the stored id. Every op goes through the symlink-safe
+/// resolve, so a planted escaping `.corvux` reads as `Absent`.
+fn read_native_vault_id(fs: &crate::roostfs::native::NativeFs) -> io::Result<StoredId> {
+    let rel = vault_id_rel();
+    if !fs.exists_blocking(&rel).map_err(to_io)? {
+        return Ok(StoredId::Absent);
+    }
+    let bytes = fs.read_blocking(&rel).map_err(to_io)?;
+    if bytes.len() == 16 {
+        let mut out = [0u8; 16];
+        out.copy_from_slice(&bytes);
+        return Ok(StoredId::Valid(out));
+    }
+    Ok(StoredId::WrongSize(bytes.len()))
+}
+
 fn ensure_native_vault_id(roost_root: &Path) -> io::Result<[u8; 16]> {
     // SYN-B2: every op goes through NativeFs's symlink-safe resolve, so a
     // hostile roost that plants `.corvux` (or `vault-id.bin`) as a symlink
@@ -62,26 +118,19 @@ fn ensure_native_vault_id(roost_root: &Path) -> io::Result<[u8; 16]> {
     //
     // `NativeFs::new` does NOT take the roost lock (the open roost already
     // holds it elsewhere); we only need the path-safety guarantees here.
-    use crate::roostfs::native::NativeFs;
-    let fs = NativeFs::new(roost_root);
-    let rel = format!(".corvux/{VAULT_ID_FILE}");
-    let to_io = |e: crate::roostfs::RoostError| io::Error::other(e.to_string());
+    let fs = native_view(roost_root);
+    let rel = vault_id_rel();
 
-    if fs.exists_blocking(&rel).map_err(to_io)? {
-        let bytes = fs.read_blocking(&rel).map_err(to_io)?;
-        if bytes.len() == 16 {
-            let mut out = [0u8; 16];
-            out.copy_from_slice(&bytes);
-            return Ok(out);
-        }
+    match read_native_vault_id(&fs)? {
+        StoredId::Valid(id) => return Ok(id),
+        StoredId::Absent => {}
         // Wrong size — treat as corrupt and rewrite. Replacing the id means
         // existing peer records won't match any more and the user has to
         // re-pair; that's the correct outcome when the integrity signal
         // we're using has been tampered with.
-        tracing::warn!(
-            "vault-id.bin had unexpected size {}; regenerating",
-            bytes.len()
-        );
+        StoredId::WrongSize(len) => {
+            tracing::warn!("vault-id.bin had unexpected size {len}; regenerating");
+        }
     }
     fs.mkdir_all_blocking(".corvux").map_err(to_io)?;
     let mut id = [0u8; 16];
@@ -208,5 +257,64 @@ mod tests {
         let other = std::path::Path::new("content://com.example/tree/Work");
         let c = ensure_vault_id_sync(other).unwrap();
         assert_ne!(a, c, "different paths must derive different ids");
+    }
+
+    // ── RF-6: the read-only lookup never writes ───────────────────────────
+
+    #[test]
+    fn lookup_on_a_fresh_folder_creates_nothing() {
+        let dir = TempDir::new().unwrap();
+        assert_eq!(lookup_vault_id_sync(dir.path()).unwrap(), None);
+        assert!(
+            !dir.path().join(".corvux").exists(),
+            "a read-only lookup must not even create .corvux"
+        );
+        assert_eq!(
+            std::fs::read_dir(dir.path()).unwrap().count(),
+            0,
+            "the folder is untouched"
+        );
+    }
+
+    #[test]
+    fn lookup_returns_the_id_ensure_wrote_and_agrees_with_it() {
+        let dir = TempDir::new().unwrap();
+        let written = ensure_vault_id_sync(dir.path()).unwrap();
+        assert_eq!(lookup_vault_id_sync(dir.path()).unwrap(), Some(written));
+        // Repeated lookups never change the file.
+        let before = std::fs::read(dir.path().join(".corvux").join(VAULT_ID_FILE)).unwrap();
+        lookup_vault_id_sync(dir.path()).unwrap();
+        let after = std::fs::read(dir.path().join(".corvux").join(VAULT_ID_FILE)).unwrap();
+        assert_eq!(before, after);
+    }
+
+    #[test]
+    fn lookup_does_not_repair_a_wrong_sized_id() {
+        let dir = TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join(".corvux")).unwrap();
+        let file = dir.path().join(".corvux").join(VAULT_ID_FILE);
+        std::fs::write(&file, b"too short").unwrap();
+        assert_eq!(lookup_vault_id_sync(dir.path()).unwrap(), None);
+        assert_eq!(std::fs::read(&file).unwrap(), b"too short", "left as found");
+    }
+
+    #[test]
+    fn lookup_of_a_non_directory_derives_the_same_id_as_ensure() {
+        let s = std::path::Path::new("content://com.example/tree/MyBrain");
+        assert_eq!(
+            lookup_vault_id_sync(s).unwrap(),
+            Some(ensure_vault_id_sync(s).unwrap())
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lookup_does_not_adopt_an_id_planted_behind_a_symlink() {
+        use std::os::unix::fs::symlink;
+        let roost = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        std::fs::write(outside.path().join(VAULT_ID_FILE), [0xABu8; 16]).unwrap();
+        symlink(outside.path(), roost.path().join(".corvux")).unwrap();
+        assert_eq!(lookup_vault_id_sync(roost.path()).unwrap(), None);
     }
 }

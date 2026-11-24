@@ -178,6 +178,9 @@ impl From<SyncEvent> for SyncEventPayload {
 /// Stored as JSON at `app_data/sync/prefs.json`. Hosting PINs are hydrated
 /// from roost-scoped secret-store slots and stripped before writing JSON.
 /// Legacy plaintext PINs migrate only after secret-store writes succeed.
+/// Only flows that use a PIN see the hydrated form (`load_prefs_with_pins`);
+/// everything else reads and writes [`StoredPrefs`], which never touches the
+/// secret store (SY-3).
 /// Per-roost hosting config, so switching roosts doesn't lose each roost's
 /// pairing PINs. Snapshotted into `SyncPrefs.per_roost` on every save and
 /// restored by `enable_prefs`.
@@ -243,7 +246,7 @@ impl Default for SyncPrefs {
     /// default** — a fresh install talks only directly between the user's own
     /// devices (LAN + NAT-punched direct), with the vendor-operated relay and
     /// store-and-forward queue OFF until the user opts in. This `Default` is
-    /// what a BRAND-NEW install gets (no prefs file → `load_sync_prefs` returns
+    /// what a BRAND-NEW install gets (no prefs file → `read_stored_prefs` returns
     /// it). MIGRATION-SAFE: the field carries a bare `#[serde(default)]`, which
     /// deserializes an ABSENT field via `bool::default()` (= `false`), NOT this
     /// struct default — so an EXISTING user whose stored prefs predate the flip
@@ -320,7 +323,7 @@ mod strict_p2p_default_tests {
 
     #[test]
     fn new_install_defaults_to_strict_p2p() {
-        // No prefs file → `load_sync_prefs` returns `SyncPrefs::default()`.
+        // No prefs file → `read_stored_prefs` returns `SyncPrefs::default()`.
         assert!(
             SyncPrefs::default().strict_p2p_only,
             "a brand-new install must default to strict P2P (relay/queue off)"
@@ -512,7 +515,7 @@ mod resolve_pin_tests {
     #[test]
     fn enable_prefs_restores_per_roost_pins_on_switch_back() {
         // Sync roost A (its PIN gets recorded in per_roost, which is what
-        // save_sync_prefs snapshots).
+        // snapshot_current_roost records).
         let mut a = enable_prefs(SyncPrefs::default(), "W:/roots/A", "dev");
         a.iroh_hosting_pin = "111111".into();
         a.per_roost.insert(
@@ -644,57 +647,198 @@ fn hosting_secret_slot(roost: &str, transport: &str) -> String {
     format!("sync_hosting_pin:v1:{transport}:{}", hex::encode(digest))
 }
 
+/// The transports a roost keeps a hosting PIN for (the `transport` of
+/// [`hosting_secret_slot`]). `hydrate_hosting_pins` / `strip_hosting_pins` pair
+/// each with its prefs field; [`purge_hosting_pins`] deletes both. A test pins
+/// that every slot `strip` writes is one `purge` deletes.
+const HOSTING_PIN_KINDS: [&str; 2] = ["tls", "iroh"];
+
+/// Fill the ACTIVE roost's hosting PINs from the secret store. Fail closed: a
+/// store ERROR is an `Err`, never "no PIN" (an empty PIN must not be mistaken
+/// for a saved one, and a missing slot must not be mistaken for a locked store).
+///
+/// Only the roost in `prefs.roost_path` is read (SY-3). Other roosts' slots are
+/// not needed by any caller, and one unreadable slot of an unrelated roost
+/// must not stop this roost from hosting.
 fn hydrate_hosting_pins(
     prefs: &mut SyncPrefs,
     mut get: impl FnMut(&str) -> Result<Option<crate::sensitive::SecretString>, String>,
 ) -> Result<(), String> {
+    if prefs.roost_path.is_empty() {
+        return Ok(());
+    }
     let roost = prefs.roost_path.clone();
-    let mut hydrate = |roost: &str,
-                       tls: &mut crate::sensitive::SecretString,
-                       iroh: &mut crate::sensitive::SecretString|
-     -> Result<(), String> {
-        if !roost.is_empty() {
-            for (kind, pin) in [("tls", tls), ("iroh", iroh)] {
-                if let Some(stored) = get(&hosting_secret_slot(roost, kind))? {
-                    *pin = stored;
-                }
-            }
+    for (kind, pin) in [
+        ("tls", &mut prefs.hosting_pin),
+        ("iroh", &mut prefs.iroh_hosting_pin),
+    ] {
+        if let Some(stored) = get(&hosting_secret_slot(&roost, kind))? {
+            *pin = stored;
         }
-        Ok(())
-    };
-    hydrate(&roost, &mut prefs.hosting_pin, &mut prefs.iroh_hosting_pin)?;
-    for (roost, hosting) in &mut prefs.per_roost {
-        hydrate(
-            roost,
-            &mut hosting.hosting_pin,
-            &mut hosting.iroh_hosting_pin,
-        )?;
     }
     Ok(())
 }
 
-fn load_sync_prefs(app: &AppHandle) -> Result<SyncPrefs, String> {
-    let path = sync_prefs_path(app)?;
-    let bytes = match std::fs::read(&path) {
-        Ok(bytes) => zeroize::Zeroizing::new(bytes),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(SyncPrefs::default()),
-        Err(e) => return Err(format!("reading sync preferences: {e}")),
-    };
-    let mut prefs: SyncPrefs =
-        serde_json::from_slice(&bytes).map_err(|e| format!("parsing sync preferences: {e}"))?;
-    let legacy = !prefs.hosting_pin.is_empty()
+/// Do the stored prefs still carry a plaintext PIN (a 0.2.5 file whose PINs
+/// have not been moved into the secret store yet)?
+fn legacy_pins_present(prefs: &SyncPrefs) -> bool {
+    !prefs.hosting_pin.is_empty()
         || !prefs.iroh_hosting_pin.is_empty()
         || prefs
             .per_roost
             .values()
-            .any(|h| !h.hosting_pin.is_empty() || !h.iroh_hosting_pin.is_empty());
+            .any(|h| !h.hosting_pin.is_empty() || !h.iroh_hosting_pin.is_empty())
+}
+
+/// SY-3: `prefs.json` exactly as stored — the non-secret settings plus whatever
+/// PIN fields the file still carries (empty once PINs live in the secret
+/// store; the plaintext value for a not-yet-migrated 0.2.5 file).
+///
+/// It is NEVER hydrated from, and never written to, the secret store, so every
+/// flow that only needs `enabled`, the queue settings or strict-P2P (init,
+/// stop, the queue/strict commands, connect bookkeeping) works with a locked
+/// keychain, no Secret Service, or a broken store. The only way to read the
+/// PINs is [`load_prefs_with_pins`], and the type has no way to put a PIN into
+/// the file in plaintext: callers mutate it through the methods below, which
+/// touch non-secret fields only.
+struct StoredPrefs(SyncPrefs);
+
+impl std::ops::Deref for StoredPrefs {
+    type Target = SyncPrefs;
+    fn deref(&self) -> &SyncPrefs {
+        &self.0
+    }
+}
+
+impl StoredPrefs {
+    /// What a brand-new install (or an unreadable file) gets: strict P2P.
+    fn defaults() -> Self {
+        Self(SyncPrefs::default())
+    }
+
+    fn has_plaintext_pins(&self) -> bool {
+        legacy_pins_present(&self.0)
+    }
+
+    /// Hand the prefs to a flow that sets a PIN. Such a flow must then save
+    /// through [`save_prefs_with_pins`], which moves the PIN into the secret
+    /// store instead of the file.
+    fn into_inner(self) -> SyncPrefs {
+        self.0
+    }
+
+    /// The `sync_init` transition (see [`enable_prefs`]).
+    fn enable_for(self, roost_path: &str, device_name: &str) -> Self {
+        Self(enable_prefs(self.0, roost_path, device_name))
+    }
+
+    /// Connect bookkeeping: remember that sync is on for this roost.
+    fn mark_enabled(&mut self, roost_path: String, display_name: String) {
+        self.0.enabled = true;
+        self.0.roost_path = roost_path;
+        if self.0.device_name.is_empty() {
+            self.0.device_name = display_name;
+        }
+    }
+
+    /// Record the user's "stop": returns whether anything changed.
+    fn clear_enabled(&mut self) -> bool {
+        std::mem::replace(&mut self.0.enabled, false)
+    }
+
+    fn set_queue_endpoint(&mut self, endpoint: String) {
+        self.0.queue_endpoint = endpoint;
+    }
+
+    fn set_pinned_queue_host(&mut self, host: String) {
+        self.0.pinned_queue_host = host;
+    }
+
+    fn set_strict_p2p_only(&mut self, strict: bool) {
+        self.0.strict_p2p_only = strict;
+    }
+}
+
+/// Read `prefs.json` without touching the secret store.
+///
+/// * missing file ⇒ the defaults (a brand-new install);
+/// * a file that does not parse ⇒ the defaults too, with a warning. That is the
+///   documented behaviour of [`SyncPrefs::default`] and what this loader did
+///   before PINs moved to the keychain: strict P2P, sync not enabled, nothing
+///   resumes. Failing instead would make every settings flow (stop, queue,
+///   strict-P2P) unusable, with no way to repair the file from the app;
+/// * any OTHER read error ⇒ `Err`. The file may well exist, so the caller must
+///   not act on defaults and later overwrite it.
+fn read_stored_prefs(path: &std::path::Path) -> Result<StoredPrefs, String> {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => zeroize::Zeroizing::new(bytes),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(StoredPrefs::defaults()),
+        Err(e) => return Err(format!("reading sync preferences: {e}")),
+    };
+    match serde_json::from_slice::<SyncPrefs>(&bytes) {
+        Ok(prefs) => Ok(StoredPrefs(prefs)),
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "sync prefs.json is unreadable — using the defaults (strict P2P, sync not enabled)"
+            );
+            Ok(StoredPrefs::defaults())
+        }
+    }
+}
+
+fn load_stored_prefs(app: &AppHandle) -> Result<StoredPrefs, String> {
+    read_stored_prefs(&sync_prefs_path(app)?)
+}
+
+/// Engine bring-up reads: an unreadable prefs file means strict P2P with no
+/// queue (the privacy-safe reading), never a failed init.
+fn bring_up_prefs(app: &AppHandle) -> StoredPrefs {
+    load_stored_prefs(app).unwrap_or_else(|e| {
+        tracing::warn!(error = %e, "sync: could not read prefs — bringing up strict-P2P defaults");
+        StoredPrefs::defaults()
+    })
+}
+
+/// The PIN-bearing view of the prefs: [`StoredPrefs`] plus the ACTIVE roost's
+/// hosting PINs from the secret store, migrating a plaintext 0.2.5 file on the
+/// way. FAIL CLOSED: a secret-store error is an `Err`. Only the flows that
+/// actually need a PIN may call this (pinned by
+/// `sync_invariants::sy3_*`); everything else uses [`load_stored_prefs`].
+fn load_prefs_with_pins(app: &AppHandle) -> Result<SyncPrefs, String> {
+    hydrate_prefs(app, load_stored_prefs(app)?.into_inner())
+}
+
+fn hydrate_prefs(app: &AppHandle, mut prefs: SyncPrefs) -> Result<SyncPrefs, String> {
+    let legacy = legacy_pins_present(&prefs);
     hydrate_hosting_pins(&mut prefs, crate::secret_store::get)?;
     if legacy {
         // Save credentials first. A failure leaves the original fallback intact;
         // the next launch retries even if some slots have already migrated.
-        save_sync_prefs(app, &prefs)?;
+        save_prefs_with_pins(app, &prefs)?;
     }
     Ok(prefs)
+}
+
+/// SY-3: the listener PIN for a flow that hosts. A secret-store READ ERROR is
+/// not "no PIN saved": generating a fresh PIN would silently rotate the sticky
+/// PIN out from under every paired device (and the save would then fail or
+/// overwrite the real one). So an error stops the flow; only a successful read
+/// of "nothing saved" (or an explicit `rotate`) mints a new PIN.
+fn pin_for_listener(
+    loaded: Result<&crate::sensitive::SecretString, &str>,
+    rotate: bool,
+) -> Result<Pin, String> {
+    let saved = loaded.map_err(|e| {
+        format!(
+            "Could not read the saved pairing PIN from the system keychain ({e}). \
+             Unlock or repair the keychain and try again."
+        )
+    })?;
+    Ok(match (rotate, Pin::parse(saved)) {
+        (false, Some(pin)) => pin,
+        _ => Pin::generate(),
+    })
 }
 
 fn strip_hosting_pins(
@@ -755,7 +899,7 @@ mod hosting_secret_tests {
     }
 
     #[test]
-    fn hosting_credentials_leave_json_and_hydrate_per_roost() {
+    fn hosting_credentials_leave_json_and_hydrate_the_active_roost() {
         let prefs = legacy();
         let mut disk = prefs.clone();
         let mut secrets = HashMap::new();
@@ -768,18 +912,155 @@ mod hosting_secret_tests {
         for pin in ["123456", "654321", "234567", "765432"] {
             assert!(!json.contains(pin));
         }
-        hydrate_hosting_pins(&mut disk, |key| Ok(secrets.get(key).cloned())).unwrap();
+        let mut reads = Vec::new();
+        hydrate_hosting_pins(&mut disk, |key| {
+            reads.push(key.to_owned());
+            Ok(secrets.get(key).cloned())
+        })
+        .unwrap();
         assert_eq!(disk.hosting_pin, prefs.hosting_pin);
         assert_eq!(disk.iroh_hosting_pin, prefs.iroh_hosting_pin);
+        // SY-3: only the ACTIVE roost's two slots are read. Another roost's
+        // PIN stays in the store (its slot is intact) and is not hydrated.
         assert_eq!(
-            disk.per_roost["roost-b"].iroh_hosting_pin,
-            prefs.per_roost["roost-b"].iroh_hosting_pin
+            reads,
+            vec![
+                hosting_secret_slot("roost-a", "tls"),
+                hosting_secret_slot("roost-a", "iroh")
+            ]
         );
+        assert!(disk.per_roost["roost-b"].iroh_hosting_pin.is_empty());
+        assert!(secrets.contains_key(&hosting_secret_slot("roost-b", "iroh")));
         assert_eq!(disk.per_roost["roost-b"].hosting_port, 42);
         assert_ne!(
             hosting_secret_slot("roost-a", "iroh"),
             hosting_secret_slot("roost-b", "iroh")
         );
+    }
+
+    /// SY-3: with no roost there is nothing to look up, so the store is not
+    /// asked at all (a locked store cannot fail a prefs load that needs no PIN).
+    #[test]
+    fn hydrating_prefs_with_no_roost_never_touches_the_store() {
+        let mut prefs = SyncPrefs::default();
+        hydrate_hosting_pins(&mut prefs, |_| panic!("the store must not be read")).unwrap();
+        assert!(prefs.iroh_hosting_pin.is_empty());
+    }
+
+    /// SY-3: a store ERROR is never read as "no PIN saved". Both the hydrate
+    /// step and the listener-PIN choice keep failing closed, and the PIN is
+    /// left untouched (empty) rather than defaulted.
+    #[test]
+    fn a_store_error_fails_closed_and_never_becomes_an_empty_pin() {
+        let mut prefs = SyncPrefs {
+            roost_path: "roost-a".into(),
+            ..Default::default()
+        };
+        let err =
+            hydrate_hosting_pins(&mut prefs, |_| Err("keyring get: locked".into())).unwrap_err();
+        assert!(err.contains("locked"));
+        assert!(prefs.iroh_hosting_pin.is_empty());
+
+        // The listener must not mint a new PIN because the read failed.
+        let err = pin_for_listener(Err("keyring get: locked"), false).unwrap_err();
+        assert!(err.contains("keychain") && err.contains("locked"), "{err}");
+        let err = pin_for_listener(Err("keyring get: locked"), true).unwrap_err();
+        assert!(
+            err.contains("locked"),
+            "rotate must not bypass a failed read"
+        );
+    }
+
+    #[test]
+    fn listener_pin_reuses_the_saved_pin_and_mints_only_when_none_or_rotated() {
+        let saved = crate::sensitive::SecretString::from("424242");
+        let same = pin_for_listener(Ok(&saved), false).unwrap();
+        assert_eq!(same.as_str(), "424242");
+
+        // A successful read of "nothing saved" mints a valid PIN.
+        let none = crate::sensitive::SecretString::from("");
+        let minted = pin_for_listener(Ok(&none), false).unwrap();
+        assert!(Pin::parse(minted.as_str()).is_some());
+
+        // `rotate` replaces the saved PIN (random: allow a 1-in-a-million tie).
+        let rotated = (0..8)
+            .map(|_| pin_for_listener(Ok(&saved), true).unwrap())
+            .any(|p| p.as_str() != "424242");
+        assert!(rotated, "rotate must mint a new PIN");
+    }
+
+    /// SY-5b: removing a roost deletes exactly the slots a save of its PINs
+    /// writes — no more, no fewer (a drift here would strand a PIN).
+    #[test]
+    fn purge_deletes_every_slot_a_save_writes_and_only_those() {
+        let mut written = Vec::new();
+        let mut prefs = SyncPrefs {
+            roost_path: "roost-a".into(),
+            hosting_pin: "123456".into(),
+            iroh_hosting_pin: "654321".into(),
+            ..Default::default()
+        };
+        strip_hosting_pins(&mut prefs, |key, _| {
+            written.push(key.to_owned());
+            Ok(())
+        })
+        .unwrap();
+        let mut deleted = Vec::new();
+        purge_hosting_pins_with(
+            &["roost-a".to_string(), "roost-b".to_string()],
+            &[],
+            |key| {
+                deleted.push(key.to_owned());
+                Ok(())
+            },
+        );
+        for slot in &written {
+            assert!(deleted.contains(slot), "{slot} must be purged");
+        }
+        // roost-b's two slots too: 2 roosts x 2 kinds.
+        assert_eq!(deleted.len(), 4);
+        assert!(deleted.contains(&hosting_secret_slot("roost-b", "iroh")));
+        assert!(deleted.contains(&hosting_secret_slot("roost-b", "tls")));
+        // A path spelled differently (slashes, trailing slash) hits the same slots.
+        assert_eq!(
+            hosting_secret_slot("W:\\notes\\A\\", "iroh"),
+            hosting_secret_slot("W:/notes/A", "iroh")
+        );
+    }
+
+    #[test]
+    fn purge_keeps_going_after_a_failed_delete_and_skips_empty_paths() {
+        let mut attempted = 0;
+        purge_hosting_pins_with(&[String::new(), "roost-a".to_string()], &[], |_| {
+            attempted += 1;
+            Err("store locked".into())
+        });
+        // Both kinds of roost-a were still attempted; the empty path was skipped.
+        assert_eq!(attempted, 2);
+    }
+
+    /// A removal must never take the PIN of a roost that stays in the list,
+    /// even when the two spellings only differ the way the sync normaliser
+    /// ignores (slash direction, trailing slash, case on Windows/macOS).
+    #[test]
+    fn purge_spares_a_roost_that_is_still_listed_under_another_spelling() {
+        let mut deleted = Vec::new();
+        purge_hosting_pins_with(
+            &["W:\\notes\\A\\".to_string(), "W:/notes/gone".to_string()],
+            &["W:/notes/A".to_string()],
+            |key| {
+                deleted.push(key.to_owned());
+                Ok(())
+            },
+        );
+        assert_eq!(
+            deleted.len(),
+            2,
+            "only the genuinely removed roost is purged"
+        );
+        assert!(deleted.contains(&hosting_secret_slot("W:/notes/gone", "iroh")));
+        assert!(deleted.contains(&hosting_secret_slot("W:/notes/gone", "tls")));
+        assert!(!deleted.contains(&hosting_secret_slot("W:/notes/A", "iroh")));
     }
 
     #[test]
@@ -797,33 +1078,285 @@ mod hosting_secret_tests {
     }
 }
 
-fn save_sync_prefs(app: &AppHandle, prefs: &SyncPrefs) -> Result<(), String> {
-    let path = sync_prefs_path(app)?;
+/// Snapshot the current roost's hosting config into the per-roost map before
+/// persisting, so switching roosts (which resets the top-level fields via
+/// enable_prefs) can restore it instead of forcing a re-pair. The port is
+/// always refreshed; a PIN is copied only when the top level has one, so an
+/// entry's PIN (a not-yet-migrated plaintext one, say) is never blanked by a
+/// save that did not hydrate it.
+fn snapshot_current_roost(prefs: &mut SyncPrefs) {
+    if prefs.roost_path.is_empty() {
+        return;
+    }
+    let key = normalize_roost_key(&prefs.roost_path);
+    let (tls, iroh, port) = (
+        prefs.hosting_pin.clone(),
+        prefs.iroh_hosting_pin.clone(),
+        prefs.hosting_port,
+    );
+    let entry = prefs.per_roost.entry(key).or_default();
+    entry.hosting_port = port;
+    if !tls.is_empty() {
+        entry.hosting_pin = tls;
+    }
+    if !iroh.is_empty() {
+        entry.iroh_hosting_pin = iroh;
+    }
+}
+
+fn write_prefs_json(path: &std::path::Path, prefs: &SyncPrefs) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("creating sync dir: {e}"))?;
     }
-    // Snapshot the current roost's hosting config into the per-roost map
-    // before persisting, so switching roosts (which resets the top-level
-    // fields via enable_prefs) can restore it instead of forcing a re-pair.
+    let bytes = serde_json::to_vec_pretty(prefs).map_err(|e| format!("serializing prefs: {e}"))?;
+    crate::commands::ai::settings::persist_settings_json(
+        path,
+        std::str::from_utf8(&bytes).map_err(|e| e.to_string())?,
+    )
+}
+
+/// Persist PIN-bearing prefs: every non-empty PIN goes into the secret store
+/// FIRST (a failure aborts before the file is touched, so the previous file —
+/// plaintext fallback included — stays authoritative), then the PIN-free JSON
+/// is written. Only for flows that set or migrate a PIN; everything else saves
+/// a [`StoredPrefs`] with [`save_stored_prefs`] and never needs the store.
+fn save_prefs_with_pins(app: &AppHandle, prefs: &SyncPrefs) -> Result<(), String> {
+    let path = sync_prefs_path(app)?;
     let mut prefs = prefs.clone();
-    if !prefs.roost_path.is_empty() {
-        let key = normalize_roost_key(&prefs.roost_path);
+    snapshot_current_roost(&mut prefs);
+    strip_hosting_pins(&mut prefs, crate::secret_store::set)?;
+    write_prefs_json(&path, &prefs)
+}
+
+/// Persist [`StoredPrefs`] verbatim. NEVER touches the secret store: the PIN
+/// fields hold exactly what was read (empty, or a not-yet-migrated plaintext
+/// value that stays where it was until a PIN flow migrates it), so nothing is
+/// lost and nothing new reaches the file.
+fn write_stored_prefs(path: &std::path::Path, prefs: &StoredPrefs) -> Result<(), String> {
+    let mut prefs = prefs.0.clone();
+    snapshot_current_roost(&mut prefs);
+    write_prefs_json(path, &prefs)
+}
+
+fn save_stored_prefs(app: &AppHandle, prefs: &StoredPrefs) -> Result<(), String> {
+    write_stored_prefs(&sync_prefs_path(app)?, prefs)
+}
+
+/// SY-3: record the user's "stop" in `prefs.json` — `enabled = false` — without
+/// reading or writing a single secret. A locked keychain, no Secret Service or
+/// a broken store therefore cannot leave the flag set (which resumed sync on the
+/// next launch against the user's choice). Returns whether the file changed.
+fn record_stop_in_prefs(path: &std::path::Path) -> Result<bool, String> {
+    let mut prefs = read_stored_prefs(path)?;
+    if !prefs.clear_enabled() {
+        return Ok(false);
+    }
+    write_stored_prefs(path, &prefs)?;
+    Ok(true)
+}
+
+/// SY-5b: delete the hosting-PIN secret slots of roosts the user removed from
+/// the roost list. The slots are keyed by a hash of the roost PATH, so nothing
+/// else can find them once the roost is gone — they would sit in the keychain
+/// forever. `still_listed` is the roost list AFTER the removal: a removed path
+/// that the sync normalisation still maps onto a listed roost (same folder,
+/// spelled differently) is left alone, so a roost that stays never loses its
+/// PIN. Best-effort (a failure is logged, never blocks the removal).
+pub(crate) fn purge_hosting_pins(removed: &[String], still_listed: &[String]) {
+    purge_hosting_pins_with(removed, still_listed, crate::secret_store::delete);
+}
+
+fn purge_hosting_pins_with(
+    removed: &[String],
+    still_listed: &[String],
+    mut delete: impl FnMut(&str) -> Result<(), String>,
+) {
+    let keep: std::collections::BTreeSet<String> = still_listed
+        .iter()
+        .map(|r| normalize_roost_key(r))
+        .collect();
+    for roost in removed
+        .iter()
+        .filter(|r| !r.is_empty() && !keep.contains(&normalize_roost_key(r)))
+    {
+        for kind in HOSTING_PIN_KINDS {
+            if let Err(e) = delete(&hosting_secret_slot(roost, kind)) {
+                tracing::warn!(error = %e, kind, "sync: could not delete a removed roost's hosting PIN");
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod stored_prefs_tests {
+    //! SY-3: the non-secret prefs flows. None of these functions can reach the
+    //! secret store (they take no secret closure and call no `secret_store`
+    //! function — `sync_invariants::sy3_*` pins that), so they must work with
+    //! a store that is locked, missing or broken.
+    use super::*;
+
+    fn dir() -> tempfile::TempDir {
+        tempfile::TempDir::new().expect("tempdir")
+    }
+
+    fn prefs_path(d: &tempfile::TempDir) -> std::path::PathBuf {
+        d.path().join("sync").join("prefs.json")
+    }
+
+    fn write_raw(path: &std::path::Path, json: &str) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, json).unwrap();
+    }
+
+    #[test]
+    fn a_missing_file_is_a_brand_new_install_with_strict_p2p() {
+        let d = dir();
+        let prefs = read_stored_prefs(&prefs_path(&d)).unwrap();
+        assert!(!prefs.enabled);
+        assert!(prefs.strict_p2p_only);
+        assert!(!prefs_path(&d).exists(), "reading must not create the file");
+    }
+
+    #[test]
+    fn a_corrupt_file_falls_back_to_defaults_instead_of_failing() {
+        let d = dir();
+        // No brace in this literal on purpose: the ratchet's brace counter
+        // reads inside strings, and an unbalanced one hides the rest of the file.
+        write_raw(&prefs_path(&d), "this is not json at all");
+        let prefs = read_stored_prefs(&prefs_path(&d)).expect("corrupt prefs must not be an error");
+        assert!(!prefs.enabled, "nothing may resume from a corrupt file");
+        assert!(prefs.strict_p2p_only, "the safe default is strict P2P");
+        assert!(prefs.queue_endpoint.is_empty());
+    }
+
+    #[test]
+    fn a_read_error_other_than_missing_is_an_error_not_defaults() {
+        // A directory where the file should be: the read fails with something
+        // other than NotFound. Acting on defaults here could overwrite a real
+        // file later, so it is reported.
+        let d = dir();
+        std::fs::create_dir_all(prefs_path(&d)).unwrap();
+        let err = read_stored_prefs(&prefs_path(&d))
+            .err()
+            .expect("must be Err");
+        assert!(err.contains("reading sync preferences"), "{err}");
+    }
+
+    #[test]
+    fn stop_clears_the_resume_flag_and_keeps_every_other_setting() {
+        let d = dir();
+        write_raw(
+            &prefs_path(&d),
+            r#"{"enabled":true,"roost_path":"W:/notes","device_name":"Laptop",
+                "hosting_port":7337,"queue_endpoint":"https://queue.meetcorvux.com",
+                "strict_p2p_only":false,"pinned_queue_host":"q.example.net"}"#,
+        );
+        assert!(record_stop_in_prefs(&prefs_path(&d)).unwrap());
+        let after = read_stored_prefs(&prefs_path(&d)).unwrap();
+        assert!(!after.enabled, "the user's stop must be recorded");
+        assert_eq!(after.roost_path, "W:/notes");
+        assert_eq!(after.device_name, "Laptop");
+        assert_eq!(after.hosting_port, 7337);
+        assert_eq!(after.queue_endpoint, "https://queue.meetcorvux.com");
+        assert!(
+            !after.strict_p2p_only,
+            "an explicit opt-in to relay/queue sticks"
+        );
+        assert_eq!(after.pinned_queue_host, "q.example.net");
+        // And it must not resume: should_resume needs enabled.
+        assert!(!should_resume(&after, "W:/notes"));
+    }
+
+    #[test]
+    fn stop_with_nothing_enabled_is_a_no_op_and_creates_nothing() {
+        let d = dir();
+        assert!(!record_stop_in_prefs(&prefs_path(&d)).unwrap());
+        assert!(!prefs_path(&d).exists());
+        write_raw(&prefs_path(&d), r#"{"enabled":false,"device_name":"x"}"#);
+        let before = std::fs::read_to_string(prefs_path(&d)).unwrap();
+        assert!(!record_stop_in_prefs(&prefs_path(&d)).unwrap());
+        assert_eq!(std::fs::read_to_string(prefs_path(&d)).unwrap(), before);
+    }
+
+    /// The worst case from the review: a not-yet-migrated 0.2.5 file (plaintext
+    /// PINs) on a machine whose keychain is unusable. Stop must still record
+    /// the choice, and must not lose, migrate or leak the PINs: they stay in
+    /// the file exactly as they were until a PIN flow can move them.
+    #[test]
+    fn stop_on_an_unmigrated_file_keeps_the_pins_verbatim_and_never_needs_the_store() {
+        let d = dir();
+        write_raw(
+            &prefs_path(&d),
+            r#"{"enabled":true,"roost_path":"W:/notes","hosting_pin":"123456",
+                "iroh_hosting_pin":"654321",
+                "per_roost":{"w:/other":{"hosting_pin":"234567","iroh_hosting_pin":"765432","hosting_port":9}}}"#,
+        );
+        assert!(record_stop_in_prefs(&prefs_path(&d)).unwrap());
+        let after = read_stored_prefs(&prefs_path(&d)).unwrap();
+        assert!(!after.enabled);
+        assert!(
+            after.has_plaintext_pins(),
+            "nothing was migrated or dropped"
+        );
+        assert_eq!(after.hosting_pin, "123456");
+        assert_eq!(after.iroh_hosting_pin, "654321");
+        assert_eq!(after.per_roost["w:/other"].iroh_hosting_pin, "765432");
+        assert_eq!(after.per_roost["w:/other"].hosting_port, 9);
+    }
+
+    #[test]
+    fn a_stored_save_never_blanks_an_entrys_unmigrated_pin() {
+        // Top level has no PIN (this save did not hydrate), but the per-roost
+        // entry for the same roost still carries one: the snapshot must refresh
+        // the port and leave that PIN alone.
+        let mut prefs = SyncPrefs {
+            roost_path: "W:/notes".into(),
+            hosting_port: 4242,
+            ..Default::default()
+        };
         prefs.per_roost.insert(
-            key,
+            normalize_roost_key("W:/notes"),
             RoostHosting {
-                hosting_pin: prefs.hosting_pin.clone(),
-                iroh_hosting_pin: prefs.iroh_hosting_pin.clone(),
-                hosting_port: prefs.hosting_port,
+                iroh_hosting_pin: "111111".into(),
+                hosting_port: 1,
+                ..Default::default()
             },
         );
+        snapshot_current_roost(&mut prefs);
+        let entry = &prefs.per_roost[&normalize_roost_key("W:/notes")];
+        assert_eq!(entry.iroh_hosting_pin, "111111");
+        assert_eq!(entry.hosting_port, 4242);
+        // A hydrated top-level PIN does overwrite it.
+        prefs.iroh_hosting_pin = "222222".into();
+        snapshot_current_roost(&mut prefs);
+        assert_eq!(
+            prefs.per_roost[&normalize_roost_key("W:/notes")].iroh_hosting_pin,
+            "222222"
+        );
     }
-    strip_hosting_pins(&mut prefs, crate::secret_store::set)?;
-    let bytes = serde_json::to_vec_pretty(&prefs).map_err(|e| format!("serializing prefs: {e}"))?;
-    crate::commands::ai::settings::persist_settings_json(
-        &path,
-        std::str::from_utf8(&bytes).map_err(|e| e.to_string())?,
-    )?;
-    Ok(())
+
+    #[test]
+    fn the_stored_edits_touch_only_the_settings_they_name() {
+        let mut p = StoredPrefs::defaults();
+        p.mark_enabled("W:/notes".into(), "Phone".into());
+        assert!(p.enabled);
+        assert_eq!(p.roost_path, "W:/notes");
+        assert_eq!(p.device_name, "Phone");
+        p.mark_enabled("W:/notes".into(), "Renamed".into());
+        assert_eq!(p.device_name, "Phone", "an existing device name is kept");
+
+        p.set_queue_endpoint("https://queue.meetcorvux.com".into());
+        p.set_pinned_queue_host("q.example.net".into());
+        p.set_strict_p2p_only(false);
+        assert_eq!(p.queue_endpoint, "https://queue.meetcorvux.com");
+        assert_eq!(p.pinned_queue_host, "q.example.net");
+        assert!(!p.strict_p2p_only);
+        assert!(p.enabled && p.roost_path == "W:/notes");
+
+        let switched = p.enable_for("W:/other", "Phone");
+        assert_eq!(switched.roost_path, "W:/other");
+        assert!(switched.enabled);
+    }
 }
 
 /// Forward every `SyncEvent` from the engine's broadcast channel to the
@@ -1408,7 +1941,8 @@ async fn sync_init_inner(
     // Honor strict-P2P before any listener binds: no Corvux/Number0 relay in
     // the path. (Discovery still publishes our NodeAddr to the n0 DNS namespace
     // — a smaller, address-only surface — tracked as a separate follow-up.)
-    engine.set_relay_disabled(load_sync_prefs(app)?.strict_p2p_only);
+    // SY-3: non-secret prefs only; an unreadable file means strict P2P.
+    engine.set_relay_disabled(bring_up_prefs(app).strict_p2p_only);
     // Attach the event bridge BEFORE starting the watcher. `start_watcher`
     // kicks off a background `scan_roost` that emits `ScanProgress` /
     // `ScanComplete` events; if the bridge isn't already subscribed,
@@ -1430,7 +1964,7 @@ async fn sync_init_inner(
     // Install the queue client if prefs say to. Strict-P2P-only or
     // missing endpoint = no client (engine drops back to live transport
     // only). Periodic pull is spun up by `set_queue_client` itself.
-    let prefs = load_sync_prefs(app)?;
+    let prefs = bring_up_prefs(app);
     if !prefs.strict_p2p_only && !prefs.queue_endpoint.is_empty() {
         match crate::sync::queue::client::QueueClient::new(
             &prefs.queue_endpoint,
@@ -1532,7 +2066,12 @@ async fn sync_init_inner(
                 // No-op stub on desktop / iOS.
                 discover_acquire_lock(app);
                 let (tx, rx) = mpsc::unbounded_channel();
-                if let Err(e) = discovery.browse(tx) {
+                // SY-6: tell the bounded advert cache which advertisers are
+                // paired peers, so a flood of fake LAN adverts can never
+                // push a paired peer out. Must run before the engine handle
+                // moves into the bridge below.
+                let paired = engine_for_discovery.paired_lookup();
+                if let Err(e) = discovery.browse_with_paired(tx, paired) {
                     tracing::warn!(error = %e, "sync: mdns browse failed to start");
                 } else {
                     spawn_discovery_bridge(app.clone(), engine_for_discovery, rx);
@@ -1569,8 +2108,13 @@ pub async fn sync_init(
     // resumes without the user re-clicking "Enable sync". The engine being up
     // isn't enough — `sync_try_autostart` reads prefs, and switching roosts now
     // stops the engine, so the durable flag is what survives the round-trip.
-    let prefs = enable_prefs(load_sync_prefs(&app)?, &roost_path, &device_name);
-    if let Err(e) = save_sync_prefs(&app, &prefs) {
+    //
+    // SY-3: the engine is already up, so a prefs problem must not turn this
+    // into an error (nor may a keychain problem: no secret is involved).
+    let persisted = load_stored_prefs(&app)
+        .map(|stored| stored.enable_for(&roost_path, &device_name))
+        .and_then(|prefs| save_stored_prefs(&app, &prefs));
+    if let Err(e) = persisted {
         tracing::warn!(
             error = %e,
             "sync_init: could not persist enable prefs — auto-resume on return/restart may not work"
@@ -1632,7 +2176,18 @@ pub async fn sync_try_autostart(
         sync_shutdown_without_disabling(&app, &state).await;
     }
 
-    let prefs = load_sync_prefs(&app)?;
+    // SY-3: resume needs only the non-secret prefs. PINs are read later, and
+    // only for the listener (`hosting_pins` below), so a locked keychain can
+    // neither block the resume decision nor leave the engine down.
+    let prefs = load_stored_prefs(&app)?;
+    if prefs.has_plaintext_pins() {
+        // Best-effort move of a 0.2.5 file's plaintext PINs into the secret
+        // store (what every prefs load used to do). A failure keeps the plaintext
+        // fallback in the file and is retried on the next launch.
+        if let Err(e) = hydrate_prefs(&app, prefs.0.clone()) {
+            tracing::warn!(error = %e, "sync_try_autostart: could not migrate hosting PINs to the secret store yet");
+        }
+    }
     if !should_resume(&prefs, &roost_path) {
         return Ok(SyncStatus {
             running: false,
@@ -1666,7 +2221,21 @@ pub async fn sync_try_autostart(
     // Skipping this is what made one-device-offline → reconnect require
     // a fresh QR pair: the listener wasn't bound after restart, so the
     // iroh redial path returned `EngineError::NotConnected`.
-    if let Some(iroh_pin) = Pin::parse(&prefs.iroh_hosting_pin) {
+    //
+    // SY-3: the PINs come from the secret store, read only here. If that read
+    // fails the listener is simply not resumed (outbound-only, exactly like a
+    // device with no PIN saved) and a warning says why. The failure is NOT
+    // turned into an empty PIN, and nothing is paired or minted from it: the
+    // "Show pairing code" flow reads the PIN itself and fails closed with a
+    // message (`pin_for_listener`).
+    let pins = match load_prefs_with_pins(&app) {
+        Ok(p) => Some(p),
+        Err(e) => {
+            tracing::warn!(error = %e, "sync_try_autostart: hosting PIN unreadable — iroh listener not resumed");
+            None
+        }
+    };
+    if let Some(iroh_pin) = pins.as_ref().and_then(|p| Pin::parse(&p.iroh_hosting_pin)) {
         let guard = state.engine.lock().await;
         if let Some(engine) = guard.as_ref() {
             if let Err(e) = engine.start_listening_iroh(iroh_pin).await {
@@ -1674,7 +2243,7 @@ pub async fn sync_try_autostart(
             }
         }
     } else {
-        tracing::debug!("sync_try_autostart: no iroh hosting PIN saved — outbound-only iroh");
+        tracing::debug!("sync_try_autostart: no iroh hosting PIN available — outbound-only iroh");
     }
 
     // Kick off active dial for every known peer that has an address +
@@ -1705,7 +2274,7 @@ pub async fn sync_try_autostart(
         );
         return sync_status(state).await;
     }
-    let pin = match Pin::parse(&prefs.hosting_pin) {
+    let pin = match pins.as_ref().and_then(|p| Pin::parse(&p.hosting_pin)) {
         Some(p) => p,
         None => {
             tracing::info!(
@@ -1759,21 +2328,11 @@ pub async fn sync_try_autostart(
         }
         // Refresh prefs so a port that was chosen by the OS (port=0) gets
         // remembered. Keep enabled=true.
-        save_sync_prefs(
-            &app,
-            &SyncPrefs {
-                enabled: true,
-                roost_path: roost_path.clone(),
-                device_name: prefs.device_name,
-                hosting_port: bound,
-                hosting_pin: prefs.hosting_pin,
-                iroh_hosting_pin: prefs.iroh_hosting_pin,
-                queue_endpoint: prefs.queue_endpoint,
-                strict_p2p_only: prefs.strict_p2p_only,
-                pinned_queue_host: prefs.pinned_queue_host,
-                per_roost: prefs.per_roost,
-            },
-        )?;
+        let mut refreshed = (*prefs).clone();
+        refreshed.enabled = true;
+        refreshed.roost_path = roost_path.clone();
+        refreshed.hosting_port = bound;
+        save_prefs_with_pins(&app, &refreshed)?;
     }
 
     sync_status(state).await
@@ -1941,22 +2500,32 @@ pub async fn sync_start_listening(
     // Preserve any existing iroh_hosting_pin — starting the legacy TLS
     // listener shouldn't clobber the iroh autoresume PIN if the user has
     // also been hosting iroh in the same session.
-    let prior = load_sync_prefs(&app)?;
-    if let Err(e) = save_sync_prefs(
-        &app,
-        &SyncPrefs {
-            enabled: true,
-            roost_path,
-            device_name: display_name,
-            hosting_port: bound,
-            hosting_pin: pin,
-            iroh_hosting_pin: prior.iroh_hosting_pin,
-            queue_endpoint: prior.queue_endpoint,
-            strict_p2p_only: prior.strict_p2p_only,
-            pinned_queue_host: prior.pinned_queue_host,
-            per_roost: prior.per_roost,
-        },
-    ) {
+    //
+    // SY-3: `prior` is the STORED prefs (no secret read): the iroh PIN field
+    // is whatever the file holds, and saving it empty never clears the iroh
+    // PIN's secret slot (saves only ever write non-empty PINs). The new TLS
+    // PIN is the one value that must reach the secret store, via
+    // `save_prefs_with_pins`. Prior-read or save failure is non-fatal here,
+    // exactly like a failed save always was.
+    let persisted = load_stored_prefs(&app).and_then(|prior| {
+        let prior = prior.into_inner();
+        save_prefs_with_pins(
+            &app,
+            &SyncPrefs {
+                enabled: true,
+                roost_path,
+                device_name: display_name,
+                hosting_port: bound,
+                hosting_pin: pin,
+                iroh_hosting_pin: prior.iroh_hosting_pin,
+                queue_endpoint: prior.queue_endpoint,
+                strict_p2p_only: prior.strict_p2p_only,
+                pinned_queue_host: prior.pinned_queue_host,
+                per_roost: prior.per_roost,
+            },
+        )
+    });
+    if let Err(e) = persisted {
         tracing::warn!(error = %e, "sync_start_listening: could not persist prefs");
     }
 
@@ -2036,17 +2605,24 @@ pub async fn sync_connect(
     let roost_path = engine.roost_path().to_string();
     let display_name = engine.display_name().to_string();
     drop(guard);
-    let mut prefs = load_sync_prefs(&app)?;
-    prefs.enabled = true;
-    prefs.roost_path = roost_path;
-    if prefs.device_name.is_empty() {
-        prefs.device_name = display_name;
-    }
-    if let Err(e) = save_sync_prefs(&app, &prefs) {
+    // SY-3: the pairing already succeeded, so a prefs problem is only a warning.
+    if let Err(e) = persist_enabled_after_connect(&app, roost_path, display_name) {
         tracing::warn!(error = %e, "sync_connect: could not persist auto-resume prefs");
     }
 
     Ok(device_id.as_hex())
+}
+
+/// Connect bookkeeping shared by `sync_connect` and `sync_connect_iroh`: remember
+/// that sync is on for this roost. Non-secret prefs only (SY-3).
+fn persist_enabled_after_connect(
+    app: &AppHandle,
+    roost_path: String,
+    display_name: String,
+) -> Result<(), String> {
+    let mut prefs = load_stored_prefs(app)?;
+    prefs.mark_enabled(roost_path, display_name);
+    save_stored_prefs(app, &prefs)
 }
 
 /// Bind the iroh endpoint and return a **pairing ticket** for the QR
@@ -2090,11 +2666,17 @@ pub async fn sync_listen_iroh(
     // (get-or-create), so re-opening the panel shows the SAME code and existing
     // pairings keep working. `rotate: true` is the only way to mint a new PIN
     // (explicit user action, e.g. "the old code leaked").
-    let existing = Pin::parse(&load_sync_prefs(&app)?.iroh_hosting_pin);
-    let pin = match (rotate, existing) {
-        (false, Some(p)) => p,
-        _ => Pin::generate(),
-    };
+    //
+    // SY-3: a secret-store READ ERROR is not "no PIN saved". `pin_for_listener`
+    // fails closed on it (before anything is bound or opened) instead of
+    // minting a PIN that would silently rotate the saved one.
+    let pin = pin_for_listener(
+        load_prefs_with_pins(&app)
+            .as_ref()
+            .map(|p| &p.iroh_hosting_pin)
+            .map_err(String::as_str),
+        rotate,
+    )?;
     let pin_str = crate::sensitive::SecretString::from(pin.as_str());
 
     let guard = state.engine.lock().await;
@@ -2130,14 +2712,11 @@ pub async fn sync_listen_iroh(
     let roost_path = engine.roost_path().to_string();
     let display_name = engine.display_name().to_string();
     drop(guard);
-    let mut prefs = load_sync_prefs(&app)?;
-    prefs.enabled = true;
-    prefs.roost_path = roost_path;
-    if prefs.device_name.is_empty() {
-        prefs.device_name = display_name;
-    }
+    let mut stored = load_stored_prefs(&app)?;
+    stored.mark_enabled(roost_path, display_name);
+    let mut prefs = stored.into_inner();
     prefs.iroh_hosting_pin = pin_str.clone();
-    save_sync_prefs(&app, &prefs)?;
+    save_prefs_with_pins(&app, &prefs)?;
     Ok(IrohHostingInfo {
         ticket,
         pin: pin_str,
@@ -2459,17 +3038,25 @@ pub async fn sync_connect_iroh(
         crate::sensitive::SecretString,
         crate::sensitive::SecretString,
     )> = {
-        let my_pin =
-            Pin::parse(&load_sync_prefs(&app)?.iroh_hosting_pin).unwrap_or_else(Pin::generate);
+        // SY-3: an unreadable secret store stops the pairing HERE (nothing has
+        // been dialed yet) instead of minting a PIN that would rotate the saved
+        // one — same rule as `sync_listen_iroh` (`pin_for_listener`).
+        let my_pin = pin_for_listener(
+            load_prefs_with_pins(&app)
+                .as_ref()
+                .map(|p| &p.iroh_hosting_pin)
+                .map_err(String::as_str),
+            false,
+        )?;
         let my_pin_str = crate::sensitive::SecretString::from(my_pin.as_str());
         match engine.start_listening_iroh(my_pin).await {
             Ok(_) => match engine.iroh_pairing_ticket().await {
                 Ok(my_ticket) => {
                     // Persist our sticky hosting PIN so redials from the host
                     // keep matching across our restarts.
-                    let mut prefs = load_sync_prefs(&app)?;
+                    let mut prefs = load_stored_prefs(&app)?.into_inner();
                     prefs.iroh_hosting_pin = my_pin_str.clone();
-                    save_sync_prefs(&app, &prefs)?;
+                    save_prefs_with_pins(&app, &prefs)?;
                     Some((my_ticket, my_pin_str))
                 }
                 Err(e) => {
@@ -2514,13 +3101,8 @@ pub async fn sync_connect_iroh(
     // sync on the dialer side too.
     let roost_path = engine.roost_path().to_string();
     let display_name = engine.display_name().to_string();
-    let mut prefs = load_sync_prefs(&app)?;
-    prefs.enabled = true;
-    prefs.roost_path = roost_path;
-    if prefs.device_name.is_empty() {
-        prefs.device_name = display_name;
-    }
-    if let Err(e) = save_sync_prefs(&app, &prefs) {
+    // SY-3: the pairing already succeeded, so a prefs problem is only a warning.
+    if let Err(e) = persist_enabled_after_connect(&app, roost_path, display_name) {
         tracing::warn!(error = %e, "sync_connect_iroh: could not persist auto-resume prefs");
     }
 
@@ -2553,6 +3135,7 @@ pub async fn sync_status(state: State<'_, SyncEngineState>) -> Result<SyncStatus
 #[tauri::command]
 #[specta::specta]
 pub async fn sync_unpair(
+    app: tauri::AppHandle,
     state: State<'_, SyncEngineState>,
     device_id_hex: String,
 ) -> Result<(), String> {
@@ -2564,6 +3147,23 @@ pub async fn sync_unpair(
     }
     let mut arr = [0u8; 16];
     arr.copy_from_slice(&bytes);
+    // SY-4: an unpaired peer must not stay trusted by the first-pair record
+    // (`confirmed_sync_peers.json`) or this run's session memory, or a hijacked
+    // webview could re-pair that identity with no dialog. The keys are read
+    // from the peer's record BEFORE the unpair drops it, and the record is
+    // cleared BEFORE the unpair: if it cannot be cleared the unpair is refused
+    // (the user retries) rather than claimed while the old trust remains.
+    let keys = engine
+        .peer_store_lock()
+        .await
+        .get(DeviceId(arr))
+        .map(super::sync_endpoint::confirm_keys_for_peer)
+        .unwrap_or_default();
+    let dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| format!("app_data_dir: {e}"))?;
+    super::sync_endpoint::forget_confirmed_peer(&dir, &keys).await?;
     engine
         .unpair(DeviceId(arr))
         .await
@@ -2652,19 +3252,27 @@ pub async fn sync_stop(
         discover_release_lock(&app);
     }
     let mut guard = state.engine.lock().await;
-    if let Some(engine) = guard.take() {
-        engine.stop().await.map_err(|e| format!("stop: {e}"))?;
-    }
+    let stopped = match guard.take() {
+        Some(engine) => engine.stop().await.map_err(|e| format!("stop: {e}")),
+        None => Ok(()),
+    };
     // User asked to forget — clear the auto-resume flag but keep the rest
     // of prefs so if they re-enable we can pre-fill device name, etc.
-    let mut prefs = load_sync_prefs(&app)?;
-    if prefs.enabled {
-        prefs.enabled = false;
-        if let Err(e) = save_sync_prefs(&app, &prefs) {
-            tracing::warn!(error = %e, "sync_stop: could not clear auto-resume flag");
-        }
-    }
-    Ok(())
+    //
+    // SY-3: this reads and writes NO secret (`record_stop_in_prefs`), so a
+    // locked keychain, no Secret Service or a broken store cannot leave the
+    // flag set — which would resume sync on the next launch against the user's
+    // choice. It also runs when the engine failed to stop cleanly: the choice
+    // is the user's either way. If the file itself cannot be written the user
+    // is told, instead of the flag silently staying on.
+    let recorded = sync_prefs_path(&app).and_then(|path| record_stop_in_prefs(&path));
+    stopped?;
+    recorded.map(|_| ()).map_err(|e| {
+        format!(
+            "Sync was stopped, but Corvux could not save that choice ({e}). \
+             It may start again the next time the app opens."
+        )
+    })
 }
 
 /// Internal shutdown used by the window-close hook. Drops the running
@@ -2848,7 +3456,8 @@ pub async fn sync_get_queue_settings(
     app: tauri::AppHandle,
     state: State<'_, SyncEngineState>,
 ) -> Result<QueueSettings, String> {
-    let prefs = load_sync_prefs(&app)?;
+    // SY-3: queue / strict-P2P settings are non-secret — no keychain involved.
+    let prefs = load_stored_prefs(&app)?;
     let active = {
         let guard = state.engine.lock().await;
         match guard.as_ref() {
@@ -2857,7 +3466,7 @@ pub async fn sync_get_queue_settings(
         }
     };
     Ok(QueueSettings {
-        endpoint: prefs.queue_endpoint,
+        endpoint: prefs.queue_endpoint.clone(),
         strict_p2p_only: prefs.strict_p2p_only,
         active,
     })
@@ -2877,10 +3486,10 @@ pub async fn sync_set_queue_endpoint(
     state: State<'_, SyncEngineState>,
     endpoint: String,
 ) -> Result<(), String> {
-    let mut prefs = load_sync_prefs(&app)?;
+    let mut prefs = load_stored_prefs(&app)?;
     let normalized = validate_queue_endpoint(&endpoint, &prefs.pinned_queue_host)?;
-    prefs.queue_endpoint = normalized;
-    save_sync_prefs(&app, &prefs)?;
+    prefs.set_queue_endpoint(normalized);
+    save_stored_prefs(&app, &prefs)?;
     refresh_queue_client(&state, &prefs).await
 }
 
@@ -2901,16 +3510,16 @@ pub async fn sync_pin_custom_queue_host(
     host_confirm: String,
 ) -> Result<(), String> {
     let host = super::sync_endpoint::normalize_pin_host(&host, &host_confirm)?;
-    let current = load_sync_prefs(&app)?.pinned_queue_host;
+    let current = load_stored_prefs(&app)?.pinned_queue_host.clone();
     super::sync_endpoint::authorize_pin_change(
         &current,
         &host,
         &super::native_confirm::OsDialog(app.clone()),
     )
     .await?;
-    let mut prefs = load_sync_prefs(&app)?;
-    prefs.pinned_queue_host = host;
-    save_sync_prefs(&app, &prefs)?;
+    let mut prefs = load_stored_prefs(&app)?;
+    prefs.set_pinned_queue_host(host);
+    save_stored_prefs(&app, &prefs)?;
     Ok(())
 }
 
@@ -2923,9 +3532,9 @@ pub async fn sync_set_strict_p2p_only(
     state: State<'_, SyncEngineState>,
     enabled: bool,
 ) -> Result<(), String> {
-    let mut prefs = load_sync_prefs(&app)?;
-    prefs.strict_p2p_only = enabled;
-    save_sync_prefs(&app, &prefs)?;
+    let mut prefs = load_stored_prefs(&app)?;
+    prefs.set_strict_p2p_only(enabled);
+    save_stored_prefs(&app, &prefs)?;
     // Make the toggle take effect on the LIVE endpoint, not just at next
     // restart. Previously this only dropped the queue client, so a running iroh
     // endpoint kept using the Number0 relay/discovery until the app was

@@ -32,6 +32,36 @@ use super::protocol::*;
 /// engine for a minute.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// SY-Q: bound the TCP+TLS connect separately from the whole-request deadline,
+/// so a black-holed queue host fails fast instead of eating the full request
+/// budget on the handshake alone.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// SY-Q: drop idle pooled connections after this long. The client is long-lived
+/// (one per queue endpoint) and the queue is polled on a timer, so a stale
+/// kept-alive socket to a server that went away is retired rather than reused.
+const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+
+// The connect budget must fit inside the request budget, or it is meaningless.
+const _: () = assert!(CONNECT_TIMEOUT.as_secs() < REQUEST_TIMEOUT.as_secs());
+
+/// Build the one HTTP client every queue call goes through.
+///
+/// SY-Q: redirects are NEVER followed (`Policy::none()`). The default policy
+/// follows up to 10 hops, and on a 307/308 resends the request body: a queue
+/// server (or anything between us and it) that answered `Location: https://
+/// elsewhere` would receive our signed auth proof, our bearer token (for a
+/// same-host hop) and the ciphertext we push. The queue protocol has no
+/// redirects, so a 3xx is just an error, surfaced as `UnknownServerError`.
+fn build_http_client() -> Result<HttpClient, reqwest::Error> {
+    HttpClient::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(REQUEST_TIMEOUT)
+        .connect_timeout(CONNECT_TIMEOUT)
+        .pool_idle_timeout(POOL_IDLE_TIMEOUT)
+        .build()
+}
+
 /// SYN-M3/M6 (audit follow-up) / SYN-I6: per-ENDPOINT response ceilings, not one
 /// blanket cap. A single 64 MiB limit for every response closed "unbounded" but
 /// let a compromised/buggy queue server make the client buffer up to 64 MiB for
@@ -144,10 +174,7 @@ impl QueueClient {
         if !parsed.username().is_empty() || parsed.password().is_some() {
             return Err(QueueClientError::InvalidUrl(base_url));
         }
-        let http = HttpClient::builder()
-            .timeout(REQUEST_TIMEOUT)
-            .build()
-            .map_err(QueueClientError::Http)?;
+        let http = build_http_client().map_err(QueueClientError::Http)?;
         Ok(Self {
             inner: Arc::new(QueueClientInner {
                 base_url,

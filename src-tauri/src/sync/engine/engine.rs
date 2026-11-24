@@ -63,6 +63,7 @@ use crate::sync::transport::tcp_tls::TlsIdentity;
 use iroh::{Endpoint, EndpointId as NodeId};
 
 use super::peer::PeerHandle;
+use super::removal_guard::RemovalVerdict;
 use super::state::{ConnectedPeer, KnownPeer, PeerConnectionState, SyncEvent, SyncStatus};
 use super::util::{clone_handle, now_millis, roost_folder_name};
 use super::watcher::{LocalChange, RoostWatcher};
@@ -267,6 +268,18 @@ pub(super) struct SyncEngineInner {
     /// Cap delayed deletion verifications before spawning, not inside a task.
     tombstone_slots: Arc<tokio::sync::Semaphore>,
 
+    /// SY-2: the notes whose file this engine has actually seen on disk. A
+    /// rescan may turn a missing note into a tombstone only if it is in here;
+    /// anything else is restored, not deleted. See `disk_seen.rs`.
+    pub(super) disk_seen: super::disk_seen::DiskSeen,
+
+    /// SY-2: single-flight gate for the off-loop watcher-overflow reconcile.
+    overflow_gate: OverflowGate,
+
+    /// SYN-I5: the mass-missing breaker that every inferred tombstone consults
+    /// (unmounted drive, cloud eviction). See `removal_guard.rs`.
+    pub(super) removal_guard: super::removal_guard::RemovalGuard,
+
     /// Sender side of the watcher→engine change pipe. The engine fan-outs
     /// each change to every connected peer.
     pub(super) watcher_task: Mutex<Option<JoinHandle<()>>>,
@@ -313,6 +326,136 @@ pub(super) struct SyncEngineInner {
     /// Lock order: command-layer `State` locks → this → engine field locks.
     /// Engine methods never reach back into command `State`, so no inversion.
     pub(super) lifecycle: Mutex<()>,
+}
+
+/// Single-flight gate for the watcher-overflow reconcile. At most one pass
+/// runs; a request that arrives mid-pass is not dropped, it flags a rerun, so a
+/// burst of overflows collapses into one follow-up pass instead of a pile of
+/// concurrent full-roost scans. Request and finish are each ONE critical
+/// section, so a request can never slip between "no rerun flagged" and
+/// "running = false" and get lost.
+#[derive(Default)]
+struct OverflowGate {
+    state: std::sync::Mutex<OverflowGateState>,
+}
+
+#[derive(Default)]
+struct OverflowGateState {
+    running: bool,
+    rerun: bool,
+}
+
+impl OverflowGate {
+    fn lock(&self) -> std::sync::MutexGuard<'_, OverflowGateState> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// `true` = the caller now owns the pass and must call [`Self::finish`]
+    /// after each run. `false` = a pass is running; it will run once more.
+    fn request(&self) -> bool {
+        let mut state = self.lock();
+        if state.running {
+            state.rerun = true;
+            false
+        } else {
+            state.running = true;
+            state.rerun = false;
+            true
+        }
+    }
+
+    /// Called after a pass. `true` = a request arrived meanwhile, run again.
+    /// `false` = the gate is open again.
+    fn finish(&self) -> bool {
+        let mut state = self.lock();
+        if state.rerun {
+            state.rerun = false;
+            true
+        } else {
+            state.running = false;
+            false
+        }
+    }
+
+    /// Reopen the gate after an abnormal exit (cancel, panic).
+    fn abandon(&self) {
+        let mut state = self.lock();
+        state.running = false;
+        state.rerun = false;
+    }
+}
+
+/// Reopens the [`OverflowGate`] if the reconcile task dies mid-pass, so a
+/// cancelled or panicked pass can never wedge every later overflow.
+struct OverflowGateGuard {
+    engine: SyncEngine,
+    armed: bool,
+}
+
+impl Drop for OverflowGateGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.engine.inner.overflow_gate.abandon();
+        }
+    }
+}
+
+/// CL-6: two connections to the same device count as a SIMULTANEOUS dial only if
+/// they were established within this long of each other. Both ends dial on the
+/// same trigger (app resume, a supervisor tick) and finish within a few seconds;
+/// a connection that is much older is a stale/half-open one that a fresh connect
+/// should simply replace, exactly as before.
+const SIMULTANEOUS_DIAL_WINDOW: Duration = Duration::from_secs(10);
+
+/// What `register_peer` should do with a newly established connection when the
+/// peer map already holds one for the same device.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SimultaneousDial {
+    /// Not a simultaneous dial (no existing connection, a dead or old one, or
+    /// the same direction): plain replace, as before the tie-break.
+    NotApplicable,
+    /// The new connection is the one both ends keep: replace, close the old one.
+    NewWins,
+    /// The new connection is the duplicate both ends close: drop it.
+    NewLoses,
+}
+
+/// Decide which of two live connections to the same device survives, WITHOUT any
+/// wire change and identically on both ends: keep the connection DIALED BY the
+/// side with the lower device id.
+///
+/// Each end sees every connection from its own side: one it dialed
+/// (`dialed_by_us`) and one it accepted. With `a < b`, end `a` keeps its dialed
+/// connection and end `b` keeps its accepted one: the same connection. Without
+/// this, each end kept whichever registered last, so the two ends could keep
+/// DIFFERENT connections and close each other's, flapping until the supervisor's
+/// next tick.
+///
+/// A 0.2.5 peer has no tie-break and may keep the other connection. The worst
+/// case is then both connections closed and a supervisor redial: what the plain
+/// replace did before.
+fn resolve_simultaneous_dial(
+    our_id: DeviceId,
+    existing: &PeerHandle,
+    new: &PeerHandle,
+) -> SimultaneousDial {
+    if existing.control.is_closed() || existing.dialed_by_us == new.dialed_by_us {
+        return SimultaneousDial::NotApplicable;
+    }
+    let gap = if new.established_at >= existing.established_at {
+        new.established_at - existing.established_at
+    } else {
+        existing.established_at - new.established_at
+    };
+    if gap > SIMULTANEOUS_DIAL_WINDOW {
+        return SimultaneousDial::NotApplicable;
+    }
+    let keep_dialed_by_us = our_id.0 < new.device_id.0;
+    if new.dialed_by_us == keep_dialed_by_us {
+        SimultaneousDial::NewWins
+    } else {
+        SimultaneousDial::NewLoses
+    }
 }
 
 /// Per-peer reconnect backoff + outcome bookkeeping. See
@@ -507,6 +650,9 @@ impl SyncEngine {
                 outbox_drain_task: Mutex::new(None),
                 watcher: Mutex::new(None),
                 tombstone_slots: Arc::new(tokio::sync::Semaphore::new(64)),
+                disk_seen: super::disk_seen::DiskSeen::default(),
+                overflow_gate: OverflowGate::default(),
+                removal_guard: super::removal_guard::RemovalGuard::default(),
                 watcher_task: Mutex::new(None),
                 events,
                 pairing_rate_limiter: std::sync::Arc::new(std::sync::Mutex::new(
@@ -694,6 +840,21 @@ impl SyncEngine {
     /// handshake + PIN/token proof regardless.
     pub async fn is_paired(&self, device_id: DeviceId) -> bool {
         self.inner.peer_store.lock().await.get(device_id).is_some()
+    }
+
+    /// [`Self::is_paired`] as a [`crate::sync::discovery::PairedLookup`], the
+    /// argument `Discovery::browse_with_paired` takes. It lets the browser's
+    /// bounded peer cache keep paired peers when fake LAN adverts fill it
+    /// (SY-6): unpaired entries are evicted first.
+    // Unused until `commands::sync::sync_init` passes it to `browse_with_paired`
+    // (no-queue-server builds keep `sync` crate-private, so the lint can fire).
+    #[allow(dead_code)]
+    pub fn paired_lookup(&self) -> crate::sync::discovery::PairedLookup {
+        let engine = self.clone();
+        crate::sync::discovery::mdns::paired_lookup(move |device_id| {
+            let engine = engine.clone();
+            async move { engine.is_paired(device_id).await }
+        })
     }
 
     /// Clone of the currently-bound iroh `Endpoint`, or `None` if the iroh
@@ -1161,48 +1322,93 @@ impl SyncEngine {
     /// only for events the engine did not itself originate.
     const REMOVAL_VERIFY_DELAY: std::time::Duration = std::time::Duration::from_millis(1200);
 
-    /// Confirm a watcher-observed removal and tombstone the note **only if the
-    /// file is genuinely still missing**. Fail-safe by construction:
-    /// - file reappeared (transient churn / our own rewrite) → skip, no delete;
+    /// Confirm a watcher-observed (or rescan-inferred) removal and tombstone the
+    /// note **only if the file is genuinely still missing**. Fail-safe by
+    /// construction:
+    /// - file reappeared (transient churn / our own rewrite / recreated by the
+    ///   user) → skip, no delete;
     /// - existence probe errored → skip, no delete (never delete on doubt);
+    /// - doc already deleted → skip (nothing to do, and no disk reconcile);
     /// - file really gone → tombstone (the genuine external-delete path).
+    ///
+    /// ALL of those are decided under the note's lock, in the same critical
+    /// section as the CRDT commit (`commit_tombstone`, `InferredFromDisk`). A
+    /// check made before taking the lock leaves a window where a recreated file
+    /// is tombstoned and then trashed (the SYN-I3 tombstone race).
     ///
     /// Split out from the timing wrapper so the decision is unit-testable
     /// without sleeping.
+    ///
+    /// This form treats the removal as scheduled just now, which forces a fresh
+    /// roost look; production always goes through the `_since` form with the time
+    /// the removal was actually scheduled. Kept for tests.
+    #[cfg(test)]
     pub(super) async fn verify_then_tombstone(&self, note: crate::sync::protocol::NotePath) {
-        // A removal scheduled just before a roost switch / shutdown must not
-        // fire into a torn-down engine and tombstone into the previous roost's
-        // docstore. Match the existing stopped-latch guard used on the dial
-        // paths and bail.
-        if self.is_stopped() {
-            return;
-        }
-        match self.note_exists_on_disk(&note).await {
-            Ok(true) => {
-                info!(
-                    note = %note,
-                    "watcher removal not confirmed — file present after verify delay; skipping tombstone (transient FS event, not a real delete)"
-                );
-            }
-            Ok(false) => {
-                self.mark_note_deleted(note).await;
-            }
-            Err(e) => {
-                warn!(
-                    note = %note,
-                    error = %e,
-                    "watcher removal verify: existence check failed — skipping tombstone (fail-safe: never delete on uncertainty)"
-                );
-            }
-        }
+        self.verify_then_tombstone_since(note, std::time::Instant::now())
+            .await;
     }
 
-    /// Schedule a [`Self::verify_then_tombstone`] after [`Self::REMOVAL_VERIFY_DELAY`].
+    /// `verify_then_tombstone` for a removal scheduled at `scheduled_at`:
+    /// the roost look that vouches for it must have started after that moment (a
+    /// cached "allow" from before it cannot know about this removal).
+    pub(super) async fn verify_then_tombstone_since(
+        &self,
+        note: crate::sync::protocol::NotePath,
+        scheduled_at: std::time::Instant,
+    ) {
+        // The stopped-latch guard lives in `commit_tombstone`: a removal
+        // scheduled just before a roost switch / shutdown must not fire into a
+        // torn-down engine and tombstone into the previous roost's docstore.
+        self.commit_tombstone(
+            note,
+            super::fanout::TombstoneOrigin::InferredFromDisk,
+            scheduled_at,
+        )
+        .await;
+    }
+
+    /// Is the note's doc already tombstoned? A read failure is an `Err`: callers
+    /// treat "don't know" as "don't delete".
+    pub(super) async fn note_is_tombstoned(
+        &self,
+        note: &crate::sync::protocol::NotePath,
+    ) -> SyncResult<bool> {
+        let store = self.inner.doc_store.lock().await;
+        store.load_or_create(note)?.is_deleted()
+    }
+
+    /// Schedule a `verify_then_tombstone` after [`Self::REMOVAL_VERIFY_DELAY`].
     /// Spawns so the watcher-intake loop keeps draining. The delayed existence
     /// re-check is self-cancelling: if a `Modified` for the same path lands in
     /// the window and rewrites the file, the probe simply finds it present and
     /// no tombstone is written — no explicit cancellation bookkeeping needed.
+    ///
+    /// An already-deleted note is skipped HERE, before it takes one of the 64
+    /// verification slots for 1.2 s: a removal event for a note that is already
+    /// a tombstone (the usual double-fire after an IPC delete, or every
+    /// tombstoned entry a rescan walks past) has nothing left to decide.
     async fn schedule_verified_tombstone(&self, note: crate::sync::protocol::NotePath) {
+        // When this removal was observed. The roost look the commit relies on has
+        // to start after it (see `verify_then_tombstone_since`).
+        let scheduled_at = std::time::Instant::now();
+        // A fresh "the roost looks gone" verdict, or a full rate window, means
+        // every inferred delete would be suppressed at commit anyway; don't queue
+        // timers and slots for them. (The commit still re-judges: this is only an
+        // early out.)
+        if self.cached_suppression().is_some() {
+            return;
+        }
+        match self.note_is_tombstoned(&note).await {
+            Ok(true) => {
+                self.inner.disk_seen.forget(&note);
+                return;
+            }
+            Ok(false) => {}
+            Err(e) => {
+                warn!(note = %note, error = %e, "removal schedule: could not read the doc — skipping (fail-safe: never delete on uncertainty)");
+                return;
+            }
+        }
         let permit = tokio::select! {
             _ = self.inner.cancel.cancelled() => return,
             permit = self.inner.tombstone_slots.clone().acquire_owned() => match permit {
@@ -1211,45 +1417,264 @@ impl SyncEngine {
             },
         };
         let engine = self.clone();
+        // Counts toward the rolling budget until this removal resolves, so a batch
+        // scheduled right behind this one sees it.
+        let pending = self.inner.removal_guard.begin_pending();
         // SYN-I4: tracked + cancel-aware. A pending verify-delay must not
         // outlive `stop()` (it would fire `verify_then_tombstone` into a
         // torn-down engine, or hold `tracker.wait()` for the full 1.2s delay).
         self.spawn_tracked(move |token| async move {
             let _permit = permit;
+            let _pending = pending;
             tokio::select! {
                 _ = token.cancelled() => {} // engine stopping — drop the pending tombstone
                 _ = tokio::time::sleep(Self::REMOVAL_VERIFY_DELAY) => {
-                    engine.verify_then_tombstone(note).await;
+                    engine.verify_then_tombstone_since(note, scheduled_at).await;
                 }
             }
         });
     }
 
+    /// Notes handled per pacing step of the overflow reconcile. Kept well under
+    /// the 64-slot event broadcast buffer so a step's `NoteWritten` burst can't
+    /// by itself make the frontend bridge lag and drop re-index signals.
+    const OVERFLOW_BATCH: usize = 16;
+    /// Pause between overflow-reconcile batches. Yields the runtime and paces the
+    /// index-refresh events: 50k notes cost ~16 s of pacing, not the ~250 s a
+    /// 5 ms tick PER note did.
+    const OVERFLOW_PACE: Duration = Duration::from_millis(5);
+
     /// Reconcile disk truth after event coalescing: ingest current notes,
-    /// publish index refreshes, and verify missing notes before tombstoning.
+    /// publish index refreshes, and settle every DocStore note whose file is
+    /// missing — WITHOUT turning ambiguity into a propagated delete (SY-2).
+    ///
+    /// A missing note is a tombstone candidate only if this engine has SEEN its
+    /// file on disk (`DiskSeen`): then the disappearance is a real delete and it
+    /// goes through the usual verify-delay + under-lock re-check. A missing note
+    /// with no such evidence (peer-adopted but never rendered, a failed or
+    /// policy-refused recovery, a divergent doc) follows the RECOVER policy that
+    /// startup uses: restore it, create-only. Already-deleted notes are skipped.
+    /// An existence probe that errors skips that note: never decide on doubt.
+    ///
+    /// Runs OFF the watcher loop (`spawn_overflow_reconcile`) and yields every
+    /// [`Self::OVERFLOW_BATCH`] notes, so a large roost never stalls intake.
     async fn reconcile_watcher_overflow(&self) -> SyncResult<()> {
+        // Judge the roost BEFORE touching it, from the pre-scan state (the scan
+        // only adds notes it finds, so it can't hide a vanished one). A root that
+        // is missing, empty or unreadable (unmounted drive, offline cloud folder)
+        // means: do nothing at all. No scan, no restore into a mount-point stub,
+        // no tombstone. A mass vanish keeps the pass, but no seen note is
+        // tombstoned (below).
+        let verdict = self.removal_verdict(std::time::Instant::now()).await;
+        if verdict == RemovalVerdict::RootUnhealthy {
+            warn!("overflow reconcile: the roost root is missing, empty or unreadable — skipping the whole pass");
+            return Ok(());
+        }
         self.scan_roost().await?;
         let store = self.inner.doc_store.clone();
         let known = tokio::task::spawn_blocking(move || store.blocking_lock().list())
             .await
             .map_err(|e| std::io::Error::other(e.to_string()))??;
-        let mut tick = tokio::time::interval(Duration::from_millis(5));
-        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+        // PHASE 1: classify. Nothing is written to the roost and nothing is
+        // scheduled yet, so the batch can be judged as a whole.
+        // - seen on disk, gone now, not already deleted: a delete candidate;
+        // - never seen on disk: a restore candidate (SY-2);
+        // - present: a re-index signal for the frontend.
+        let mut delete_candidates: Vec<crate::sync::protocol::NotePath> = Vec::new();
+        let mut restore_candidates: Vec<crate::sync::protocol::NotePath> = Vec::new();
+        let mut handled = 0usize;
         for note in known {
             if self.is_stopped() {
-                break;
+                return Ok(());
             }
-            if self.note_exists_on_disk(&note).await? {
-                tick.tick().await;
-                let _ = self
-                    .inner
-                    .events
-                    .send(SyncEvent::NoteWritten { path: note.0 });
-            } else {
-                self.schedule_verified_tombstone(note).await;
+            match self.note_exists_on_disk(&note).await {
+                Ok(true) => {
+                    let _ = self
+                        .inner
+                        .events
+                        .send(SyncEvent::NoteWritten { path: note.0 });
+                }
+                Ok(false) if self.inner.disk_seen.contains(&note) => {
+                    match self.note_is_tombstoned(&note).await {
+                        Ok(true) => self.inner.disk_seen.forget(&note),
+                        Ok(false) => delete_candidates.push(note),
+                        Err(e) => {
+                            warn!(note = %note, error = %e, "overflow reconcile: could not read the doc — leaving the note alone");
+                        }
+                    }
+                }
+                Ok(false) => restore_candidates.push(note),
+                Err(e) => {
+                    warn!(note = %note, error = %e, "overflow reconcile: existence check failed — leaving the note alone");
+                }
+            }
+            handled += 1;
+            if handled.is_multiple_of(Self::OVERFLOW_BATCH) {
+                tokio::time::sleep(Self::OVERFLOW_PACE).await;
+            }
+        }
+
+        // The batch is refused as a whole when the roost verdict says suppress, or
+        // when it is larger than the 60 s budget still allows (never the first 20
+        // of a mass and then a gap). Suppression writes nothing to the roost:
+        // no tombstone and no restore (see `removal_guard`).
+        let budget = self.inner.removal_guard.budget(std::time::Instant::now());
+        let batch_refused = !verdict.is_allow() || delete_candidates.len() > budget;
+        if batch_refused {
+            if verdict.is_allow() {
+                self.announce_removal_suppressed(RemovalVerdict::RateLimited {
+                    recent: delete_candidates.len(),
+                });
+            }
+            warn!(
+                delete_candidates = delete_candidates.len(),
+                restore_candidates = restore_candidates.len(),
+                budget,
+                ?verdict,
+                "overflow reconcile: notes vanished from disk in a mass — no tombstone written and nothing restored"
+            );
+            return Ok(());
+        }
+
+        // PHASE 2: act.
+        for note in delete_candidates {
+            if self.is_stopped() {
+                return Ok(());
+            }
+            // Seen on disk, gone now: a real delete candidate, re-verified under
+            // the note lock after the delay.
+            self.schedule_verified_tombstone(note).await;
+            handled += 1;
+            if handled.is_multiple_of(Self::OVERFLOW_BATCH) {
+                tokio::time::sleep(Self::OVERFLOW_PACE).await;
+            }
+        }
+        for note in restore_candidates {
+            if self.is_stopped() {
+                return Ok(());
+            }
+            // No evidence it was ever on disk: restore, never delete. (Skips
+            // already-deleted docs under the note lock.)
+            self.recover_missing_note(&note).await;
+            handled += 1;
+            if handled.is_multiple_of(Self::OVERFLOW_BATCH) {
+                tokio::time::sleep(Self::OVERFLOW_PACE).await;
             }
         }
         Ok(())
+    }
+
+    /// Run [`Self::reconcile_watcher_overflow`] in a tracked background task so
+    /// the watcher intake loop keeps draining while a big roost is rescanned.
+    /// Single-flight: a request that arrives mid-pass is not lost, it flags ONE
+    /// follow-up pass. A failed pass asks the watcher for another rescan via
+    /// `retry` (the loop's rate limit applies), as the inline version did.
+    pub(super) fn spawn_overflow_reconcile(&self, retry: super::watcher::RescanRequester) {
+        if !self.inner.overflow_gate.request() {
+            return;
+        }
+        let engine = self.clone();
+        self.spawn_tracked(move |token| async move {
+            let mut guard = OverflowGateGuard {
+                engine: engine.clone(),
+                armed: true,
+            };
+            loop {
+                tokio::select! {
+                    // Engine stopping: the guard reopens the gate on the way out.
+                    _ = token.cancelled() => break,
+                    result = engine.reconcile_watcher_overflow() => {
+                        if let Err(error) = result {
+                            warn!(%error, "watcher overflow reconciliation failed; retrying");
+                            retry.request();
+                        }
+                    }
+                }
+                if !engine.inner.overflow_gate.finish() {
+                    guard.armed = false;
+                    break;
+                }
+            }
+        });
+    }
+
+    /// Expand an external folder removal into one verified tombstone per nested
+    /// note. The files are already gone, so the DocStore is the only record of
+    /// what was inside. Runs off the watcher loop (a big folder would otherwise
+    /// hold the intake for `notes / 64 × 1.2 s` waiting for verification slots).
+    ///
+    /// The OS event names the FOLDER, not each note, so it is not evidence about
+    /// any one note. Only notes this engine has seen on disk (`DiskSeen`) are
+    /// tombstone candidates; a DocStore-only note under the folder (never
+    /// rendered, a refused path) is left alone instead of being deleted on every
+    /// peer for a folder removal that never contained it (SY-2, same rule as the
+    /// overflow reconcile).
+    async fn schedule_prefix_removal(&self, prefix: crate::sync::protocol::NotePath) {
+        // A folder "removal" that is really an unmounted drive or a cloud eviction
+        // must not tombstone the notes under it (see `removal_guard`).
+        let verdict = self.removal_verdict(std::time::Instant::now()).await;
+        if !verdict.is_allow() {
+            warn!(prefix = %prefix, ?verdict, "folder removal ignored: the roost looks unavailable or mass-emptied, so no nested note was tombstoned");
+            return;
+        }
+        let under = {
+            let store = self.inner.doc_store.lock().await;
+            match store.list() {
+                Ok(all) => paths_under_prefix(all, &prefix),
+                Err(e) => {
+                    warn!(error = %e, prefix = %prefix, "watcher: docstore list failed for prefix removal — nested notes may not tombstone");
+                    Vec::new()
+                }
+            }
+        };
+        let total = under.len();
+        // Candidates: seen on disk and not already deleted. Collected first so the
+        // folder is judged as a whole.
+        let mut candidates: Vec<crate::sync::protocol::NotePath> = Vec::new();
+        for note in under {
+            if self.is_stopped() {
+                return;
+            }
+            if !self.inner.disk_seen.contains(&note) {
+                continue;
+            }
+            match self.note_is_tombstoned(&note).await {
+                Ok(true) => self.inner.disk_seen.forget(&note),
+                Ok(false) => candidates.push(note),
+                Err(e) => {
+                    warn!(note = %note, error = %e, "folder removal: could not read the doc — leaving the note alone");
+                }
+            }
+        }
+        // All of the folder or none of it: more than the 60 s budget still allows
+        // is a mass removal, not a user deleting a folder.
+        let budget = self.inner.removal_guard.budget(std::time::Instant::now());
+        if candidates.len() > budget {
+            self.announce_removal_suppressed(RemovalVerdict::RateLimited {
+                recent: candidates.len(),
+            });
+            warn!(
+                prefix = %prefix,
+                candidates = candidates.len(),
+                budget,
+                "folder removal ignored: it covers more notes than the rolling budget allows — no nested note was tombstoned"
+            );
+            return;
+        }
+        let count = candidates.len();
+        for note in candidates {
+            if self.is_stopped() {
+                return;
+            }
+            // Same provisional treatment as a single-file removal: a transient
+            // prefix event (e.g. iOS resume) must not tombstone every note
+            // under it. Each note is re-verified independently after the delay.
+            self.schedule_verified_tombstone(note).await;
+        }
+        if total > 0 {
+            info!(prefix = %prefix, total, candidates = count, "watcher: folder removed — tombstoning nested notes seen on disk");
+        }
     }
 
     /// Start the roost watcher. Local markdown edits get fanned-out to
@@ -1365,15 +1790,9 @@ impl SyncEngine {
                 let change = match received {
                     super::watcher::WatcherEvent::Change(change) => change,
                     super::watcher::WatcherEvent::Rescan => {
-                        tokio::select! {
-                            _ = token.cancelled() => break,
-                            result = engine.reconcile_watcher_overflow() => {
-                                if let Err(error) = result {
-                                    warn!(%error, "watcher overflow reconciliation failed; retrying");
-                                    rx.request_rescan();
-                                }
-                            }
-                        }
+                        // Off the loop: a full-roost reconcile must not stall
+                        // intake (single-flight; a pass that fails re-requests).
+                        engine.spawn_overflow_reconcile(rx.rescan_requester());
                         continue;
                     }
                 };
@@ -1386,7 +1805,9 @@ impl SyncEngine {
                     // Watcher-originated: provisional. A transient "file gone"
                     // event (rename churn, our own rewrite, iOS resume rescan)
                     // must not become a propagated tombstone — verify the file
-                    // is really gone after a short delay first.
+                    // is really gone after a short delay first. The OS saying
+                    // "removed" is itself evidence the file existed.
+                    engine.inner.disk_seen.mark(path);
                     engine.schedule_verified_tombstone(path.clone()).await;
                     continue;
                 }
@@ -1397,26 +1818,16 @@ impl SyncEngine {
                 // docstore is the only record of what was inside — and route
                 // each nested note through the same delete chokepoint.
                 if let LocalChange::RemovedPrefix { prefix } = &change {
-                    let under = {
-                        let store = engine.inner.doc_store.lock().await;
-                        match store.list() {
-                            Ok(all) => paths_under_prefix(all, prefix),
-                            Err(e) => {
-                                warn!(error = %e, prefix = %prefix, "watcher: docstore list failed for prefix removal — nested notes may not tombstone");
-                                Vec::new()
-                            }
+                    // Off the loop: expanding a big folder waits on the 64
+                    // verification slots (see `schedule_prefix_removal`).
+                    let worker = engine.clone();
+                    let prefix = prefix.clone();
+                    engine.spawn_tracked(move |token| async move {
+                        tokio::select! {
+                            _ = token.cancelled() => {}
+                            _ = worker.schedule_prefix_removal(prefix) => {}
                         }
-                    };
-                    if !under.is_empty() {
-                        info!(prefix = %prefix, count = under.len(), "watcher: folder removed — tombstoning nested notes");
-                    }
-                    for note in under {
-                        // Same provisional treatment as a single-file removal:
-                        // a transient prefix event (e.g. iOS resume) must not
-                        // tombstone every note under it. Each note is
-                        // re-verified independently after the delay.
-                        engine.schedule_verified_tombstone(note).await;
-                    }
+                    });
                     continue;
                 }
                 // Single-writer: persist the edit to the docstore HERE,
@@ -1540,7 +1951,51 @@ impl SyncEngine {
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         handle.generation = generation;
         let display_name = handle.display_name.clone();
-        self.inner.peers.write().await.insert(device, handle);
+        // CL-6: resolve a simultaneous dial deterministically. Decided and applied
+        // under the peers write lock; the loser's Bye is sent after it drops.
+        let displaced = {
+            let mut peers = self.inner.peers.write().await;
+            let verdict = match peers.get(&device) {
+                Some(existing) => {
+                    resolve_simultaneous_dial(self.identity().device_id(), existing, &handle)
+                }
+                None => SimultaneousDial::NotApplicable,
+            };
+            match verdict {
+                SimultaneousDial::NewLoses => {
+                    drop(peers);
+                    info!(
+                        device = %device,
+                        dialed_by_us = handle.dialed_by_us,
+                        "simultaneous dial: keeping the connection dialed by the lower device id; closing this duplicate"
+                    );
+                    // Graceful Bye on the duplicate only; the kept connection is
+                    // untouched. The task ends on its own (the tracker owns it).
+                    handle.shutdown().await;
+                    drop(task);
+                    return;
+                }
+                SimultaneousDial::NewWins => {
+                    info!(
+                        device = %device,
+                        dialed_by_us = handle.dialed_by_us,
+                        "simultaneous dial: keeping the connection dialed by the lower device id; closing the earlier duplicate"
+                    );
+                    peers.insert(device, handle).map(|old| (old, true))
+                }
+                // Not a simultaneous dial: a plain replace, as before.
+                SimultaneousDial::NotApplicable => {
+                    peers.insert(device, handle).map(|old| (old, false))
+                }
+            }
+        };
+        if let Some((old, tie_break)) = displaced {
+            if tie_break {
+                // Close the loser with a Bye. Dropping it alone also closes it,
+                // but it is the explicit, symmetric close we want here.
+                old.shutdown().await;
+            }
+        }
         // A fresh connection re-syncs shared paths via its `NoteList` exchange,
         // so any live-pending redelivery intents for this device are now
         // redundant. Drop them so they can't accumulate across redials.
@@ -2708,11 +3163,29 @@ mod tests {
                 peer_vault_id: [0u8; 16],
                 control: tx,
                 generation: 0,
+                dialed_by_us: false,
+                established_at: std::time::Instant::now(),
                 peer_reconnect: None,
                 resumption_token: [0u8; 32].into(),
             },
             rx,
         )
+    }
+
+    /// `fake_handle` with an explicit direction and establishment time, for the
+    /// CL-6 simultaneous-dial tests.
+    fn fake_conn(
+        device: DeviceId,
+        dialed_by_us: bool,
+        established_at: std::time::Instant,
+    ) -> (
+        PeerHandle,
+        tokio::sync::mpsc::Receiver<crate::sync::engine::peer::PeerControl>,
+    ) {
+        let (mut handle, rx) = fake_handle(device, "conn");
+        handle.dialed_by_us = dialed_by_us;
+        handle.established_at = established_at;
+        (handle, rx)
     }
 
     /// PR-B regression: a slow/wedged-but-still-connected peer that dropped a
@@ -3200,6 +3673,1007 @@ mod tests {
             doc.is_deleted().unwrap(),
             "a note whose file is genuinely gone must tombstone (real deletes still propagate)"
         );
+    }
+
+    // ── SY-2: overflow reconcile / inferred tombstones ──────────────────
+
+    /// Put a live note into the DocStore ONLY (no file on disk): the state of a
+    /// peer-adopted note whose render failed or was refused, or one startup
+    /// recovery could not materialize.
+    async fn seed_docstore_only(engine: &SyncEngine, note: &NotePath, text: &str) {
+        let store = engine.inner.doc_store.lock().await;
+        let mut doc = store.load_or_create(note).unwrap();
+        doc.apply_markdown(text).unwrap();
+        store.save(note, &mut doc).unwrap();
+    }
+
+    /// A DocStore entry that is already a tombstone (and has no file).
+    async fn seed_tombstoned(engine: &SyncEngine, note: &NotePath) {
+        let store = engine.inner.doc_store.lock().await;
+        let mut doc = store.load_or_create(note).unwrap();
+        doc.apply_markdown("gone").unwrap();
+        doc.mark_deleted(now_millis()).unwrap();
+        store.save(note, &mut doc).unwrap();
+    }
+
+    async fn is_tombstoned(engine: &SyncEngine, note: &NotePath) -> bool {
+        engine
+            .inner
+            .doc_store
+            .lock()
+            .await
+            .load_or_create(note)
+            .unwrap()
+            .is_deleted()
+            .unwrap()
+    }
+
+    /// Wait out the verify delay (plus margin) so a tombstone that WAS going to
+    /// fire has fired.
+    async fn outwait_verify_delay() {
+        tokio::time::sleep(SyncEngine::REMOVAL_VERIFY_DELAY + Duration::from_millis(500)).await;
+    }
+
+    /// SY-2 headline. A DocStore note whose file this engine never saw on disk
+    /// must NOT be tombstoned by an overflow rescan (a delete the user never
+    /// made would spread to every peer); it follows the startup recover policy
+    /// and is restored instead.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn overflow_reconcile_restores_a_note_that_was_never_on_disk() {
+        let (engine, roost, _d) = setup_engine();
+        let note = NotePath("adopted-never-rendered.md".into());
+        seed_docstore_only(&engine, &note, "from a peer").await;
+        assert!(
+            !engine.inner.disk_seen.contains(&note),
+            "precondition: never seen"
+        );
+
+        engine.reconcile_watcher_overflow().await.unwrap();
+        outwait_verify_delay().await;
+
+        assert!(
+            !is_tombstoned(&engine, &note).await,
+            "a note never seen on disk was tombstoned by the overflow rescan"
+        );
+        assert_eq!(
+            std::fs::read_to_string(roost.path().join("test-roost/adopted-never-rendered.md"))
+                .unwrap(),
+            "from a peer",
+            "the recover policy must restore the note"
+        );
+        engine.stop().await.unwrap();
+    }
+
+    /// An already-deleted entry is missing from disk by definition. The rescan
+    /// must skip it, whether or not it was ever seen, without spending one of the
+    /// 64 verification slots on it and without writing the file back.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn overflow_reconcile_skips_already_deleted_entries() {
+        let (engine, roost, _d) = setup_engine();
+        let never_seen = NotePath("deleted-never-seen.md".into());
+        let seen_then_deleted = NotePath("deleted-after-seen.md".into());
+        seed_tombstoned(&engine, &never_seen).await;
+        seed_tombstoned(&engine, &seen_then_deleted).await;
+        engine.inner.disk_seen.mark(&seen_then_deleted); // e.g. tombstoned by a peer
+
+        engine.reconcile_watcher_overflow().await.unwrap();
+
+        assert_eq!(
+            engine.inner.tombstone_slots.available_permits(),
+            64,
+            "an already-deleted entry took a verification slot"
+        );
+        assert!(
+            !engine.inner.disk_seen.contains(&seen_then_deleted),
+            "a tombstoned note must be dropped from the evidence set"
+        );
+        for name in ["deleted-never-seen.md", "deleted-after-seen.md"] {
+            assert!(
+                !roost.path().join("test-roost").join(name).exists(),
+                "{name}: a deleted note must not be restored"
+            );
+        }
+        engine.stop().await.unwrap();
+    }
+
+    /// The counterpart: a note the engine rendered itself (so it HAS been seen)
+    /// that is then removed externally still tombstones through an overflow
+    /// rescan, so real deletes keep propagating.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn overflow_reconcile_still_tombstones_a_seen_note_that_was_deleted() {
+        let (engine, roost, _d) = setup_engine();
+        let note = NotePath("really-deleted.md".into());
+        engine.notify_local_write(note.clone(), "bye".into()).await;
+        assert!(
+            engine.inner.disk_seen.contains(&note),
+            "a locked local render is evidence the file was on disk"
+        );
+        std::fs::remove_file(roost.path().join("test-roost/really-deleted.md")).unwrap();
+
+        engine.reconcile_watcher_overflow().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !is_tombstoned(&engine, &note).await {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("a real delete must still propagate after an overflow rescan");
+        assert!(
+            !engine.inner.disk_seen.contains(&note),
+            "the evidence is dropped once the tombstone commits"
+        );
+        engine.stop().await.unwrap();
+    }
+
+    /// SYN-I3 tombstone race: the file is recreated AFTER the watcher saw it
+    /// missing but BEFORE the tombstone takes the note lock. The old code checked
+    /// existence first and locked second, so it tombstoned the note and then
+    /// trashed the user's new file. The check now happens under the lock.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn verify_then_tombstone_never_tombstones_a_file_recreated_before_the_lock() {
+        let (engine, roost, _d) = setup_engine();
+        let note = NotePath("recreated.md".into());
+        engine.notify_local_write(note.clone(), "v1".into()).await;
+        let on_disk = roost.path().join("test-roost/recreated.md");
+        std::fs::remove_file(&on_disk).unwrap();
+
+        // Hold the note's lock, as a concurrent adopt / save would, and let the
+        // tombstone attempt queue up behind it while the file is still absent.
+        let held = engine.inner.note_locks.lock(&note).await;
+        let worker = engine.clone();
+        let target = note.clone();
+        let task = tokio::spawn(async move { worker.verify_then_tombstone(target).await });
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        // The user recreates the note while the tombstone waits for the lock.
+        std::fs::write(&on_disk, "recreated by the user").unwrap();
+        drop(held);
+        task.await.unwrap();
+
+        assert!(
+            !is_tombstoned(&engine, &note).await,
+            "a recreated file was tombstoned (the check ran before the lock)"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&on_disk).unwrap(),
+            "recreated by the user",
+            "a recreated file must never be trashed by an inferred removal"
+        );
+        engine.stop().await.unwrap();
+    }
+
+    /// An inferred removal of an already-deleted note does nothing, and in
+    /// particular does not trash a copy the user recreated (the scan leaves such
+    /// a file alone on purpose; only an explicit Intentional delete re-trashes).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn inferred_removal_of_a_deleted_note_leaves_a_recreated_file_alone() {
+        let (engine, roost, _d) = setup_engine();
+        let note = NotePath("tombstoned.md".into());
+        seed_tombstoned(&engine, &note).await;
+        async fn deleted_at(engine: &SyncEngine, note: &NotePath) -> u64 {
+            engine
+                .inner
+                .doc_store
+                .lock()
+                .await
+                .load_or_create(note)
+                .unwrap()
+                .deleted_at()
+                .unwrap()
+        }
+        let stamped = deleted_at(&engine, &note).await;
+        let on_disk = roost.path().join("test-roost/tombstoned.md");
+        std::fs::write(&on_disk, "user wrote this after the delete").unwrap();
+
+        engine.verify_then_tombstone(note.clone()).await;
+
+        assert!(is_tombstoned(&engine, &note).await);
+        assert_eq!(
+            std::fs::read_to_string(&on_disk).unwrap(),
+            "user wrote this after the delete",
+            "an inferred removal must never trash a recreated copy"
+        );
+
+        // File gone again: still a no-op on the already-deleted doc (the
+        // original tombstone is not re-stamped).
+        std::fs::remove_file(&on_disk).unwrap();
+        engine.verify_then_tombstone(note.clone()).await;
+        assert!(is_tombstoned(&engine, &note).await);
+        assert_eq!(
+            deleted_at(&engine, &note).await,
+            stamped,
+            "the existing tombstone must not be re-written"
+        );
+        engine.stop().await.unwrap();
+    }
+
+    /// A folder removal expands to its nested notes: those really gone tombstone,
+    /// one whose file is present again is left alone, an already-deleted one is
+    /// skipped (twin of the single-file watcher removal, same chokepoint).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn prefix_removal_tombstones_only_notes_that_are_really_gone() {
+        let (engine, roost, _d) = setup_engine();
+        let gone = NotePath("dir/gone.md".into());
+        let back = NotePath("dir/back.md".into());
+        let old = NotePath("dir/old.md".into());
+        let never = NotePath("dir/never-on-disk.md".into());
+        let sibling = NotePath("dir-other/keep.md".into());
+        for note in [&gone, &back, &sibling] {
+            engine.notify_local_write(note.clone(), "body".into()).await;
+        }
+        seed_tombstoned(&engine, &old).await;
+        seed_docstore_only(&engine, &never, "never rendered").await;
+        std::fs::remove_file(roost.path().join("test-roost/dir/gone.md")).unwrap();
+        // `back.md` stays on disk: the folder came back (or never left).
+
+        engine.schedule_prefix_removal(NotePath("dir".into())).await;
+        outwait_verify_delay().await;
+
+        assert!(is_tombstoned(&engine, &gone).await, "gone must tombstone");
+        assert!(
+            !is_tombstoned(&engine, &never).await,
+            "a DocStore-only note under a removed folder was never on disk: it must \
+             not be deleted on every peer for a folder removal that never held it"
+        );
+        assert!(
+            !is_tombstoned(&engine, &back).await,
+            "a note whose file is present must survive a prefix removal"
+        );
+        assert!(
+            !is_tombstoned(&engine, &sibling).await,
+            "a sibling folder is not under the prefix"
+        );
+        assert!(is_tombstoned(&engine, &old).await);
+        engine.stop().await.unwrap();
+    }
+
+    /// The overflow reconcile runs off the watcher loop, single-flight: a
+    /// request mid-pass is coalesced, the work still completes in the
+    /// background, and the gate reopens for the next overflow.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn spawned_overflow_reconcile_runs_in_the_background_and_reopens_the_gate() {
+        let (engine, roost, _d) = setup_engine();
+        let note = NotePath("background.md".into());
+        seed_docstore_only(&engine, &note, "restore me").await;
+        let (_tx, rx) = super::super::watcher::change_channel();
+
+        engine.spawn_overflow_reconcile(rx.rescan_requester());
+        engine.spawn_overflow_reconcile(rx.rescan_requester()); // coalesced
+
+        let restored = roost.path().join("test-roost/background.md");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !restored.exists() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the background reconcile must restore the note");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            // Gate open again once the (single, possibly re-run) pass is done.
+            loop {
+                if engine.inner.overflow_gate.request() {
+                    engine.inner.overflow_gate.abandon();
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the gate must reopen after the pass");
+        engine.stop().await.unwrap();
+    }
+
+    #[test]
+    fn overflow_gate_is_single_flight_and_never_loses_a_request() {
+        let gate = OverflowGate::default();
+        assert!(gate.request(), "first request owns the pass");
+        assert!(!gate.request(), "a request mid-pass is coalesced...");
+        assert!(!gate.request());
+        assert!(gate.finish(), "...into exactly one follow-up pass");
+        assert!(!gate.finish(), "then the gate opens");
+        assert!(gate.request(), "and accepts the next overflow");
+        gate.abandon();
+        assert!(gate.request(), "abandon (cancel/panic) also reopens it");
+    }
+
+    // ── Mass-missing breaker (removal_guard) ─────────────────────────────
+
+    /// Write `count` markdown files into the engine's roost and scan them in, so
+    /// every one is a live DocStore note the engine has SEEN on disk.
+    async fn seen_roost(engine: &SyncEngine, prefix: &str, count: usize) -> Vec<NotePath> {
+        let root = engine.inner.roost.clone();
+        let mut notes = Vec::new();
+        for i in 0..count {
+            let rel = format!("{prefix}note-{i:03}.md");
+            let abs = root.join(&rel);
+            std::fs::create_dir_all(abs.parent().unwrap()).unwrap();
+            std::fs::write(&abs, format!("body {i}")).unwrap();
+            notes.push(NotePath(rel));
+        }
+        engine.scan_roost().await.unwrap();
+        for note in &notes {
+            assert!(
+                engine.inner.disk_seen.contains(note),
+                "scan must mark {note}"
+            );
+        }
+        notes
+    }
+
+    fn drain_events(rx: &mut broadcast::Receiver<SyncEvent>) -> Vec<SyncEvent> {
+        use tokio::sync::broadcast::error::TryRecvError;
+        let mut out = Vec::new();
+        loop {
+            match rx.try_recv() {
+                Ok(ev) => out.push(ev),
+                Err(TryRecvError::Lagged(_)) => continue,
+                Err(_) => break,
+            }
+        }
+        out
+    }
+
+    fn notices(events: &[SyncEvent]) -> Vec<&String> {
+        events
+            .iter()
+            .filter_map(|ev| match ev {
+                SyncEvent::NoteSyncFailed { path, reason } if path.is_empty() => Some(reason),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// An unmounted drive: the roost root is gone. Every inferred delete path
+    /// (the single Removed event, the rescan, the early-out) must tombstone
+    /// nothing, and the user is told through the existing notice channel.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn missing_root_suppresses_every_inferred_delete() {
+        let (engine, roost, _d) = setup_engine();
+        let notes = seen_roost(&engine, "", 30).await;
+        std::fs::remove_dir_all(roost.path().join("test-roost")).unwrap();
+        let mut rx = engine.inner.events.subscribe();
+
+        // The single Removed path (commit-time check).
+        engine.verify_then_tombstone(notes[0].clone()).await;
+        assert!(
+            !is_tombstoned(&engine, &notes[0]).await,
+            "unmounted root: tombstoned"
+        );
+        // The rescan: returns Ok and does nothing at all.
+        engine.reconcile_watcher_overflow().await.unwrap();
+        assert_eq!(engine.inner.tombstone_slots.available_permits(), 64);
+        // The scheduler early-out: no timer, no slot, for a fresh suppress verdict.
+        engine.schedule_verified_tombstone(notes[1].clone()).await;
+        assert_eq!(engine.inner.tombstone_slots.available_permits(), 64);
+        for note in &notes {
+            assert!(!is_tombstoned(&engine, note).await, "{note} was tombstoned");
+        }
+        let events = drain_events(&mut rx);
+        assert_eq!(
+            notices(&events).len(),
+            1,
+            "one notice, not one per attempt: {events:?}"
+        );
+        assert!(
+            events
+                .iter()
+                .all(|ev| !matches!(ev, SyncEvent::NoteDeleted { .. })),
+            "no NoteDeleted may be announced for a suppressed delete"
+        );
+        engine.stop().await.unwrap();
+    }
+
+    /// A mount-point stub: the root directory exists but is EMPTY (no notes, no
+    /// `.corvux`). Nothing is tombstoned, and the rescan must not "restore"
+    /// notes into the stub either.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn empty_root_suppresses_deletes_and_is_not_restored_into() {
+        let (engine, roost, _d) = setup_engine();
+        let notes = seen_roost(&engine, "", 5).await;
+        let never_seen = NotePath("adopted-never-rendered.md".into());
+        seed_docstore_only(&engine, &never_seen, "from a peer").await;
+        let root = roost.path().join("test-roost");
+        for entry in std::fs::read_dir(&root).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                std::fs::remove_dir_all(path).unwrap();
+            } else {
+                std::fs::remove_file(path).unwrap();
+            }
+        }
+        assert_eq!(
+            std::fs::read_dir(&root).unwrap().count(),
+            0,
+            "precondition: empty stub"
+        );
+
+        engine.verify_then_tombstone(notes[0].clone()).await;
+        engine.reconcile_watcher_overflow().await.unwrap();
+
+        assert!(
+            !is_tombstoned(&engine, &notes[0]).await,
+            "empty root: tombstoned"
+        );
+        assert_eq!(
+            std::fs::read_dir(&root).unwrap().count(),
+            0,
+            "a rescan of an empty root must not write notes into the mount-point stub"
+        );
+        engine.stop().await.unwrap();
+    }
+
+    /// 60% of the seen notes vanish in one look: no tombstone, no restore (the
+    /// notes stay in the DocStore), and a notice that names the numbers.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sixty_percent_vanishing_at_once_is_suppressed() {
+        let (engine, _roost, _d) = setup_engine();
+        let notes = seen_roost(&engine, "", 40).await;
+        let root = engine.inner.roost.clone();
+        for note in &notes[..24] {
+            std::fs::remove_file(root.join(&note.0)).unwrap();
+        }
+        // A DocStore-only note the engine never saw on disk. On a normal rescan it
+        // would be restored; while suppressing, the rescan writes NOTHING.
+        let never_seen = NotePath("adopted-never-rendered.md".into());
+        seed_docstore_only(&engine, &never_seen, "from a peer").await;
+        let mut rx = engine.inner.events.subscribe();
+
+        engine.reconcile_watcher_overflow().await.unwrap();
+        assert_eq!(
+            engine.inner.tombstone_slots.available_permits(),
+            64,
+            "the rescan must not even schedule a verification"
+        );
+        engine.verify_then_tombstone(notes[0].clone()).await;
+        for note in &notes {
+            assert!(!is_tombstoned(&engine, note).await, "{note} was tombstoned");
+        }
+        assert!(
+            !root.join(&notes[0].0).exists(),
+            "suppression restores nothing: the notes stay in the DocStore for startup recovery"
+        );
+        assert!(
+            !root.join(&never_seen.0).exists(),
+            "a suppressing rescan must not restore a never-seen DocStore note either"
+        );
+        let events = drain_events(&mut rx);
+        let texts = notices(&events);
+        assert_eq!(texts.len(), 1, "{events:?}");
+        assert!(texts[0].contains("24 of 40"), "{}", texts[0]);
+        engine.stop().await.unwrap();
+    }
+
+    /// A small batch (10 of 60) is a real delete and still propagates, whichever
+    /// way it arrives (one verification per removal, or one rescan).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ten_deletes_still_propagate() {
+        let (engine, _roost, _d) = setup_engine();
+        let notes = seen_roost(&engine, "", 60).await;
+        let root = engine.inner.roost.clone();
+        for note in &notes[..10] {
+            std::fs::remove_file(root.join(&note.0)).unwrap();
+        }
+        for note in &notes[..10] {
+            engine.verify_then_tombstone(note.clone()).await;
+        }
+        for note in &notes[..10] {
+            assert!(
+                is_tombstoned(&engine, note).await,
+                "{note} must tombstone (10 deletes)"
+            );
+        }
+        assert!(!is_tombstoned(&engine, &notes[30]).await);
+        engine.stop().await.unwrap();
+    }
+
+    /// Rule 3: at most 20 inferred tombstones commit per minute, even when each
+    /// look on its own is unremarkable (25 of 60 is above the floor but under half,
+    /// so the proportion rule never fires). The 21st and later are refused, the
+    /// user is told once, and a rescan while the window is full writes nothing:
+    /// no tombstone and no restore.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_twenty_first_inferred_delete_within_a_minute_is_suppressed() {
+        let (engine, _roost, _d) = setup_engine();
+        let notes = seen_roost(&engine, "", 60).await;
+        let root = engine.inner.roost.clone();
+        for note in &notes[..25] {
+            std::fs::remove_file(root.join(&note.0)).unwrap();
+        }
+        let mut rx = engine.inner.events.subscribe();
+        for note in &notes[..25] {
+            engine.verify_then_tombstone(note.clone()).await;
+        }
+        let mut tombstoned = 0;
+        for note in &notes[..25] {
+            if is_tombstoned(&engine, note).await {
+                tombstoned += 1;
+            }
+        }
+        assert_eq!(tombstoned, 20, "exactly the 60 s budget may commit");
+        for note in &notes[..20] {
+            assert!(
+                is_tombstoned(&engine, note).await,
+                "{note}: within the budget"
+            );
+        }
+        for note in &notes[20..25] {
+            assert!(
+                !is_tombstoned(&engine, note).await,
+                "{note}: over the budget"
+            );
+        }
+        let events = drain_events(&mut rx);
+        assert_eq!(
+            notices(&events).len(),
+            1,
+            "one notice per minute: {events:?}"
+        );
+
+        // The window is full: a rescan refuses the delete candidates AND restores
+        // nothing (a never-seen DocStore note stays absent too).
+        let never_seen = NotePath("adopted-never-rendered.md".into());
+        seed_docstore_only(&engine, &never_seen, "from a peer").await;
+        engine.reconcile_watcher_overflow().await.unwrap();
+        assert_eq!(engine.inner.tombstone_slots.available_permits(), 64);
+        assert!(
+            !root.join(&never_seen.0).exists(),
+            "a rescan that suppresses must not restore"
+        );
+        engine.stop().await.unwrap();
+    }
+
+    /// A vanish that unfolds over minutes (a branch switch on an antivirus-scanned
+    /// disk) never shows more than a handful of notes missing in any one look, and
+    /// each removal is scheduled after the previous look. It is still cut off at
+    /// the budget: 100 notes vanish spread across the 2 s cache window, 20 commit.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_slow_vanish_across_the_cache_window_is_cut_off_at_twenty() {
+        let (engine, _roost, _d) = setup_engine();
+        let notes = seen_roost(&engine, "", 100).await;
+        let root = engine.inner.roost.clone();
+        for note in &notes {
+            std::fs::remove_file(root.join(&note.0)).unwrap();
+            // Each removal is scheduled just now: no earlier look may vouch for it.
+            engine.verify_then_tombstone(note.clone()).await;
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        let mut tombstoned = 0;
+        for note in &notes {
+            if is_tombstoned(&engine, note).await {
+                tombstoned += 1;
+            }
+        }
+        assert_eq!(
+            tombstoned, 20,
+            "a slow mass vanish must stop at the rolling budget, not reach peers"
+        );
+        engine.stop().await.unwrap();
+    }
+
+    /// The salami case: every look sees at most 15 notes missing, and the commit
+    /// of each batch forgets them from `DiskSeen`, so a per-look count resets
+    /// forever (gradual cloud eviction). The rolling counter does not reset.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn deleting_fifteen_per_look_over_and_over_is_cut_off() {
+        let (engine, _roost, _d) = setup_engine();
+        let notes = seen_roost(&engine, "", 200).await;
+        let root = engine.inner.roost.clone();
+        for round in 0..4 {
+            let batch = &notes[round * 15..(round + 1) * 15];
+            for note in batch {
+                std::fs::remove_file(root.join(&note.0)).unwrap();
+            }
+            for note in batch {
+                engine.verify_then_tombstone(note.clone()).await;
+            }
+        }
+        let mut tombstoned = 0;
+        for note in &notes[..60] {
+            if is_tombstoned(&engine, note).await {
+                tombstoned += 1;
+            }
+        }
+        assert_eq!(
+            tombstoned, 20,
+            "15 per look must not keep resetting the count: 60 removed, 20 allowed"
+        );
+        engine.stop().await.unwrap();
+    }
+
+    /// The reviewer's stale-allow hole: a look that found nothing missing is cached
+    /// as allow for 2 s, then a vanish begins. A removal scheduled AFTER that look
+    /// must not reuse it (the look never saw this vanish), only a removal that was
+    /// scheduled before it may.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_allow_look_older_than_the_removal_is_not_reused() {
+        let (engine, _roost, _d) = setup_engine();
+        let notes = seen_roost(&engine, "", 100).await;
+        let root = engine.inner.roost.clone();
+        // An early look: everything present, so Allow, cached.
+        let before_vanish = std::time::Instant::now();
+        assert!(engine.removal_verdict(before_vanish).await.is_allow());
+        // A mass vanish begins after that look.
+        for note in &notes[..60] {
+            std::fs::remove_file(root.join(&note.0)).unwrap();
+        }
+        // A removal scheduled AFTER the cached look: needs its own look, which sees
+        // 60 of 100 gone.
+        engine
+            .verify_then_tombstone_since(notes[0].clone(), std::time::Instant::now())
+            .await;
+        assert!(
+            !is_tombstoned(&engine, &notes[0]).await,
+            "a stale allow vouched for a removal it never saw"
+        );
+        engine.stop().await.unwrap();
+    }
+
+    /// A batch larger than the budget is refused WHOLE, never the first 20 and then
+    /// a gap: a rescan with 25 delete candidates schedules none; with 15 it
+    /// schedules all of them.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_rescan_batch_over_the_budget_is_refused_whole() {
+        let (engine, _roost, _d) = setup_engine();
+        let notes = seen_roost(&engine, "", 60).await;
+        let root = engine.inner.roost.clone();
+        for note in &notes[..25] {
+            std::fs::remove_file(root.join(&note.0)).unwrap();
+        }
+        let mut rx = engine.inner.events.subscribe();
+        engine.reconcile_watcher_overflow().await.unwrap();
+        assert_eq!(
+            engine.inner.tombstone_slots.available_permits(),
+            64,
+            "no candidate of an over-budget batch may be scheduled"
+        );
+        assert_eq!(notices(&drain_events(&mut rx)).len(), 1);
+        engine.stop().await.unwrap();
+
+        let (engine, _roost, _d) = setup_engine();
+        let notes = seen_roost(&engine, "", 60).await;
+        for note in &notes[..15] {
+            std::fs::remove_file(engine.inner.roost.join(&note.0)).unwrap();
+        }
+        engine.reconcile_watcher_overflow().await.unwrap();
+        assert_eq!(
+            engine.inner.tombstone_slots.available_permits(),
+            64 - 15,
+            "an in-budget batch is scheduled in full"
+        );
+        engine.stop().await.unwrap();
+    }
+
+    /// A folder removal covering more notes than the budget allows is refused
+    /// whole (25 of 65 is not a mass by proportion, so only the budget stops it).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_folder_removal_over_the_budget_is_refused_whole() {
+        let (engine, _roost, _d) = setup_engine();
+        let under = seen_roost(&engine, "dir/", 25).await;
+        seen_roost(&engine, "other/", 40).await;
+        std::fs::remove_dir_all(engine.inner.roost.join("dir")).unwrap();
+
+        engine.schedule_prefix_removal(NotePath("dir".into())).await;
+
+        assert_eq!(engine.inner.tombstone_slots.available_permits(), 64);
+        for note in &under {
+            assert!(!is_tombstoned(&engine, note).await, "{note} was tombstoned");
+        }
+        engine.stop().await.unwrap();
+    }
+
+    /// One note deleted (and a tiny roost emptied entirely: 5 of 5 is below the
+    /// floor of 20) are genuine deletes and propagate.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_single_or_tiny_roost_delete_still_propagates() {
+        let (engine, _roost, _d) = setup_engine();
+        let notes = seen_roost(&engine, "", 5).await;
+        let root = engine.inner.roost.clone();
+        std::fs::remove_file(root.join(&notes[0].0)).unwrap();
+        engine.verify_then_tombstone(notes[0].clone()).await;
+        assert!(
+            is_tombstoned(&engine, &notes[0]).await,
+            "one deleted note must tombstone"
+        );
+        // Now the rest: all five gone, still under the floor.
+        for note in &notes[1..] {
+            std::fs::remove_file(root.join(&note.0)).unwrap();
+        }
+        // A fresh look (the verdict is cached for 2 s).
+        engine.removal_verdict(std::time::Instant::now()).await;
+        for note in &notes[1..] {
+            engine.verify_then_tombstone(note.clone()).await;
+            assert!(
+                is_tombstoned(&engine, note).await,
+                "{note}: below the floor, must tombstone"
+            );
+        }
+        engine.stop().await.unwrap();
+    }
+
+    /// Entries a peer already deleted stay in `DiskSeen` and are missing from
+    /// disk by definition. They must not count as "vanished", or one real delete
+    /// would be suppressed after a peer cleared out a folder. The look also
+    /// cleans them out of the set.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn tombstoned_entries_are_not_counted_as_vanished() {
+        let (engine, _roost, _d) = setup_engine();
+        let live = seen_roost(&engine, "", 40).await;
+        let mut stale = Vec::new();
+        for i in 0..30 {
+            let note = NotePath(format!("peer-deleted-{i:02}.md"));
+            seed_tombstoned(&engine, &note).await;
+            engine.inner.disk_seen.mark(&note);
+            stale.push(note);
+        }
+        let root = engine.inner.roost.clone();
+        std::fs::remove_file(root.join(&live[0].0)).unwrap();
+
+        engine.verify_then_tombstone(live[0].clone()).await;
+
+        assert!(
+            is_tombstoned(&engine, &live[0]).await,
+            "31 missing, 30 of them already tombstones: one real delete must go through"
+        );
+        for note in &stale {
+            assert!(
+                !engine.inner.disk_seen.contains(note),
+                "{note} should be cleaned out"
+            );
+        }
+        engine.stop().await.unwrap();
+    }
+
+    /// A folder removal that empties most of the roost is not believed either.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn folder_removal_that_empties_the_roost_is_suppressed() {
+        let (engine, _roost, _d) = setup_engine();
+        let under = seen_roost(&engine, "dir/", 30).await;
+        seen_roost(&engine, "other/", 5).await;
+        let root = engine.inner.roost.clone();
+        std::fs::remove_dir_all(root.join("dir")).unwrap();
+
+        engine.schedule_prefix_removal(NotePath("dir".into())).await;
+
+        assert_eq!(engine.inner.tombstone_slots.available_permits(), 64);
+        engine.verify_then_tombstone(under[0].clone()).await;
+        for note in &under {
+            assert!(!is_tombstoned(&engine, note).await, "{note} was tombstoned");
+        }
+        engine.stop().await.unwrap();
+    }
+
+    // ── IP-12: an inferred delete announces NoteDeleted ───────────────────
+
+    /// External delete while sync is on: the index watcher is inert, so the
+    /// engine is the only thing that can tell the graph / search / edit history
+    /// the note is gone. It must say so once, at the locked commit, and not at all
+    /// for a note whose file is still there.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_inferred_delete_emits_note_deleted_exactly_once() {
+        let (engine, roost, _d) = setup_engine();
+        let gone = NotePath("really-gone.md".into());
+        let kept = NotePath("still-here.md".into());
+        engine.notify_local_write(gone.clone(), "bye".into()).await;
+        engine.notify_local_write(kept.clone(), "stay".into()).await;
+        std::fs::remove_file(roost.path().join("test-roost/really-gone.md")).unwrap();
+        let mut rx = engine.inner.events.subscribe();
+
+        engine.verify_then_tombstone(gone.clone()).await;
+        engine.verify_then_tombstone(gone.clone()).await; // the watcher's double fire
+        engine.verify_then_tombstone(kept.clone()).await; // file present: transient event
+
+        let events = drain_events(&mut rx);
+        let deleted: Vec<&String> = events
+            .iter()
+            .filter_map(|ev| match ev {
+                SyncEvent::NoteDeleted { path } => Some(path),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            deleted,
+            vec![&gone.0],
+            "NoteDeleted exactly once, only for the real delete: {events:?}"
+        );
+        assert!(is_tombstoned(&engine, &gone).await);
+        assert!(!is_tombstoned(&engine, &kept).await);
+        engine.stop().await.unwrap();
+    }
+
+    /// The same through the rescan path (watcher overflow): the note really
+    /// deleted is announced too.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_overflow_rescan_delete_emits_note_deleted() {
+        let (engine, _roost, _d) = setup_engine();
+        let notes = seen_roost(&engine, "", 3).await;
+        std::fs::remove_file(engine.inner.roost.join(&notes[1].0)).unwrap();
+        let mut rx = engine.inner.events.subscribe();
+
+        engine.reconcile_watcher_overflow().await.unwrap();
+        let waited = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if is_tombstoned(&engine, &notes[1]).await {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        assert!(waited.is_ok(), "the delete must still propagate");
+
+        let events = drain_events(&mut rx);
+        assert!(
+            events
+                .iter()
+                .any(|ev| matches!(ev, SyncEvent::NoteDeleted { path } if *path == notes[1].0)),
+            "NoteDeleted missing: {events:?}"
+        );
+        engine.stop().await.unwrap();
+    }
+
+    // ── CL-6: simultaneous dial ───────────────────────────────────────────
+
+    async fn register_conn(engine: &SyncEngine, handle: PeerHandle) {
+        let task = tokio::spawn(std::future::pending::<SyncResult<()>>());
+        engine.register_peer(handle, task).await;
+    }
+
+    /// Register a connection dialed (or accepted) first, then the opposite one,
+    /// and return which survived plus what each channel was told.
+    async fn simultaneous_dial_case(peer_is_higher: bool, first_dialed_by_us: bool) {
+        use crate::sync::engine::peer::PeerControl;
+        let (engine, _v, _d) = setup_engine();
+        // Extreme ids make our own (random) id lower or higher than the peer's.
+        let peer = if peer_is_higher {
+            DeviceId([0xff; 16])
+        } else {
+            DeviceId([0x00; 16])
+        };
+        // Both ends keep the connection dialed by the LOWER id: when the peer's id
+        // is higher, that is the one we dialed.
+        let keep_dialed = peer_is_higher;
+        let case =
+            format!("peer_is_higher={peer_is_higher} first_dialed_by_us={first_dialed_by_us}");
+        let now = std::time::Instant::now();
+        let (first, mut first_rx) = fake_conn(peer, first_dialed_by_us, now);
+        let (second, mut second_rx) =
+            fake_conn(peer, !first_dialed_by_us, now + Duration::from_millis(50));
+
+        register_conn(&engine, first).await;
+        register_conn(&engine, second).await;
+
+        let kept_dialed = engine
+            .inner
+            .peers
+            .read()
+            .await
+            .get(&peer)
+            .map(|h| h.dialed_by_us)
+            .expect("a connection must survive");
+        assert_eq!(kept_dialed, keep_dialed, "wrong connection kept ({case})");
+        let first_wins = first_dialed_by_us == keep_dialed;
+        let (winner_rx, loser_rx) = if first_wins {
+            (&mut first_rx, &mut second_rx)
+        } else {
+            (&mut second_rx, &mut first_rx)
+        };
+        assert!(
+            matches!(loser_rx.try_recv(), Ok(PeerControl::Shutdown)),
+            "the duplicate must get a Bye ({case})"
+        );
+        assert!(
+            winner_rx.try_recv().is_err(),
+            "the kept connection must be left alone ({case})"
+        );
+        engine.stop().await.unwrap();
+    }
+
+    /// Both registration orders, on both sides of the id comparison.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn simultaneous_dial_keeps_the_connection_dialed_by_the_lower_id() {
+        for peer_is_higher in [true, false] {
+            for first_dialed_by_us in [true, false] {
+                simultaneous_dial_case(peer_is_higher, first_dialed_by_us).await;
+            }
+        }
+    }
+
+    /// The rule must pick the SAME connection on both ends, whatever order each
+    /// end registers in: that is what stops each end closing the other's choice.
+    #[test]
+    fn both_ends_keep_the_same_connection() {
+        let (low, high) = (DeviceId([0x01; 16]), DeviceId([0xfe; 16]));
+        let now = std::time::Instant::now();
+        // conn 1 is dialed by `low`, conn 2 by `high`.
+        let view = |ours: DeviceId, order: [u8; 2]| -> u8 {
+            let handle = |conn: u8| {
+                let dialer_is_us = (conn == 1) == (ours == low);
+                let peer = if ours == low { high } else { low };
+                fake_conn(
+                    peer,
+                    dialer_is_us,
+                    now + Duration::from_millis(u64::from(conn)),
+                )
+            };
+            // Keep the receivers alive: a dropped receiver closes the channel, and
+            // a closed connection is never tie-broken.
+            let ((existing, _existing_rx), (new, _new_rx)) = (handle(order[0]), handle(order[1]));
+            match resolve_simultaneous_dial(ours, &existing, &new) {
+                SimultaneousDial::NewWins => order[1],
+                SimultaneousDial::NewLoses => order[0],
+                SimultaneousDial::NotApplicable => panic!("must resolve"),
+            }
+        };
+        for low_order in [[1, 2], [2, 1]] {
+            for high_order in [[1, 2], [2, 1]] {
+                let on_low = view(low, low_order);
+                let on_high = view(high, high_order);
+                assert_eq!(
+                    on_low, on_high,
+                    "ends disagree ({low_order:?} / {high_order:?})"
+                );
+                assert_eq!(on_low, 1, "the connection dialed by the lower id must win");
+            }
+        }
+    }
+
+    /// Not a simultaneous dial, so a plain replace exactly as before: the same
+    /// direction, a dead existing connection, or one much older than the new one.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn only_a_real_simultaneous_dial_uses_the_tie_break() {
+        use crate::sync::engine::peer::PeerControl;
+        let peer = DeviceId([0xff; 16]); // we are lower: the tie-break keeps OUR dial
+        let now = std::time::Instant::now();
+
+        // Same direction: the new one replaces the old; the old is not Bye'd here.
+        let (engine, _v, _d) = setup_engine();
+        let (old, mut old_rx) = fake_conn(peer, false, now);
+        let (new, _new_rx) = fake_conn(peer, false, now);
+        register_conn(&engine, old).await;
+        register_conn(&engine, new).await;
+        assert!(
+            !matches!(old_rx.try_recv(), Ok(PeerControl::Shutdown)),
+            "same-direction replace must stay a plain replace"
+        );
+        engine.stop().await.unwrap();
+
+        // A dead existing connection: the (otherwise losing) new one is kept.
+        let (engine, _v, _d) = setup_engine();
+        let (old, old_rx) = fake_conn(peer, true, now);
+        drop(old_rx); // closes the channel
+        let (new, _new_rx) = fake_conn(peer, false, now);
+        register_conn(&engine, old).await;
+        register_conn(&engine, new).await;
+        assert!(
+            !engine
+                .inner
+                .peers
+                .read()
+                .await
+                .get(&peer)
+                .unwrap()
+                .dialed_by_us,
+            "a closed connection never wins a tie-break"
+        );
+        engine.stop().await.unwrap();
+
+        // A stale existing connection: a fresh connect replaces it as before.
+        let (engine, _v, _d) = setup_engine();
+        let (old, _old_rx) = fake_conn(peer, true, now);
+        let (new, _new_rx) = fake_conn(peer, false, now + Duration::from_secs(60));
+        register_conn(&engine, old).await;
+        register_conn(&engine, new).await;
+        assert!(
+            !engine
+                .inner
+                .peers
+                .read()
+                .await
+                .get(&peer)
+                .unwrap()
+                .dialed_by_us,
+            "a connection long past the window is replaced, not tie-broken"
+        );
+        engine.stop().await.unwrap();
     }
 
     /// `recover_missing_files` must RESTORE a legitimately-empty note (whose

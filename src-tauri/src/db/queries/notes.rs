@@ -1,14 +1,14 @@
 //! Note-relation queries and indexing. `LinkResolver` lives here because
-//! it's built from one full scan of `notes{id}` and used immediately by
-//! `index_note_pass2` — splitting them across files would just create a
-//! circular-feeling dependency.
+//! it's built from one full scan of `notes{id}` and used immediately by the
+//! per-note index (`index_note_full_with_resolver`) — splitting them across
+//! files would just create a circular-feeling dependency.
 
 use cozo::{DataValue, DbInstance, ScriptMutability};
 use std::collections::{BTreeMap, HashMap};
 
 use crate::parser::checkboxes::parse_tasks_in_note;
 use crate::parser::links::parse_links;
-use crate::parser::tags::parse_tags;
+use crate::parser::tags::{fold_tag, parse_tags, TagIdentities};
 
 use super::path::{note_id_from_abs_path, note_rel_dir, shared_dir_prefix, title_from_path};
 use super::types::NoteIndexEntry;
@@ -111,42 +111,105 @@ pub fn lookup_notes_by_ids(db: &DbInstance, ids: &[String]) -> Result<Vec<NoteIn
 /// fragment the knowledge graph with synonym/singleton noise — see
 /// `bundle.rs` rule about tag reuse).
 ///
-/// Returns `(tag, count)` rows. Caller decides cap/formatting. We cap
-/// inside the query so a roost with 5K unique tags doesn't ship the
-/// whole tail to the LLM.
+/// Returns `(tag, count)` rows — one per tag IDENTITY (LR-6): `#ML` and `#ml`
+/// are one tag, counted once per NOTE, shown under their most-used stored
+/// spelling. Stored rows stay verbatim; the fold happens here, so a graph.db
+/// from before this rule and one from after it group identically. Caller
+/// decides cap/formatting; we cap to `limit` so a roost with 5K unique tags
+/// doesn't ship the whole tail to the LLM.
 pub fn top_tags(db: &DbInstance, limit: usize) -> Result<Vec<(String, usize)>, String> {
-    let script = r#"
-        ?[tag, count(note_id)] := *tags{ note_id, tag }
-        :order -count(note_id)
-        :limit $limit
-    "#;
-    let mut params = BTreeMap::new();
-    params.insert(
-        "limit".to_string(),
-        DataValue::Num(cozo::Num::Int(limit as i64)),
-    );
+    // Per-SPELLING note counts: a Cozo aggregate, so the output is
+    // O(distinct spellings), never O(rows) — this runs on every chat send.
     let result = db
-        .run_script(script, params, ScriptMutability::Immutable)
+        .run_script(
+            r#"?[tag, count(note_id)] := *tags{ note_id, tag }"#,
+            BTreeMap::new(),
+            ScriptMutability::Immutable,
+        )
         .map_err(|e| format!("top_tags query failed: {e}"))?;
 
-    let mut out = Vec::with_capacity(result.rows.len());
+    let mut identities = TagIdentities::default();
+    // key → (summed per-spelling counts, the spellings that fold to it)
+    let mut groups: HashMap<String, (usize, Vec<String>)> = HashMap::new();
     for row in result.rows.iter() {
         if row.len() >= 2 {
             if let (Some(tag), Some(count)) = (
                 row[0].get_str().map(String::from),
                 row[1].get_int().map(|n| n as usize),
             ) {
-                out.push((tag, count));
+                let key = identities.add(&tag, count);
+                let group = groups.entry(key).or_default();
+                group.0 += count;
+                group.1.push(tag);
             }
         }
     }
+
+    // A note carrying two spellings of one tag (`#ML` and `#ml`) is counted by
+    // each spelling above. Recount ONLY the colliding identities by distinct
+    // note — the common case (no collisions) costs nothing extra.
+    let colliding: Vec<&String> = groups
+        .values()
+        .filter(|(_, spellings)| spellings.len() > 1)
+        .flat_map(|(_, spellings)| spellings.iter())
+        .collect();
+    if !colliding.is_empty() {
+        let mut params = BTreeMap::new();
+        params.insert(
+            "spellings".to_string(),
+            DataValue::List(
+                colliding
+                    .iter()
+                    .map(|s| DataValue::Str((*s).as_str().into()))
+                    .collect(),
+            ),
+        );
+        let rows = db
+            .run_script(
+                r#"?[tag, note_id] := *tags{ note_id, tag }, is_in(tag, $spellings)"#,
+                params,
+                ScriptMutability::Immutable,
+            )
+            .map_err(|e| format!("top_tags collision recount failed: {e}"))?;
+        let mut notes_by_key: HashMap<String, std::collections::HashSet<String>> = HashMap::new();
+        for row in rows.rows.iter() {
+            if let (Some(tag), Some(note_id)) = (
+                row.first().and_then(|v| v.get_str()),
+                row.get(1).and_then(|v| v.get_str()),
+            ) {
+                notes_by_key
+                    .entry(fold_tag(tag))
+                    .or_default()
+                    .insert(note_id.to_string());
+            }
+        }
+        for (key, notes) in notes_by_key {
+            if let Some(group) = groups.get_mut(&key) {
+                group.0 = notes.len();
+            }
+        }
+    }
+
+    let mut out: Vec<(String, usize)> = groups
+        .into_iter()
+        .map(|(key, (count, _))| {
+            let display = identities.display(&key).unwrap_or(&key).to_string();
+            (display, count)
+        })
+        .collect();
+    // Count desc; ties by spelling so the inventory is deterministic.
+    out.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    out.truncate(limit);
     Ok(out)
 }
 
-/// All distinct tag names currently indexed in the roost. Used by
-/// write-tool validation to reject tags the agent invented out of
-/// thin air — see `roost_write::execute`. Cheaper than `top_tags`
-/// when the caller only needs membership, not ranking.
+/// All distinct tag spellings currently stored in the roost — VERBATIM, so a
+/// roost holding `#ML` and `#ml` returns both. Used by write-tool validation to
+/// reject tags the agent invented out of thin air (`roost_write`,
+/// `roost_edit`). Callers MUST compare through [`fold_tag`] (build the lookup
+/// set with `known.iter().map(|t| fold_tag(t))`), never by exact string —
+/// exact comparison was the LR-6 gap. Cheaper than `top_tags` when the caller
+/// only needs membership, not ranking.
 pub fn all_tag_names(db: &DbInstance) -> Result<std::collections::HashSet<String>, String> {
     let script = r#"
         ?[tag] := *tags{ tag }
@@ -430,10 +493,15 @@ impl LinkResolver {
         }
     }
 
-    /// Remove a note id from the cache. Idempotent. Called by future
-    /// delete/rename code paths so the resolver doesn't keep ghost ids
-    /// around that resolve to nothing on disk.
-    #[allow(dead_code)] // wired up in Phase 0.5 (delete/rename invalidation)
+    /// Is this note id in the cache?
+    pub fn contains_id(&self, id: &str) -> bool {
+        self.id_set.contains(id)
+    }
+
+    /// Remove a note id from the cache. Idempotent. Used to roll back an
+    /// `add_id` when the index transaction that was meant to create the note
+    /// failed, so the resolver never advertises a ghost id that resolves to
+    /// nothing in the graph.
     pub fn remove_id(&mut self, id: &str) {
         if self.id_set.remove(id) {
             let basename = Self::basename_of(id);
@@ -488,137 +556,270 @@ fn now_secs() -> f64 {
         .as_secs_f64()
 }
 
-/// Pass 1 of indexing: upsert the note row and replace its tag set. Does
-/// NOT touch the links relation — link edges need the full roost index
-/// to resolve correctly.
-pub fn index_note_pass1(
-    db: &DbInstance,
-    roost_root: &str,
-    abs_path: &str,
-    content: &str,
-) -> Result<(), String> {
-    let id = note_id_from_abs_path(abs_path, roost_root);
-    let title = title_from_path(abs_path);
-    // IP-A2: prefer the file's mtime so ordering by `updated_at` reflects real
-    // edit time and survives a cold rebuild; fall back to now() on backends we
-    // can't stat (SAF).
-    let updated_at = file_mtime_secs(abs_path).unwrap_or_else(now_secs);
+// ── Atomic single-note indexing (DB-4) ──────────────────────────────────────
+//
+// A note's derived rows live in five relations: `notes` (carries the mtime
+// stamp the warm heal keys on), `tags`, `task`, `links`, `dangling`. They used
+// to be written by 5–9 SEPARATE `run_script` calls, and on the SQLite backend
+// every call is its own `begin; … commit;`. The `notes` row with the NEW mtime
+// was written FIRST, so a crash / power loss mid-save left the note with
+// stale-or-missing links and tags AND an up-to-date stamp — and the warm heal
+// (`reconcile_added_and_modified_notes`: file mtime > stored `updated_at`)
+// then saw "nothing to do" and skipped it until the note was next edited.
+//
+// Fix: every relation write for one note — the note row + stamp, tags, tasks,
+// links, dangling rows, and the dangling→link promotions a brand-new note
+// triggers — is staged into ONE multi-block CozoScript (`{…} {…}`) and run as
+// a single write transaction. Cozo runs an imperative script inside one
+// `SessionTx`; on SQLite that is one `begin;` … `commit;`, a failed block
+// returns before the commit and the drop rolls back, and a crash leaves the
+// pre-image (SQLite journal/WAL recovery). So the note is either fully old
+// (stamp included → the heal re-detects it) or fully new — never torn.
 
-    let mut params = BTreeMap::new();
-    params.insert("id".to_string(), DataValue::Str(id.clone().into()));
-    params.insert("title".to_string(), DataValue::Str(title.into()));
-    params.insert(
-        "path".to_string(),
-        DataValue::Str(abs_path.to_string().into()),
-    );
-    params.insert("updated_at".to_string(), DataValue::from(updated_at));
-    db.run_script(
-        r#"?[id, title, path, updated_at] <- [[$id, $title, $path, $updated_at]]
-           :put notes { id => title, path, updated_at }"#,
-        params,
-        ScriptMutability::Mutable,
-    )
-    .map_err(|e| format!("Failed to upsert note: {e}"))?;
-
-    // Replace tag set for this note.
-    let mut params = BTreeMap::new();
-    params.insert("note_id".to_string(), DataValue::Str(id.clone().into()));
-    db.run_script(
-        r#"?[note_id, tag] := *tags{ note_id, tag }, note_id == $note_id
-           :rm tags { note_id, tag }"#,
-        params,
-        ScriptMutability::Mutable,
-    )
-    .map_err(|e| format!("Failed to clear tags: {e}"))?;
-
-    // Batch insert all tags in a single script — mirrors the bulk path
-    // in `bulk_index_pass1`. The previous per-tag loop was 1+N
-    // run_script calls under the global Mutex; on a note with 15 tags
-    // that's 15 SQLite auto-commits per save.
-    let parsed_tags = parse_tags(content.to_string());
-    if !parsed_tags.is_empty() {
-        let tag_rows: Vec<DataValue> = parsed_tags
-            .into_iter()
-            .map(|tag| {
-                DataValue::List(vec![
-                    DataValue::Str(id.clone().into()),
-                    DataValue::Str(tag.tag.into()),
-                ])
-            })
-            .collect();
-        let mut params = BTreeMap::new();
-        params.insert("rows".to_string(), DataValue::List(tag_rows));
-        db.run_script(
-            r#"?[note_id, tag] <- $rows
-               :put tags { note_id, tag }"#,
-            params,
-            ScriptMutability::Mutable,
-        )
-        .map_err(|e| format!("Failed to insert tags: {e}"))?;
-    }
-
-    // Tasks are derived from the same content. Doing this in pass1 (not pass2)
-    // keeps the per-save cost low — no resolver build needed; tasks are
-    // single-note. The pane reads `:task` rows directly with no JOIN to
-    // `links` for the basic groupings.
-    index_note_tasks(db, &id, content)?;
-
-    Ok(())
+/// An ordered list of CozoScript blocks executed as ONE transaction. Blocks are
+/// static text; row sets are passed as `$params` so nothing user-controlled is
+/// ever spliced into the script.
+struct TxScript {
+    blocks: Vec<&'static str>,
+    params: BTreeMap<String, DataValue>,
 }
 
-/// Pass 2 of indexing: resolve wiki-links against the supplied
-/// `LinkResolver` and replace this note's outgoing edges.
-pub fn index_note_pass2(
-    db: &DbInstance,
-    roost_root: &str,
-    abs_path: &str,
+impl TxScript {
+    fn new() -> Self {
+        Self {
+            blocks: Vec::new(),
+            params: BTreeMap::new(),
+        }
+    }
+
+    /// Script scoped to one note: binds `$id` (the canonical note id) for the
+    /// per-note `:rm` blocks.
+    fn for_note(note_id: &str) -> Self {
+        let mut tx = Self::new();
+        tx.param("id", DataValue::Str(note_id.into()));
+        tx
+    }
+
+    fn block(&mut self, body: &'static str) {
+        self.blocks.push(body);
+    }
+
+    fn param(&mut self, name: &str, value: DataValue) {
+        self.params.insert(name.to_string(), value);
+    }
+
+    /// Run every staged block in one write transaction. An empty script is a
+    /// no-op.
+    fn run(self, db: &DbInstance) -> Result<(), String> {
+        if self.blocks.is_empty() {
+            return Ok(());
+        }
+        let mut script = String::new();
+        for body in &self.blocks {
+            script.push_str("{\n");
+            script.push_str(body);
+            script.push_str("\n}\n");
+        }
+        // Test-only fail-point: a final block that errors AT RUNTIME, after
+        // every staged write has already executed inside the transaction —
+        // the shape of a crash between statements.
+        #[cfg(test)]
+        if tx_fail_point::armed() {
+            script.push_str(tx_fail_point::POISON_BLOCK);
+        }
+        db.run_script(&script, self.params, ScriptMutability::Mutable)
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod tx_fail_point {
+    //! Thread-local fail-point for [`TxScript::run`]. While a [`Guard`] is
+    //! alive on this thread, every transactional index write gets a trailing
+    //! block that fails at runtime (a `:put` of a non-Float into a Float
+    //! column), so the whole transaction must roll back. Thread-local so
+    //! parallel tests never see each other's fail-point.
+    use std::cell::Cell;
+
+    thread_local! {
+        static ARMED: Cell<bool> = const { Cell::new(false) };
+        static POST_COMMIT_ARMED: Cell<bool> = const { Cell::new(false) };
+    }
+
+    pub(super) const POISON_BLOCK: &str = r#"{
+?[id, title, path, updated_at] <- [["__fail_point__", "t", "p", "not-a-float"]]
+:put notes { id => title, path, updated_at }
+}
+"#;
+
+    pub(super) fn armed() -> bool {
+        ARMED.with(Cell::get)
+    }
+
+    pub(super) fn post_commit_armed() -> bool {
+        POST_COMMIT_ARMED.with(Cell::get)
+    }
+
+    pub(crate) struct Guard;
+
+    impl Guard {
+        pub(crate) fn arm() -> Self {
+            ARMED.with(|a| a.set(true));
+            Guard
+        }
+    }
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            ARMED.with(|a| a.set(false));
+        }
+    }
+
+    /// Fail-point AFTER the commit: the index transaction succeeds, then the
+    /// post-commit measurement reads fail. Proves a committed index never
+    /// reports `Err` and that callers drop (not trust) their caches.
+    pub(crate) struct PostCommitGuard;
+
+    impl PostCommitGuard {
+        pub(crate) fn arm() -> Self {
+            POST_COMMIT_ARMED.with(|a| a.set(true));
+            PostCommitGuard
+        }
+    }
+
+    impl Drop for PostCommitGuard {
+        fn drop(&mut self) {
+            POST_COMMIT_ARMED.with(|a| a.set(false));
+        }
+    }
+}
+
+// Per-note blocks. Row lookups use `x = $id, *rel{ x, .. }` (a constant
+// unification joined into the relation's KEY PREFIX) — NOT `*rel{ x, .. },
+// x == $id`, which Cozo plans as a filter over a FULL relation scan. The
+// difference is O(this note) vs O(whole roost) on every save.
+const B_PUT_NOTE: &str = r#"?[id, title, path, updated_at] <- [[$id, $title, $path, $updated_at]]
+:put notes { id => title, path, updated_at }"#;
+const B_RM_TAGS: &str = r#"?[note_id, tag] := note_id = $id, *tags{ note_id, tag }
+:rm tags { note_id, tag }"#;
+const B_PUT_TAGS: &str = r#"?[note_id, tag] <- $tag_rows
+:put tags { note_id, tag }"#;
+const B_RM_TASKS: &str = r#"?[note_id, source_line] := note_id = $id, *task{ note_id, source_line }
+:rm task { note_id, source_line }"#;
+const B_PUT_TASKS: &str = r#"?[note_id, source_line, text, content_anchor, due_at, completed, completed_at, linked_person, linked_project, updated_at] <- $task_rows
+:put task { note_id, source_line => text, content_anchor, due_at, completed, completed_at, linked_person, linked_project, updated_at }"#;
+const B_RM_LINKS: &str = r#"?[from_id, to_id] := from_id = $id, *links{ from_id, to_id }
+:rm links { from_id, to_id }"#;
+const B_RM_DANGLING: &str = r#"?[from_id, target] := from_id = $id, *dangling{ from_id, target }
+:rm dangling { from_id, target }"#;
+const B_PUT_LINKS: &str = r#"?[from_id, to_id, link_text] <- $link_rows
+:put links { from_id, to_id => link_text }"#;
+const B_PUT_DANGLING: &str = r#"?[from_id, target, link_text, target_base] <- $dangling_rows
+:put dangling { from_id, target => link_text, target_base }"#;
+const B_PROMOTE_PUT_LINKS: &str = r#"?[from_id, to_id, link_text] <- $promo_links
+:put links { from_id, to_id => link_text }"#;
+const B_PROMOTE_RM_DANGLING: &str = r#"?[from_id, target] <- $promo_dangling
+:rm dangling { from_id, target }"#;
+
+/// Stage the note row. `updated_at` is the stamp the warm heal compares against
+/// the file mtime — it commits atomically with every other row of this note.
+fn stage_note_row(tx: &mut TxScript, title: &str, abs_path: &str, updated_at: f64) {
+    tx.param("title", DataValue::Str(title.into()));
+    tx.param("path", DataValue::Str(abs_path.into()));
+    tx.param("updated_at", DataValue::from(updated_at));
+    tx.block(B_PUT_NOTE);
+}
+
+/// Stage "replace this note's tag set" (clear + insert).
+fn stage_tags(tx: &mut TxScript, note_id: &str, content: &str) {
+    tx.block(B_RM_TAGS);
+    let tag_rows: Vec<DataValue> = parse_tags(content.to_string())
+        .into_iter()
+        .map(|tag| {
+            DataValue::List(vec![
+                DataValue::Str(note_id.into()),
+                DataValue::Str(tag.tag.into()),
+            ])
+        })
+        .collect();
+    if !tag_rows.is_empty() {
+        tx.param("tag_rows", DataValue::List(tag_rows));
+        tx.block(B_PUT_TAGS);
+    }
+}
+
+/// Stage "replace this note's `:task` rows" (clear + insert). Tasks are derived
+/// from the same content as tags — single-note, no resolver needed.
+fn stage_tasks(tx: &mut TxScript, note_id: &str, content: &str) {
+    tx.block(B_RM_TASKS);
+
+    // Convention 0.3: a checkbox is a task only with an effective date. Feed
+    // the note's own date (daily-note stem; frontmatter `date:` wins inside
+    // the parser) and today so dated/daily-note checkboxes and lone-⏰ lines
+    // resolve correctly.
+    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+    let note_date = note_date_from_id(note_id);
+    let parsed = parse_tasks_in_note(content, note_date.as_deref(), Some(&today));
+    if parsed.is_empty() {
+        return;
+    }
+    let now = now_secs();
+    let rows: Vec<DataValue> = parsed
+        .into_iter()
+        .map(|task| {
+            DataValue::List(vec![
+                DataValue::Str(note_id.into()),
+                DataValue::Num(cozo::Num::Int(task.source_line as i64)),
+                DataValue::Str(task.text.into()),
+                DataValue::Str(task.content_anchor.into()),
+                DataValue::Str(task.due_at.into()),
+                DataValue::Bool(task.completed),
+                DataValue::Str(task.completed_at.into()),
+                DataValue::Str(task.linked_person.into()),
+                DataValue::Str(task.linked_project.into()),
+                DataValue::from(now),
+            ])
+        })
+        .collect();
+    tx.param("task_rows", DataValue::List(rows));
+    tx.block(B_PUT_TASKS);
+}
+
+/// Stage "replace this note's outgoing edges": clear its old links AND its old
+/// dangling (unresolved) links — both sets are recomputed — then insert the
+/// freshly resolved ones. Clearing dangling matters because a link that
+/// previously had no target may now resolve (its target was created), so its
+/// stale dangling row must go.
+///
+/// Resolved → a real `:links` edge. Unresolved → a `:dangling` row (instead of
+/// being silently dropped), so when the target note is later created,
+/// promotion turns it into a real edge immediately rather than waiting for THIS
+/// note to be re-saved.
+fn stage_links(
+    tx: &mut TxScript,
+    note_id: &str,
+    rel_dir: &str,
     content: &str,
     resolver: &LinkResolver,
-) -> Result<(), String> {
-    let id = note_id_from_abs_path(abs_path, roost_root);
-    let rel_dir = note_rel_dir(abs_path, roost_root);
+) {
+    tx.block(B_RM_LINKS);
+    tx.block(B_RM_DANGLING);
 
-    // Clear this note's old links AND its old dangling (unresolved) links —
-    // both sets are recomputed below. Clearing dangling matters because a
-    // link that previously had no target may now resolve (its target was
-    // created), so its stale dangling row must go.
-    let mut params = BTreeMap::new();
-    params.insert("from_id".to_string(), DataValue::Str(id.clone().into()));
-    db.run_script(
-        r#"?[from_id, to_id] := *links{ from_id, to_id }, from_id == $from_id
-           :rm links { from_id, to_id }"#,
-        params,
-        ScriptMutability::Mutable,
-    )
-    .map_err(|e| format!("Failed to clear links: {e}"))?;
-    let mut params = BTreeMap::new();
-    params.insert("from_id".to_string(), DataValue::Str(id.clone().into()));
-    db.run_script(
-        r#"?[from_id, target] := *dangling{ from_id, target }, from_id == $from_id
-           :rm dangling { from_id, target }"#,
-        params,
-        ScriptMutability::Mutable,
-    )
-    .map_err(|e| format!("Failed to clear dangling links: {e}"))?;
-
-    // Resolve each wiki-link. Resolved → a real `:links` edge. Unresolved →
-    // a `:dangling` row (instead of being silently dropped), so when the
-    // target note is later created, `promote_dangling_links` turns it into a
-    // real edge immediately rather than waiting for THIS note to be re-saved.
     let mut link_rows: Vec<DataValue> = Vec::new();
     let mut dangling_rows: Vec<DataValue> = Vec::new();
     for link in parse_links(content.to_string()) {
         let link_text = link.display.as_deref().unwrap_or(&link.target).to_string();
-        match resolver.resolve(&link.target, &rel_dir) {
+        match resolver.resolve(&link.target, rel_dir) {
             Some(to_id) => link_rows.push(DataValue::List(vec![
-                DataValue::Str(id.clone().into()),
+                DataValue::Str(note_id.into()),
                 DataValue::Str(to_id.into()),
                 DataValue::Str(link_text.into()),
             ])),
             None => {
                 if let Some((target, base)) = dangling_key(&link.target) {
                     dangling_rows.push(DataValue::List(vec![
-                        DataValue::Str(id.clone().into()),
+                        DataValue::Str(note_id.into()),
                         DataValue::Str(target.into()),
                         DataValue::Str(link_text.into()),
                         DataValue::Str(base.into()),
@@ -627,94 +828,271 @@ pub fn index_note_pass2(
             }
         }
     }
-
     if !link_rows.is_empty() {
-        let mut params = BTreeMap::new();
-        params.insert("rows".to_string(), DataValue::List(link_rows));
-        db.run_script(
-            r#"?[from_id, to_id, link_text] <- $rows
-               :put links { from_id, to_id => link_text }"#,
-            params,
-            ScriptMutability::Mutable,
-        )
-        .map_err(|e| format!("Failed to insert links: {e}"))?;
+        tx.param("link_rows", DataValue::List(link_rows));
+        tx.block(B_PUT_LINKS);
     }
-
     if !dangling_rows.is_empty() {
-        let mut params = BTreeMap::new();
-        params.insert("rows".to_string(), DataValue::List(dangling_rows));
-        db.run_script(
-            r#"?[from_id, target, link_text, target_base] <- $rows
-               :put dangling { from_id, target => link_text, target_base }"#,
-            params,
-            ScriptMutability::Mutable,
-        )
-        .map_err(|e| format!("Failed to insert dangling links: {e}"))?;
+        tx.param("dangling_rows", DataValue::List(dangling_rows));
+        tx.block(B_PUT_DANGLING);
     }
-
-    Ok(())
 }
 
-/// IP-8: full single-note (re)index — the two-pass sequence plus dangling
-/// promotion that the editor save runs, packaged for the auxiliary write
-/// paths (AI roost/task edits, in-app quick-add, history revert). Those paths
-/// previously called `index_note_pass1` ALONE, so a `[[link]]` they wrote
-/// never became an edge (pass2 never ran) and any note waiting on this one as
-/// a dangling target never got promoted — the links stayed invisible until
-/// the note was next saved through the editor.
+/// Does this note id have a row in `notes`? Key lookup — O(1), unlike
+/// [`lookup_note_id_by_path`] (path is not a key → full scan).
+fn note_exists(db: &DbInstance, note_id: &str) -> Result<bool, String> {
+    let mut params = BTreeMap::new();
+    params.insert("id".to_string(), DataValue::Str(note_id.into()));
+    let res = db
+        .run_script(
+            r#"?[title] := *notes{ id: $id, title }"#,
+            params,
+            ScriptMutability::Immutable,
+        )
+        .map_err(|e| format!("note existence lookup failed: {e}"))?;
+    Ok(!res.rows.is_empty())
+}
+
+/// Resolved outgoing link targets of one note (one entry per `:links` row).
+/// Key-prefix lookup — O(this note's links).
+fn note_link_targets(db: &DbInstance, note_id: &str) -> Result<Vec<String>, String> {
+    let mut params = BTreeMap::new();
+    params.insert("id".to_string(), DataValue::Str(note_id.into()));
+    let res = db
+        .run_script(
+            r#"?[to_id] := *links{ from_id: $id, to_id }"#,
+            params,
+            ScriptMutability::Immutable,
+        )
+        .map_err(|e| format!("note link lookup failed: {e}"))?;
+    Ok(res
+        .rows
+        .iter()
+        .filter_map(|r| r.first().and_then(|v| v.get_str()).map(String::from))
+        .collect())
+}
+
+/// Number of `:tags` rows of one note. Key-prefix lookup — O(this note's tags).
+fn note_tag_count(db: &DbInstance, note_id: &str) -> Result<usize, String> {
+    let mut params = BTreeMap::new();
+    params.insert("id".to_string(), DataValue::Str(note_id.into()));
+    let res = db
+        .run_script(
+            r#"?[tag] := *tags{ note_id: $id, tag }"#,
+            params,
+            ScriptMutability::Immutable,
+        )
+        .map_err(|e| format!("note tag lookup failed: {e}"))?;
+    Ok(res.rows.len())
+}
+
+/// What one atomic single-note index did. `links_delta` / `tags_delta` /
+/// `notes_delta` are the EXACT change to the three graph-wide totals that
+/// [`get_graph_stats`](super::get_graph_stats) counts (it counts relation
+/// rows), measured over the rows this index touched — so `GraphDb` can keep its
+/// cached totals correct without re-counting whole relations on every save.
+#[derive(Debug, Clone)]
+pub struct NoteIndexOutcome {
+    pub note_id: String,
+    /// The note had no `notes` row before this index (first save / newly
+    /// discovered file).
+    pub was_new: bool,
+    /// This note's resolved outgoing link targets before / after the index.
+    /// Callers compare them to decide whether the link topology changed.
+    pub link_targets_before: Vec<String>,
+    pub link_targets_after: Vec<String>,
+    pub notes_delta: i64,
+    pub links_delta: i64,
+    pub tags_delta: i64,
+    /// `false` when the index COMMITTED but the post-commit measurements could
+    /// not be read: the deltas above are zeros and `link_targets_after` is
+    /// empty — NOT the truth. Callers must treat every derived cache (stats
+    /// snapshot, algo cache) as stale instead of patching it.
+    pub deltas_trusted: bool,
+}
+
+/// IP-8 + DB-4: the full single-note (re)index — note row + tags + tasks +
+/// links + dangling rows, plus dangling→link promotion when the note is new —
+/// as ONE atomic transaction. Packaged for every path that (re)indexes a single
+/// note: the editor save, AI roost/task edits, in-app quick-add, history
+/// revert, folder-move re-index, and the warm heal. (The old `index_note_pass1`
+/// alone never produced link edges; the old pass1/pass2 pair was torn by a
+/// crash between the two — see the section comment above.)
 ///
-/// Fresh-build entry point: rebuilds a `LinkResolver` from a full `*notes`
-/// scan (O(roost)). Prefer [`index_note_full_with_resolver`] via
-/// [`GraphDb::index_note_full_cached`](crate::commands::graph::GraphDb::index_note_full_cached)
-/// when a cached resolver is available — the auxiliary write paths now do,
-/// sparing every task toggle / quick-add / revert / agent edit a full-roost
-/// resolver rebuild under the DB lock (IP-A3 / TRN-7).
+/// Fresh-build entry point: rebuilds a `LinkResolver` from a full `*notes` scan
+/// (O(roost)). Prefer [`index_note_full_with_resolver`] via
+/// [`GraphDb::index_note_core`](crate::commands::graph::GraphDb::index_note_core)
+/// when a cached resolver is available (IP-A3 / TRN-7).
 pub fn index_note_full(
     db: &DbInstance,
     roost_root: &str,
     abs_path: &str,
     content: &str,
 ) -> Result<(), String> {
-    // Build BEFORE pass1: the shared impl `add_id`s this note's id, so a
-    // brand-new note is still resolvable in pass2 without the scan having
-    // seen it — behaviourally identical to the old build-after-pass1 order.
+    // Build BEFORE the index: the shared impl `add_id`s this note's id, so a
+    // brand-new note is still resolvable without the scan having seen it.
     let mut resolver = LinkResolver::build(db)?;
-    index_note_full_with_resolver(db, roost_root, abs_path, content, &mut resolver)
+    index_note_full_with_resolver(db, roost_root, abs_path, content, &mut resolver).map(|_| ())
 }
 
-/// IP-A3 / TRN-7: `index_note_full` against a caller-supplied resolver instead
-/// of a fresh `LinkResolver::build` (O(roost)). The caller owns the resolver —
-/// typically `GraphDb`'s cached one, reached via
-/// [`GraphDb::index_note_full_cached`](crate::commands::graph::GraphDb::index_note_full_cached).
+/// `index_note_full` against a caller-supplied resolver instead of a fresh
+/// `LinkResolver::build` (O(roost)). The caller owns the resolver — typically
+/// `GraphDb`'s cached one.
 ///
-/// This note's own id is `add_id`'d (idempotent) BEFORE pass2 so a freshly
-/// created note can resolve a self-link and so later saves see it — exactly
-/// the discipline the editor save path (`index_note_internal`) already uses.
+/// This note's own id is `add_id`'d BEFORE the links are resolved so a freshly
+/// created note can resolve a self-link and so later saves see it. If the
+/// transaction fails and this call was the one that added the id, the id is
+/// removed again so the cache never advertises a note that isn't in the graph.
 /// Because the resolver is maintained incrementally here, callers must NOT
 /// invalidate it afterward: these paths only ever ADD a note id (a content
 /// edit / task append / revert never deletes the note), so the cache stays
 /// correct. Id-removing paths — delete / rename / purge — still invalidate the
 /// cached resolver elsewhere, which forces the next save to rebuild.
+///
+/// Only O(this note) database work: key-prefix lookups, one transaction, and a
+/// scan of `:dangling` for a NEW note's basename.
 pub fn index_note_full_with_resolver(
     db: &DbInstance,
     roost_root: &str,
     abs_path: &str,
     content: &str,
     resolver: &mut LinkResolver,
-) -> Result<(), String> {
-    let note_is_new = lookup_note_id_by_path(db, abs_path)?.is_none();
-    index_note_pass1(db, roost_root, abs_path, content)?;
-    let new_id = note_id_from_abs_path(abs_path, roost_root);
-    // Make this note's id visible before pass2 (self-links) and to future
-    // saves; idempotent for an id already in the resolver.
-    resolver.add_id(&new_id);
-    index_note_pass2(db, roost_root, abs_path, content, resolver)?;
-    if note_is_new {
-        if let Err(e) = promote_dangling_links(db, resolver, &new_id) {
-            tracing::warn!(%new_id, error = %e, "index_note_full_with_resolver: promote_dangling_links failed");
+) -> Result<NoteIndexOutcome, String> {
+    let note_id = note_id_from_abs_path(abs_path, roost_root);
+    let rel_dir = note_rel_dir(abs_path, roost_root);
+    let title = title_from_path(abs_path);
+    // IP-A2: prefer the file's mtime so ordering by `updated_at` reflects real
+    // edit time and survives a cold rebuild; fall back to now() on backends we
+    // can't stat (SAF).
+    let updated_at = file_mtime_secs(abs_path).unwrap_or_else(now_secs);
+
+    // Measured BEFORE the write, over this note's partition of each relation.
+    // Always measured (even for a "new" note) so a leftover orphan row can't
+    // skew the delta — the transaction clears them either way.
+    let was_new = !note_exists(db, &note_id)?;
+    let link_targets_before = note_link_targets(db, &note_id)?;
+    let tags_before = note_tag_count(db, &note_id)?;
+
+    let resolver_had_id = resolver.contains_id(&note_id);
+    resolver.add_id(&note_id);
+
+    let mut tx = TxScript::for_note(&note_id);
+    stage_note_row(&mut tx, &title, abs_path, updated_at);
+    stage_tags(&mut tx, &note_id, content);
+    stage_tasks(&mut tx, &note_id, content);
+    stage_links(&mut tx, &note_id, &rel_dir, content, resolver);
+
+    // A NEW note may be the target other notes were waiting on: promote their
+    // dangling rows inside the SAME transaction (backlinks appear immediately,
+    // and a crash can't leave the note indexed but its backlinks unpromoted).
+    // A planning failure only loses the promotion (as before — it was a
+    // warn-only step), never the index itself.
+    let mut promotions = Vec::new();
+    if was_new {
+        match plan_promotions(db, resolver, &note_id) {
+            // This note's own edges are fully determined by `stage_links`.
+            Ok(mut planned) => {
+                planned.retain(|p| p.from_id != note_id);
+                promotions = planned;
+            }
+            Err(e) => {
+                tracing::warn!(%note_id, error = %e, "index_note_full: promote planning failed");
+            }
+        }
+        stage_promotions(&mut tx, &promotions);
+    }
+
+    if let Err(e) = tx.run(db) {
+        if !resolver_had_id {
+            resolver.remove_id(&note_id);
+        }
+        return Err(format!("Failed to index note: {e}"));
+    }
+
+    // ── COMMIT POINT ────────────────────────────────────────────────────────
+    // Everything above this line is rolled back on error. From here the note IS
+    // indexed, so nothing below may turn that into an `Err` (a caller would
+    // treat "Err" as "nothing changed", skip its cache maintenance, and keep
+    // serving a snapshot that no longer matches the graph). The post-commit
+    // measurements are therefore best-effort: if they can't be read, the
+    // outcome says so (`deltas_trusted: false`) and callers drop their caches
+    // so the next reader recomputes from the DB.
+    let promoted_new_edges = promotions.iter().filter(|p| p.new_edge).count() as i64;
+    match read_post_commit_state(db, &note_id) {
+        Ok((link_targets_after, tags_after)) => Ok(NoteIndexOutcome {
+            notes_delta: i64::from(was_new),
+            links_delta: link_targets_after.len() as i64 - link_targets_before.len() as i64
+                + promoted_new_edges,
+            tags_delta: tags_after as i64 - tags_before as i64,
+            was_new,
+            note_id,
+            link_targets_before,
+            link_targets_after,
+            deltas_trusted: true,
+        }),
+        Err(e) => {
+            tracing::warn!(%note_id, error = %e, "index_note_full: committed, but post-commit read failed; callers must drop derived caches");
+            Ok(NoteIndexOutcome {
+                notes_delta: 0,
+                links_delta: 0,
+                tags_delta: 0,
+                was_new,
+                note_id,
+                link_targets_before,
+                link_targets_after: Vec::new(),
+                deltas_trusted: false,
+            })
         }
     }
-    Ok(())
+}
+
+/// This note's `(link targets, tag count)` AFTER the index transaction
+/// committed. Separate fn so tests can fail exactly this step.
+fn read_post_commit_state(db: &DbInstance, note_id: &str) -> Result<(Vec<String>, usize), String> {
+    #[cfg(test)]
+    if tx_fail_point::post_commit_armed() {
+        return Err("injected post-commit read failure".to_string());
+    }
+    Ok((
+        note_link_targets(db, note_id)?,
+        note_tag_count(db, note_id)?,
+    ))
+}
+
+/// Test fixture: pass 1 alone (note row + tags + tasks, no link edges), as ONE
+/// transaction. The shipped indexer never splits a note across passes any more
+/// (see [`index_note_full_with_resolver`]); tests use this to build "note exists
+/// but its links haven't been resolved yet" states.
+#[cfg(test)]
+fn index_note_pass1(
+    db: &DbInstance,
+    roost_root: &str,
+    abs_path: &str,
+    content: &str,
+) -> Result<(), String> {
+    let note_id = note_id_from_abs_path(abs_path, roost_root);
+    let updated_at = file_mtime_secs(abs_path).unwrap_or_else(now_secs);
+    let mut tx = TxScript::for_note(&note_id);
+    stage_note_row(&mut tx, &title_from_path(abs_path), abs_path, updated_at);
+    stage_tags(&mut tx, &note_id, content);
+    stage_tasks(&mut tx, &note_id, content);
+    tx.run(db)
+}
+
+/// Test fixture: pass 2 alone (resolve + replace this note's outgoing edges).
+#[cfg(test)]
+fn index_note_pass2(
+    db: &DbInstance,
+    roost_root: &str,
+    abs_path: &str,
+    content: &str,
+    resolver: &LinkResolver,
+) -> Result<(), String> {
+    let note_id = note_id_from_abs_path(abs_path, roost_root);
+    let rel_dir = note_rel_dir(abs_path, roost_root);
+    let mut tx = TxScript::for_note(&note_id);
+    stage_links(&mut tx, &note_id, &rel_dir, content, resolver);
+    tx.run(db)
 }
 
 /// `(normalized_target, basename)` for a raw `[[target]]`, or `None` when the
@@ -732,21 +1110,32 @@ fn dangling_key(raw_target: &str) -> Option<(String, String)> {
     Some((target, base))
 }
 
-/// Promote dangling links that now resolve to the just-created `new_id` into
-/// real `:links` edges, and delete the promoted `:dangling` rows. Called from
-/// the save path when a NEW note appears, so a `[[NewNote]]` written before
-/// NewNote existed becomes a backlink the moment NewNote is created — without
-/// waiting for the referencing note to be re-saved.
+/// One dangling row that now resolves to a real note.
+struct Promotion {
+    from_id: String,
+    to_id: String,
+    link_text: String,
+    /// The `:dangling` row's key (`from_id`, `target`) to delete once promoted.
+    target: String,
+    /// Promoting this row adds a NEW `:links` row (the edge didn't exist and no
+    /// earlier promotion in this batch adds it) — i.e. it moves the graph-wide
+    /// link total. A `:put` onto an existing `(from_id, to_id)` key doesn't.
+    new_edge: bool,
+}
+
+/// Find the dangling links that now resolve to the just-created `new_id`.
 ///
 /// Scans `:dangling` filtered to the new note's basename (the common case is
-/// zero or a handful of rows), re-resolves each through the resolver (which
-/// must already contain `new_id`), and promotes the ones that now point at a
-/// real note. Returns the number of edges promoted.
-pub fn promote_dangling_links(
+/// zero or a handful of rows; `target_base` is not a key column, so this is a
+/// scan of the dangling relation — paid only when a NEW note appears, never on
+/// an ordinary save) and re-resolves each through the resolver, which must
+/// already contain `new_id`. Read-only: stage the result with
+/// [`stage_promotions`].
+fn plan_promotions(
     db: &DbInstance,
     resolver: &LinkResolver,
     new_id: &str,
-) -> Result<usize, String> {
+) -> Result<Vec<Promotion>, String> {
     let base = new_id
         .rsplit_once('/')
         .map(|(_, b)| b.to_string())
@@ -765,7 +1154,9 @@ pub fn promote_dangling_links(
         .map_err(|e| format!("promote_dangling: query failed: {e}"))?
         .rows;
 
-    let mut promoted = 0usize;
+    let mut planned: Vec<Promotion> = Vec::new();
+    let mut seen_edges: std::collections::HashSet<(String, String)> =
+        std::collections::HashSet::new();
     for row in rows {
         let (Some(from_id), Some(target), Some(link_text)) = (
             row.first().and_then(|v| v.get_str()),
@@ -780,114 +1171,111 @@ pub fn promote_dangling_links(
         let Some(to_id) = resolver.resolve(target, source_rel_dir) else {
             continue; // still unresolved (e.g. a different basename collision)
         };
-
-        let mut p = BTreeMap::new();
-        p.insert(
-            "from_id".to_string(),
-            DataValue::Str(from_id.to_string().into()),
-        );
-        p.insert("to_id".to_string(), DataValue::Str(to_id.into()));
-        p.insert(
-            "link_text".to_string(),
-            DataValue::Str(link_text.to_string().into()),
-        );
-        db.run_script(
-            r#"?[from_id, to_id, link_text] <- [[$from_id, $to_id, $link_text]]
-               :put links { from_id, to_id => link_text }"#,
-            p,
-            ScriptMutability::Mutable,
-        )
-        .map_err(|e| format!("promote_dangling: insert link failed: {e}"))?;
-
-        let mut p = BTreeMap::new();
-        p.insert(
-            "from_id".to_string(),
-            DataValue::Str(from_id.to_string().into()),
-        );
-        p.insert(
-            "target".to_string(),
-            DataValue::Str(target.to_string().into()),
-        );
-        db.run_script(
-            r#"?[from_id, target] <- [[$from_id, $target]]
-               :rm dangling { from_id, target }"#,
-            p,
-            ScriptMutability::Mutable,
-        )
-        .map_err(|e| format!("promote_dangling: remove dangling failed: {e}"))?;
-        promoted += 1;
+        let edge = (from_id.to_string(), to_id.clone());
+        let new_edge = if seen_edges.contains(&edge) {
+            false
+        } else {
+            let exists = link_exists(db, from_id, &to_id)?;
+            seen_edges.insert(edge);
+            !exists
+        };
+        planned.push(Promotion {
+            from_id: from_id.to_string(),
+            to_id,
+            link_text: link_text.to_string(),
+            target: target.to_string(),
+            new_edge,
+        });
     }
-    Ok(promoted)
+    Ok(planned)
+}
+
+/// Does the `:links` row `from_id → to_id` already exist? Full-key lookup.
+fn link_exists(db: &DbInstance, from_id: &str, to_id: &str) -> Result<bool, String> {
+    let mut params = BTreeMap::new();
+    params.insert("f".to_string(), DataValue::Str(from_id.into()));
+    params.insert("t".to_string(), DataValue::Str(to_id.into()));
+    let res = db
+        .run_script(
+            r#"?[link_text] := *links{ from_id: $f, to_id: $t, link_text }"#,
+            params,
+            ScriptMutability::Immutable,
+        )
+        .map_err(|e| format!("promote_dangling: link lookup failed: {e}"))?;
+    Ok(!res.rows.is_empty())
+}
+
+/// Stage "turn these dangling rows into real edges": every promoted `:links`
+/// row is written and every promoted `:dangling` row deleted by the same
+/// transaction, so a crash can't leave an edge half-promoted. No-op when empty.
+fn stage_promotions(tx: &mut TxScript, promotions: &[Promotion]) {
+    if promotions.is_empty() {
+        return;
+    }
+    let link_rows: Vec<DataValue> = promotions
+        .iter()
+        .map(|p| {
+            DataValue::List(vec![
+                DataValue::Str(p.from_id.as_str().into()),
+                DataValue::Str(p.to_id.as_str().into()),
+                DataValue::Str(p.link_text.as_str().into()),
+            ])
+        })
+        .collect();
+    let dangling_rows: Vec<DataValue> = promotions
+        .iter()
+        .map(|p| {
+            DataValue::List(vec![
+                DataValue::Str(p.from_id.as_str().into()),
+                DataValue::Str(p.target.as_str().into()),
+            ])
+        })
+        .collect();
+    tx.param("promo_links", DataValue::List(link_rows));
+    tx.param("promo_dangling", DataValue::List(dangling_rows));
+    tx.block(B_PROMOTE_PUT_LINKS);
+    tx.block(B_PROMOTE_RM_DANGLING);
+}
+
+/// Promote dangling links that now resolve to the just-created `new_id` into
+/// real `:links` edges, and delete the promoted `:dangling` rows — in one
+/// transaction. The save path no longer calls this separately (it is fused
+/// into [`index_note_full_with_resolver`]'s transaction); it remains for
+/// callers/tests that promote against an already-indexed note.
+///
+/// A `[[NewNote]]` written before NewNote existed becomes a backlink the moment
+/// NewNote is created — without waiting for the referencing note to be
+/// re-saved. Returns the number of dangling rows promoted.
+pub fn promote_dangling_links(
+    db: &DbInstance,
+    resolver: &LinkResolver,
+    new_id: &str,
+) -> Result<usize, String> {
+    let promotions = plan_promotions(db, resolver, new_id)?;
+    if promotions.is_empty() {
+        return Ok(0);
+    }
+    let mut tx = TxScript::new();
+    stage_promotions(&mut tx, &promotions);
+    tx.run(db)
+        .map_err(|e| format!("promote_dangling: write failed: {e}"))?;
+    Ok(promotions.len())
 }
 
 /// Re-derive `:task` rows for a single note. Clears every existing task
 /// row for `note_id`, parses the markdown for `- [ ]` / `- [x]` checkboxes
-/// + frontmatter `tasks:`, and inserts the new set.
+/// and frontmatter `tasks:`, and inserts the new set — clear and insert in ONE
+/// transaction, so a crash can't leave the note with its tasks wiped.
 ///
-/// Called from the per-note save path inside `index_note_pass1` so a
-/// freshly-edited note's tasks are visible to the Tasks pane within the
-/// same save tick. The parse is pure regex (`parser::checkboxes`) — no
-/// LLM call, no embedding, cheap to run on every save.
+/// Used by the task-edit paths (`complete_task` etc.) that rewrite one checkbox
+/// on disk and need the pane to reflect it. The full per-note index
+/// ([`index_note_full_with_resolver`]) stages the same blocks. The parse is
+/// pure regex (`parser::checkboxes`) — no LLM call, no embedding, cheap to run.
 pub fn index_note_tasks(db: &DbInstance, note_id: &str, content: &str) -> Result<(), String> {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs_f64();
-
-    // Clear existing rows for this note. Source-of-truth is the markdown,
-    // so a clear-then-rewrite per save is cheaper than a row-level diff
-    // (typical note has 0–10 tasks).
-    let mut params = BTreeMap::new();
-    params.insert(
-        "note_id".to_string(),
-        DataValue::Str(note_id.to_string().into()),
-    );
-    db.run_script(
-        r#"?[note_id, source_line] := *task{ note_id, source_line }, note_id == $note_id
-           :rm task { note_id, source_line }"#,
-        params,
-        ScriptMutability::Mutable,
-    )
-    .map_err(|e| format!("Failed to clear tasks for note: {e}"))?;
-
-    // Convention 0.3: a checkbox is a task only with an effective date. Feed
-    // the note's own date (daily-note stem; frontmatter `date:` wins inside
-    // the parser) and today so dated/daily-note checkboxes and lone-⏰ lines
-    // resolve correctly.
-    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
-    let note_date = note_date_from_id(note_id);
-    let parsed = parse_tasks_in_note(content, note_date.as_deref(), Some(&today));
-    if parsed.is_empty() {
-        return Ok(());
-    }
-
-    let mut rows: Vec<DataValue> = Vec::with_capacity(parsed.len());
-    for task in parsed {
-        rows.push(DataValue::List(vec![
-            DataValue::Str(note_id.to_string().into()),
-            DataValue::Num(cozo::Num::Int(task.source_line as i64)),
-            DataValue::Str(task.text.into()),
-            DataValue::Str(task.content_anchor.into()),
-            DataValue::Str(task.due_at.into()),
-            DataValue::Bool(task.completed),
-            DataValue::Str(task.completed_at.into()),
-            DataValue::Str(task.linked_person.into()),
-            DataValue::Str(task.linked_project.into()),
-            DataValue::from(now),
-        ]));
-    }
-
-    let mut params = BTreeMap::new();
-    params.insert("rows".to_string(), DataValue::List(rows));
-    db.run_script(
-        r#"?[note_id, source_line, text, content_anchor, due_at, completed, completed_at, linked_person, linked_project, updated_at] <- $rows
-           :put task { note_id, source_line => text, content_anchor, due_at, completed, completed_at, linked_person, linked_project, updated_at }"#,
-        params,
-        ScriptMutability::Mutable,
-    )
-    .map_err(|e| format!("Failed to insert tasks: {e}"))?;
-
-    Ok(())
+    let mut tx = TxScript::for_note(note_id);
+    stage_tasks(&mut tx, note_id, content);
+    tx.run(db)
+        .map_err(|e| format!("Failed to reindex tasks for note: {e}"))
 }
 
 /// Remove every trace of `note_id` from the graph relations:
@@ -966,16 +1354,18 @@ pub fn purge_note(db: &DbInstance, note_id: &str) -> Result<(), Vec<String>> {
         Err(e) => errors.push(format!("purge_note: query incoming links: {e}")),
     }
 
+    // DB-4: ORDER IS LOAD-BEARING — the `notes` row goes LAST. A crash / power
+    // loss part-way through leaves the `notes` row (and so the note in the
+    // graph) for a file that is already gone from disk, which the next warm
+    // open's `reconcile_deleted_notes` finds and purges completely. With the
+    // `notes` row first, an interrupted purge left orphan links/tags/tasks
+    // under an id no listing could ever reach — nothing would clean them.
+    // Per-note rows use `x = $id, *rel{ x, .. }` (key-prefix join), not a
+    // `*rel{ .. }, x == $id` full-relation scan.
     let steps: [(&str, &str, BTreeMap<String, DataValue>); 6] = [
         (
-            "notes",
-            r#"?[id] := *notes{ id }, id == $id
-               :rm notes { id }"#,
-            id_param(note_id, "id"),
-        ),
-        (
             "links_outgoing",
-            r#"?[from_id, to_id] := *links{ from_id, to_id }, from_id == $id
+            r#"?[from_id, to_id] := from_id = $id, *links{ from_id, to_id }
                :rm links { from_id, to_id }"#,
             id_param(note_id, "id"),
         ),
@@ -990,7 +1380,7 @@ pub fn purge_note(db: &DbInstance, note_id: &str) -> Result<(), Vec<String>> {
         ),
         (
             "tags",
-            r#"?[note_id, tag] := *tags{ note_id, tag }, note_id == $note_id
+            r#"?[note_id, tag] := note_id = $note_id, *tags{ note_id, tag }
                :rm tags { note_id, tag }"#,
             id_param(note_id, "note_id"),
         ),
@@ -998,7 +1388,7 @@ pub fn purge_note(db: &DbInstance, note_id: &str) -> Result<(), Vec<String>> {
             // drop derived `- [ ]` rows for the note — without this,
             // tasks linger in the pane until the next full re-index.
             "task",
-            r#"?[note_id, source_line] := *task{ note_id, source_line }, note_id == $note_id
+            r#"?[note_id, source_line] := note_id = $note_id, *task{ note_id, source_line }
                :rm task { note_id, source_line }"#,
             id_param(note_id, "note_id"),
         ),
@@ -1009,8 +1399,16 @@ pub fn purge_note(db: &DbInstance, note_id: &str) -> Result<(), Vec<String>> {
             // before `links_incoming` removes them, so a delete-then-recreate
             // or rename-back auto-restores those backlinks.)
             "dangling",
-            r#"?[from_id, target] := *dangling{ from_id, target }, from_id == $id
+            r#"?[from_id, target] := from_id = $id, *dangling{ from_id, target }
                :rm dangling { from_id, target }"#,
+            id_param(note_id, "id"),
+        ),
+        (
+            // LAST (see the ordering note above): the stamp row that keeps an
+            // interrupted purge discoverable by the warm-open ghost reconcile.
+            "notes",
+            r#"?[id] := id = $id, *notes{ id }
+               :rm notes { id }"#,
             id_param(note_id, "id"),
         ),
     ];
@@ -1337,9 +1735,14 @@ pub fn bulk_index_pass1(
 }
 
 /// Pass 2 bulk variant — resolves every wiki-link against the supplied
-/// resolver in memory, then writes the whole link set in two scripts:
-/// one `:rm links` clearing the old relation, one `:put links` for the
-/// new edges.
+/// resolver in memory, then replaces the whole link + dangling relations in ONE
+/// transaction (clear both, put both).
+///
+/// One transaction matters for the IP-5 completion gate: `init_graph` treats
+/// `links > 0` as "pass 2 landed". With the four statements separate, a crash
+/// after the links were put but before the dangling rows were put left
+/// `links > 0` and NO `:dangling` rows — served warm forever, so a note created
+/// later never promoted its incoming backlinks.
 pub fn bulk_index_pass2(
     db: &DbInstance,
     roost_root: &str,
@@ -1382,46 +1785,25 @@ pub fn bulk_index_pass2(
     }
 
     // Clear links + dangling relations wholesale — init_graph rebuilds both.
-    db.run_script(
+    let mut tx = TxScript::new();
+    tx.block(
         r#"?[from_id, to_id] := *links{ from_id, to_id }
-           :rm links { from_id, to_id }"#,
-        BTreeMap::new(),
-        ScriptMutability::Mutable,
-    )
-    .map_err(|e| format!("Bulk-clear links failed: {e}"))?;
-    db.run_script(
+:rm links { from_id, to_id }"#,
+    );
+    tx.block(
         r#"?[from_id, target] := *dangling{ from_id, target }
-           :rm dangling { from_id, target }"#,
-        BTreeMap::new(),
-        ScriptMutability::Mutable,
-    )
-    .map_err(|e| format!("Bulk-clear dangling failed: {e}"))?;
-
+:rm dangling { from_id, target }"#,
+    );
     if !link_rows.is_empty() {
-        let mut params = BTreeMap::new();
-        params.insert("rows".to_string(), DataValue::List(link_rows));
-        db.run_script(
-            r#"?[from_id, to_id, link_text] <- $rows
-               :put links { from_id, to_id => link_text }"#,
-            params,
-            ScriptMutability::Mutable,
-        )
-        .map_err(|e| format!("Bulk-insert links failed: {e}"))?;
+        tx.param("link_rows", DataValue::List(link_rows));
+        tx.block(B_PUT_LINKS);
     }
-
     if !dangling_rows.is_empty() {
-        let mut params = BTreeMap::new();
-        params.insert("rows".to_string(), DataValue::List(dangling_rows));
-        db.run_script(
-            r#"?[from_id, target, link_text, target_base] <- $rows
-               :put dangling { from_id, target => link_text, target_base }"#,
-            params,
-            ScriptMutability::Mutable,
-        )
-        .map_err(|e| format!("Bulk-insert dangling failed: {e}"))?;
+        tx.param("dangling_rows", DataValue::List(dangling_rows));
+        tx.block(B_PUT_DANGLING);
     }
-
-    Ok(())
+    tx.run(db)
+        .map_err(|e| format!("Bulk-replace links failed: {e}"))
 }
 
 #[cfg(test)]
@@ -2549,5 +2931,523 @@ impl LinkResolver {
             id_set,
             by_basename,
         }
+    }
+}
+
+#[cfg(test)]
+mod atomic_index_tests {
+    //! DB-4 (a note's derived rows are written atomically) and the exactness of
+    //! the per-note stats deltas DB-3's cache relies on. All run against the
+    //! real SQLite-backed schema (`init_db`), because the guarantee being
+    //! tested — a failed script rolls back every earlier block — is a property
+    //! of the storage transaction, not of CozoScript syntax.
+    use super::tx_fail_point::Guard;
+    use super::*;
+    use crate::db::queries::get_graph_stats;
+    use tempfile::TempDir;
+
+    const ROOT: &str = "/roost";
+
+    fn fresh_db() -> (TempDir, DbInstance) {
+        let dir = TempDir::new().expect("tempdir");
+        let db = crate::db::schema::init_db(dir.path()).expect("init_db");
+        (dir, db)
+    }
+
+    fn abs(rel: &str) -> String {
+        format!("{ROOT}/{rel}")
+    }
+
+    fn rows(db: &DbInstance, script: &str, id: &str) -> Vec<Vec<DataValue>> {
+        let mut p = BTreeMap::new();
+        p.insert("id".to_string(), DataValue::Str(id.into()));
+        db.run_script(script, p, ScriptMutability::Immutable)
+            .expect("query")
+            .rows
+    }
+
+    /// Everything the index writes for one note, in a comparable shape.
+    #[derive(Debug, PartialEq)]
+    struct NoteRows {
+        stamp: Option<f64>,
+        links: Vec<String>,
+        tags: Vec<String>,
+        dangling: Vec<String>,
+        tasks: usize,
+    }
+
+    fn note_rows(db: &DbInstance, id: &str) -> NoteRows {
+        let stamp = rows(db, r#"?[u] := *notes{ id: $id, updated_at: u }"#, id)
+            .first()
+            .and_then(|r| r[0].get_float());
+        let strs = |script: &str| {
+            let mut v: Vec<String> = rows(db, script, id)
+                .iter()
+                .filter_map(|r| r[0].get_str().map(String::from))
+                .collect();
+            v.sort();
+            v
+        };
+        NoteRows {
+            stamp,
+            links: strs(r#"?[t] := *links{ from_id: $id, to_id: t }"#),
+            tags: strs(r#"?[t] := *tags{ note_id: $id, tag: t }"#),
+            dangling: strs(r#"?[t] := *dangling{ from_id: $id, target: t }"#),
+            tasks: rows(db, r#"?[l] := *task{ note_id: $id, source_line: l }"#, id).len(),
+        }
+    }
+
+    fn index(
+        db: &DbInstance,
+        resolver: &mut LinkResolver,
+        rel: &str,
+        content: &str,
+    ) -> Result<NoteIndexOutcome, String> {
+        index_note_full_with_resolver(db, ROOT, &abs(rel), content, resolver)
+    }
+
+    #[test]
+    fn failed_index_rolls_back_every_relation_and_the_stamp() {
+        let (_d, db) = fresh_db();
+        let mut resolver = LinkResolver::build(&db).unwrap();
+        index(&db, &mut resolver, "b.md", "# b\n").unwrap();
+        index(&db, &mut resolver, "c.md", "# c\n").unwrap();
+
+        let v1 = "see [[b]] and [[nowhere]] #old\n- [ ] first 📅 2026-12-01\n";
+        index(&db, &mut resolver, "a.md", v1).unwrap();
+        let before = note_rows(&db, "a");
+        assert_eq!(before.links, vec!["b".to_string()]);
+        assert_eq!(before.tags, vec!["old".to_string()]);
+        assert_eq!(before.dangling, vec!["nowhere".to_string()]);
+        assert_eq!(before.tasks, 1);
+
+        // v2 changes every relation — but the transaction dies AFTER all of its
+        // blocks ran (the shape of a crash between statements).
+        let v2 = "see [[c]] #new\n";
+        {
+            let _fp = Guard::arm();
+            let err = index(&db, &mut resolver, "a.md", v2).unwrap_err();
+            assert!(err.contains("Failed to index note"), "got: {err}");
+        }
+        assert_eq!(
+            note_rows(&db, "a"),
+            before,
+            "an interrupted index must leave the note exactly as it was — stamp included, \
+             so the warm heal still sees it as stale"
+        );
+
+        // With the fail-point gone the identical call lands completely.
+        index(&db, &mut resolver, "a.md", v2).unwrap();
+        let after = note_rows(&db, "a");
+        assert_eq!(after.links, vec!["c".to_string()]);
+        assert_eq!(after.tags, vec!["new".to_string()]);
+        assert!(after.dangling.is_empty());
+        assert_eq!(after.tasks, 0);
+        assert_ne!(after.stamp, before.stamp, "stamp advances with the rows");
+    }
+
+    #[test]
+    fn failed_first_index_creates_nothing_and_does_not_leak_the_resolver_id() {
+        let (_d, db) = fresh_db();
+        let mut resolver = LinkResolver::build(&db).unwrap();
+        {
+            let _fp = Guard::arm();
+            index(&db, &mut resolver, "n.md", "# n #t\n[[x]]\n").unwrap_err();
+        }
+        assert!(!note_exists(&db, "n").unwrap(), "no notes row");
+        assert_eq!(
+            note_rows(&db, "n"),
+            NoteRows {
+                stamp: None,
+                links: vec![],
+                tags: vec![],
+                dangling: vec![],
+                tasks: 0
+            },
+            "no orphan rows of any relation"
+        );
+        assert!(
+            !resolver.contains_id("n"),
+            "the resolver must not advertise a note that isn't in the graph"
+        );
+    }
+
+    #[test]
+    fn promotion_of_waiting_backlinks_is_part_of_the_new_notes_transaction() {
+        let (_d, db) = fresh_db();
+        let mut resolver = LinkResolver::build(&db).unwrap();
+        index(&db, &mut resolver, "a.md", "waiting on [[late]]\n").unwrap();
+        assert_eq!(note_rows(&db, "a").dangling, vec!["late".to_string()]);
+
+        {
+            let _fp = Guard::arm();
+            index(&db, &mut resolver, "late.md", "# late\n").unwrap_err();
+        }
+        let a = note_rows(&db, "a");
+        assert_eq!(
+            a.dangling,
+            vec!["late".to_string()],
+            "a failed create must not half-promote"
+        );
+        assert!(a.links.is_empty());
+
+        let out = index(&db, &mut resolver, "late.md", "# late\n").unwrap();
+        assert!(out.was_new);
+        let a = note_rows(&db, "a");
+        assert_eq!(a.links, vec!["late".to_string()], "promoted immediately");
+        assert!(a.dangling.is_empty());
+        assert_eq!(
+            out.links_delta, 1,
+            "the promoted edge moves the graph-wide link total"
+        );
+    }
+
+    /// The exactness contract DB-3 depends on: for every index, the reported
+    /// deltas equal the change in what `get_graph_stats` counts. Covers new
+    /// notes, edits that add/drop links and tags, a byte-identical re-save, a
+    /// promotion that adds an edge, and two dangling rows that promote to the
+    /// SAME edge (one new row, not two).
+    #[test]
+    fn outcome_deltas_equal_the_change_in_graph_stats() {
+        let (_d, db) = fresh_db();
+        let mut resolver = LinkResolver::build(&db).unwrap();
+        let steps: &[(&str, &str)] = &[
+            ("a.md", "[[b]] [[later]] #x #y\n"),
+            // `b` didn't exist yet, so a's `[[b]]` is dangling until here → promoted.
+            ("b.md", "# b #x\n"),
+            ("a.md", "[[b]] #x\n"), // drop a dangling row + a tag
+            ("a.md", "[[b]] #x\n"), // byte-identical re-save
+            ("z.md", "[[late2]] [[sub/late2]] #t\n"), // two dangling rows, one future target
+            ("sub/late2.md", "# late2\n"), // 2 promotions → ONE new edge
+            ("c.md", "[[a]] [[b]] [[b]] [[c]] #x\n"), // duplicate + self-link
+            ("c.md", "no links now\n"),
+            (
+                "a.md",
+                "[[b]] [[c]] [[sub/late2]] #x #q\n- [ ] t 📅 2026-12-02\n",
+            ),
+        ];
+        let mut totals = get_graph_stats(&db).unwrap();
+        for (i, (rel, body)) in steps.iter().enumerate() {
+            let out = index(&db, &mut resolver, rel, body).unwrap();
+            let want = get_graph_stats(&db).unwrap();
+            let got = (
+                totals.notes as i64 + out.notes_delta,
+                totals.links as i64 + out.links_delta,
+                totals.tags as i64 + out.tags_delta,
+            );
+            assert_eq!(
+                got,
+                (want.notes as i64, want.links as i64, want.tags as i64),
+                "step {i} ({rel}): deltas {out:?} drifted from get_graph_stats {want:?}"
+            );
+            totals = want;
+        }
+    }
+
+    #[test]
+    fn index_note_tasks_replace_is_atomic() {
+        let (_d, db) = fresh_db();
+        let mut resolver = LinkResolver::build(&db).unwrap();
+        index(
+            &db,
+            &mut resolver,
+            "t.md",
+            "- [ ] one 📅 2026-12-01\n- [ ] two 📅 2026-12-02\n",
+        )
+        .unwrap();
+        assert_eq!(note_rows(&db, "t").tasks, 2);
+        {
+            let _fp = Guard::arm();
+            index_note_tasks(&db, "t", "no tasks here\n").unwrap_err();
+        }
+        assert_eq!(
+            note_rows(&db, "t").tasks,
+            2,
+            "a failed task re-index must not leave the note with its tasks wiped"
+        );
+        index_note_tasks(&db, "t", "no tasks here\n").unwrap();
+        assert_eq!(note_rows(&db, "t").tasks, 0);
+    }
+
+    #[test]
+    fn bulk_pass2_replaces_links_and_dangling_atomically() {
+        let (_d, db) = fresh_db();
+        let files = vec![
+            (abs("a.md"), "[[b]] [[gone]]\n".to_string()),
+            (abs("b.md"), "# b\n".to_string()),
+        ];
+        bulk_index_pass1(&db, ROOT, &files).unwrap();
+        let resolver = LinkResolver::build(&db).unwrap();
+        bulk_index_pass2(&db, ROOT, &files, &resolver).unwrap();
+        let before = note_rows(&db, "a");
+        assert_eq!(before.links, vec!["b".to_string()]);
+        assert_eq!(before.dangling, vec!["gone".to_string()]);
+
+        let edited = vec![
+            (abs("a.md"), "[[a]]\n".to_string()),
+            (abs("b.md"), "# b\n".to_string()),
+        ];
+        {
+            let _fp = Guard::arm();
+            bulk_index_pass2(&db, ROOT, &edited, &resolver).unwrap_err();
+        }
+        assert_eq!(
+            note_rows(&db, "a"),
+            before,
+            "clear-then-put of links + dangling must be one transaction (IP-5: \
+             links>0 is the 'pass 2 landed' gate, so a torn pass 2 was served warm)"
+        );
+        bulk_index_pass2(&db, ROOT, &edited, &resolver).unwrap();
+        assert_eq!(note_rows(&db, "a").links, vec!["a".to_string()]);
+    }
+
+    /// DB-4 ordering invariant with no other observable form: an interrupted
+    /// purge must leave the `notes` row behind (so the warm-open ghost
+    /// reconcile finds and finishes it), which only holds if it is removed LAST.
+    #[test]
+    fn purge_note_removes_the_notes_row_last() {
+        let src = include_str!("notes.rs");
+        let steps = src
+            .split("let steps: [(&str, &str, BTreeMap<String, DataValue>); 6]")
+            .nth(1)
+            .expect("purge_note steps array")
+            .split("];")
+            .next()
+            .expect("end of steps array");
+        let labels: Vec<&str> = steps
+            .lines()
+            .map(str::trim)
+            .filter(|l| l.starts_with('"') && l.ends_with("\","))
+            .collect();
+        assert_eq!(labels.len(), 6, "labels: {labels:?}");
+        assert_eq!(
+            labels.last().copied(),
+            Some("\"notes\","),
+            "the `notes` row must be purged LAST; got order {labels:?}"
+        );
+    }
+
+    #[test]
+    fn interrupted_purge_remnant_is_finished_by_the_ghost_reconcile() {
+        // The state an interrupted purge leaves (notes row present, file gone)
+        // is exactly what `reconcile_deleted_notes` exists to clean.
+        let (_d, db) = fresh_db();
+        let mut resolver = LinkResolver::build(&db).unwrap();
+        index(&db, &mut resolver, "keep.md", "# keep\n").unwrap();
+        index(
+            &db,
+            &mut resolver,
+            "gone.md",
+            "[[keep]] #t\n- [ ] x 📅 2026-12-01\n",
+        )
+        .unwrap();
+        let disk = vec![abs("keep.md")];
+        assert_eq!(reconcile_deleted_notes(&db, ROOT, &disk).unwrap(), 1);
+        assert!(!note_exists(&db, "gone").unwrap());
+        assert_eq!(
+            note_rows(&db, "gone"),
+            NoteRows {
+                stamp: None,
+                links: vec![],
+                tags: vec![],
+                dangling: vec![],
+                tasks: 0
+            }
+        );
+    }
+
+    /// N1: once the transaction commits, the call can no longer fail. If the
+    /// post-commit measurements are unreadable it says so (`deltas_trusted:
+    /// false`) instead of returning `Err` for a note that IS indexed.
+    #[test]
+    fn committed_index_never_reports_err_when_post_commit_reads_fail() {
+        let (_d, db) = fresh_db();
+        let mut resolver = LinkResolver::build(&db).unwrap();
+        index(&db, &mut resolver, "b.md", "# b\n").unwrap();
+        let out = {
+            let _fp = super::tx_fail_point::PostCommitGuard::arm();
+            index(&db, &mut resolver, "a.md", "[[b]] #t\n").expect("committed → Ok")
+        };
+        assert!(!out.deltas_trusted);
+        assert!(out.was_new);
+        assert_eq!(
+            (out.notes_delta, out.links_delta, out.tags_delta),
+            (0, 0, 0)
+        );
+        // The write itself landed.
+        let a = note_rows(&db, "a");
+        assert_eq!(a.links, vec!["b".to_string()]);
+        assert_eq!(a.tags, vec!["t".to_string()]);
+        // Healthy path reports trusted deltas.
+        let ok = index(&db, &mut resolver, "a.md", "[[b]] #t #u\n").unwrap();
+        assert!(ok.deltas_trusted);
+        assert_eq!(ok.tags_delta, 1);
+    }
+}
+
+/// LR-6 / LR-7: tag IDENTITY in the inventory + the agent tag-guard's inputs.
+/// Real SQLite-backed schema and the real indexer: the contract is "stored rows
+/// stay verbatim, every read folds", so the tests index real notes and inspect
+/// both the stored rows and the folded views.
+#[cfg(test)]
+mod tag_identity_tests {
+    use super::*;
+    use crate::db::queries::get_graph_stats;
+    use tempfile::TempDir;
+
+    const ROOT: &str = "/roost";
+
+    fn fresh_db() -> (TempDir, DbInstance) {
+        let dir = TempDir::new().expect("tempdir");
+        let db = crate::db::schema::init_db(dir.path()).expect("init_db");
+        (dir, db)
+    }
+
+    fn index(
+        db: &DbInstance,
+        resolver: &mut LinkResolver,
+        rel: &str,
+        content: &str,
+    ) -> NoteIndexOutcome {
+        index_note_full_with_resolver(db, ROOT, &format!("{ROOT}/{rel}"), content, resolver)
+            .expect("index")
+    }
+
+    fn stored_tags(db: &DbInstance) -> Vec<(String, String)> {
+        let mut v: Vec<(String, String)> = db
+            .run_script(
+                r#"?[note_id, tag] := *tags{ note_id, tag }"#,
+                BTreeMap::new(),
+                ScriptMutability::Immutable,
+            )
+            .expect("query")
+            .rows
+            .iter()
+            .map(|r| {
+                (
+                    r[0].get_str().unwrap().to_string(),
+                    r[1].get_str().unwrap().to_string(),
+                )
+            })
+            .collect();
+        v.sort();
+        v
+    }
+
+    fn put_raw_tag(db: &DbInstance, note_id: &str, tag: &str) {
+        let mut p = BTreeMap::new();
+        p.insert("n".to_string(), DataValue::Str(note_id.into()));
+        p.insert("t".to_string(), DataValue::Str(tag.into()));
+        db.run_script(
+            r#"?[note_id, tag] <- [[$n, $t]]
+               :put tags { note_id, tag }"#,
+            p,
+            ScriptMutability::Mutable,
+        )
+        .expect("put tag");
+    }
+
+    #[test]
+    fn indexer_stores_tags_verbatim_and_keeps_stats_exact() {
+        let (_d, db) = fresh_db();
+        let mut r = LinkResolver::build(&db).unwrap();
+        let out = index(&db, &mut r, "a.md", "#café #ML #ml #日本語\n");
+        // Verbatim: NOT folded at write time (Locked Decision #12), and the
+        // Unicode tags are whole.
+        assert_eq!(
+            stored_tags(&db),
+            vec![
+                ("a".to_string(), "ML".to_string()),
+                ("a".to_string(), "café".to_string()),
+                ("a".to_string(), "ml".to_string()),
+                ("a".to_string(), "日本語".to_string()),
+            ]
+        );
+        // The patched stats cache counts stored rows — untouched by folding.
+        assert_eq!(out.tags_delta, 4);
+        assert_eq!(get_graph_stats(&db).unwrap().tags, 4);
+    }
+
+    #[test]
+    fn top_tags_groups_case_variants_and_counts_each_note_once() {
+        let (_d, db) = fresh_db();
+        let mut r = LinkResolver::build(&db).unwrap();
+        index(&db, &mut r, "a.md", "#ML and #ml in one note\n");
+        index(&db, &mut r, "b.md", "#ml\n");
+        index(&db, &mut r, "c.md", "#Ml #other\n");
+        // Spellings: ML=1, ml=2, Ml=1 → naive sum 4; distinct notes = 3.
+        assert_eq!(
+            top_tags(&db, 10).unwrap(),
+            vec![("ml".to_string(), 3), ("other".to_string(), 1)]
+        );
+    }
+
+    #[test]
+    fn top_tags_without_collisions_keeps_the_stored_spelling() {
+        let (_d, db) = fresh_db();
+        let mut r = LinkResolver::build(&db).unwrap();
+        index(&db, &mut r, "a.md", "#Q4 #Q4plan\n");
+        index(&db, &mut r, "b.md", "#Q4\n");
+        assert_eq!(
+            top_tags(&db, 10).unwrap(),
+            vec![("Q4".to_string(), 2), ("Q4plan".to_string(), 1)]
+        );
+    }
+
+    #[test]
+    fn top_tags_respects_limit_and_breaks_ties_deterministically() {
+        let (_d, db) = fresh_db();
+        let mut r = LinkResolver::build(&db).unwrap();
+        index(&db, &mut r, "a.md", "#bbb #aaa #ccc\n");
+        let top = top_tags(&db, 2).unwrap();
+        assert_eq!(
+            top,
+            vec![("aaa".to_string(), 1), ("bbb".to_string(), 1)],
+            "equal counts sort by spelling"
+        );
+        assert!(top_tags(&db, 0).unwrap().is_empty());
+    }
+
+    #[test]
+    fn top_tags_folds_unicode_case_and_normalization() {
+        let (_d, db) = fresh_db();
+        let mut r = LinkResolver::build(&db).unwrap();
+        index(&db, &mut r, "a.md", "#café\n");
+        index(&db, &mut r, "b.md", "#CAFÉ\n");
+        index(&db, &mut r, "c.md", "#cafe\u{301}\n"); // decomposed
+        let top = top_tags(&db, 10).unwrap();
+        assert_eq!(top.len(), 1, "{top:?}");
+        assert_eq!(top[0].1, 3);
+    }
+
+    /// Migration safety: a graph.db written BEFORE this rule (verbatim mixed
+    /// case, a `caf` truncated by the ASCII-only parser) groups with rows
+    /// written after it. No migration, no reindex.
+    #[test]
+    fn rows_from_an_older_index_fold_with_new_rows() {
+        let (_d, db) = fresh_db();
+        put_raw_tag(&db, "old", "Ideas");
+        put_raw_tag(&db, "old", "caf");
+        put_raw_tag(&db, "new", "ideas");
+        let top = top_tags(&db, 10).unwrap();
+        assert_eq!(top.len(), 2);
+        assert_eq!(top[0].1, 2, "Ideas + ideas are one tag: {top:?}");
+        assert_eq!(top[1], ("caf".to_string(), 1));
+    }
+
+    #[test]
+    fn all_tag_names_stays_verbatim_so_guards_must_fold() {
+        let (_d, db) = fresh_db();
+        let mut r = LinkResolver::build(&db).unwrap();
+        index(&db, &mut r, "a.md", "#ML\n");
+        index(&db, &mut r, "b.md", "#ml\n");
+        let names = all_tag_names(&db).unwrap();
+        assert!(names.contains("ML") && names.contains("ml"));
+        let keys: std::collections::HashSet<String> = names.iter().map(|t| fold_tag(t)).collect();
+        assert_eq!(keys.len(), 1);
+        assert!(
+            keys.contains(&fold_tag("Ml")),
+            "the guard's fold-compare sees `Ml` as known"
+        );
     }
 }

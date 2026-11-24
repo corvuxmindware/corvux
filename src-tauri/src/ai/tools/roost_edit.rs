@@ -86,37 +86,46 @@ impl Tool for RoostEditTool {
         // frontmatter tags the create-path guard would have rejected,
         // fragmenting the graph (#fitness vs #workout vs #exercise). Empty
         // inventory (fresh roost) is the bootstrap exception.
-        if let Some(graph) = ctx.app.try_state::<GraphDb>() {
-            if let Ok(db_guard) = graph.db.lock() {
-                if let Some(db) = db_guard.as_ref() {
-                    if let Ok(known) = queries::all_tag_names(db) {
-                        let known: std::collections::HashSet<String> = known.into_iter().collect();
-                        let novel = novel_frontmatter_tags(new_content, &known);
-                        if !novel.is_empty() {
-                            let mut examples: Vec<String> =
-                                known.iter().take(6).map(|s| format!("#{s}")).collect();
-                            examples.sort();
-                            return Err(ToolError::retryable(format!(
-                                "tag(s) not in roost inventory: {}. Pick from existing tags (e.g. {}) or drop them from the frontmatter. Do not invent new tags — see rule 8 in the system prompt.",
-                                novel
-                                    .iter()
-                                    .map(|t| format!("`#{t}`"))
-                                    .collect::<Vec<_>>()
-                                    .join(", "),
-                                examples.join(", ")
-                            )));
-                        }
-                    }
-                }
-            }
-        }
+        //
+        // LR-6: tags are compared by IDENTITY (`fold_tag`), never by exact
+        // string — `#ML` is not "novel" when `#ml` exists. And tags the note
+        // ALREADY carries on disk are never novel: the agent is preserving the
+        // user's tag, not inventing one. (Without this, a note whose Unicode
+        // tag the pre-LR-7 index never stored could not be edited without
+        // dropping that tag, because the guard's advice is "drop them".) The
+        // check therefore runs inside the read-modify-write, where the current
+        // content is in hand; only the inventory is read up front.
+        let known_tags: Option<std::collections::HashSet<String>> =
+            ctx.app.try_state::<GraphDb>().and_then(|graph| {
+                let db_guard = graph.db.lock().ok()?;
+                let db = db_guard.as_ref()?;
+                queries::all_tag_names(db).ok()
+            });
 
         // Reserved-path guard + the user's blocklist (AT-1/AT-4): both run in
         // the write gate on the RESOLVED `rel`, so title / `[[wiki]]` /
         // extension-less / "daily" spellings are checked as what they become.
-        let (before, _, ()) =
-            super::write_gate::mutate_note(ctx, &rel, |_| Ok((new_content.to_string(), ())))
-                .await?;
+        let (before, _, ()) = super::write_gate::mutate_note(ctx, &rel, |current| {
+            if let Some(known) = &known_tags {
+                let novel = novel_frontmatter_tags(new_content, known, Some(current));
+                if !novel.is_empty() {
+                    let mut examples: Vec<String> =
+                        known.iter().take(6).map(|s| format!("#{s}")).collect();
+                    examples.sort();
+                    return Err(format!(
+                        "tag(s) not in roost inventory: {}. Pick from existing tags (e.g. {}) or drop them from the frontmatter. Do not invent new tags — see rule 8 in the system prompt.",
+                        novel
+                            .iter()
+                            .map(|t| format!("`#{t}`"))
+                            .collect::<Vec<_>>()
+                            .join(", "),
+                        examples.join(", ")
+                    ));
+                }
+            }
+            Ok((new_content.to_string(), ()))
+        })
+        .await?;
         if before == new_content {
             return Ok(json!({
                 "summary": "no changes — new content matches existing content",
@@ -162,16 +171,34 @@ impl Tool for RoostEditTool {
 }
 
 /// Frontmatter tags in `content` that aren't already in `known` (the roost
-/// tag inventory). Empty `known` → none, so a fresh roost's first edit can
-/// define the vocabulary (matches `roost_write`'s bootstrap rule). This is
-/// the pure, testable core of the edit-path tag guard.
-fn novel_frontmatter_tags(content: &str, known: &std::collections::HashSet<String>) -> Vec<String> {
+/// tag inventory — stored spellings, compared here by tag IDENTITY, so `#ML`
+/// is not novel when `#ml` exists). Empty `known` → none, so a fresh roost's
+/// first edit can define the vocabulary (matches `roost_write`'s bootstrap
+/// rule). Tags the note's `before` content already carries are never novel —
+/// the edit preserves them, it doesn't invent them. This is the pure,
+/// testable core of the edit-path tag guard.
+fn novel_frontmatter_tags(
+    content: &str,
+    known: &std::collections::HashSet<String>,
+    before: Option<&str>,
+) -> Vec<String> {
+    use crate::parser::tags::{fold_tag, frontmatter_tag_names, tags_not_in};
     if known.is_empty() {
         return Vec::new();
     }
-    crate::parser::tags::frontmatter_tag_names(content)
+    let already: std::collections::HashSet<String> = before
+        .map(|b| {
+            frontmatter_tag_names(b)
+                .iter()
+                .map(|t| fold_tag(t))
+                .collect()
+        })
+        .unwrap_or_default();
+    let new_tags = frontmatter_tag_names(content);
+    tags_not_in(new_tags.iter().map(String::as_str), known)
         .into_iter()
-        .filter(|t| !known.contains(t))
+        .filter(|t| !already.contains(&fold_tag(t)))
+        .map(String::from)
         .collect()
 }
 
@@ -243,27 +270,30 @@ mod tag_guard_tests {
     fn flags_only_tags_outside_the_inventory() {
         let inv = known(&["project/corvux", "sync"]);
         let content = "---\ntags:\n  - sync\n  - brand-new\n---\n\n# X\n\nbody\n";
-        assert_eq!(novel_frontmatter_tags(content, &inv), vec!["brand-new"]);
+        assert_eq!(
+            novel_frontmatter_tags(content, &inv, None),
+            vec!["brand-new"]
+        );
     }
 
     #[test]
     fn all_known_tags_pass() {
         let inv = known(&["sync", "project/corvux"]);
         let content = "---\ntags: [sync, project/corvux]\n---\n\n# X\n";
-        assert!(novel_frontmatter_tags(content, &inv).is_empty());
+        assert!(novel_frontmatter_tags(content, &inv, None).is_empty());
     }
 
     #[test]
     fn empty_inventory_bootstraps_anything() {
         let inv = HashSet::new();
         let content = "---\ntags:\n  - whatever\n---\n";
-        assert!(novel_frontmatter_tags(content, &inv).is_empty());
+        assert!(novel_frontmatter_tags(content, &inv, None).is_empty());
     }
 
     #[test]
     fn no_frontmatter_has_no_novel_tags() {
         let inv = known(&["sync"]);
-        assert!(novel_frontmatter_tags("# just a body\n\nno frontmatter", &inv).is_empty());
+        assert!(novel_frontmatter_tags("# just a body\n\nno frontmatter", &inv, None).is_empty());
     }
 
     #[test]
@@ -272,6 +302,54 @@ mod tag_guard_tests {
         // not prose #hashes — so a body #newidea does not trip the guard.
         let inv = known(&["sync"]);
         let content = "---\ntags:\n  - sync\n---\n\n# X\n\nan inline #newidea here\n";
-        assert!(novel_frontmatter_tags(content, &inv).is_empty());
+        assert!(novel_frontmatter_tags(content, &inv, None).is_empty());
+    }
+
+    // ── LR-6 / LR-7 ──────────────────────────────────────────────────
+
+    #[test]
+    fn case_variant_of_a_known_tag_is_not_novel() {
+        // Regression: the guard compared exact strings, so `ML` was rejected
+        // as "invented" while `ml` is in the inventory — and the agent was
+        // told to drop it, or to coin yet another spelling.
+        let inv = known(&["ml", "project/corvux"]);
+        let content = "---\ntags: [ML, Project/Corvux]\n---\nbody";
+        assert!(novel_frontmatter_tags(content, &inv, None).is_empty());
+        // A genuinely new tag is still flagged.
+        let content = "---\ntags: [ML, brand-new]\n---\nbody";
+        assert_eq!(
+            novel_frontmatter_tags(content, &inv, None),
+            vec!["brand-new"]
+        );
+    }
+
+    #[test]
+    fn unicode_tag_is_compared_by_identity_across_normalization() {
+        let inv = known(&["café"]);
+        // NFD spelling + upper case of the same tag.
+        let content = "---\ntags: [CAFE\u{301}]\n---\nbody";
+        assert!(novel_frontmatter_tags(content, &inv, None).is_empty());
+        let content = "---\ntags: [日本語]\n---\nbody";
+        assert_eq!(novel_frontmatter_tags(content, &inv, None), vec!["日本語"]);
+    }
+
+    #[test]
+    fn a_tag_the_note_already_carries_is_never_novel() {
+        // Migration: a note indexed before LR-7 has no stored row for its
+        // Unicode tag, so the inventory lacks it. Editing the note must not
+        // demand the user's own tag be dropped.
+        let inv = known(&["sync"]);
+        let before = "---\ntags: [sync, café]\n---\n\nold body";
+        let after = "---\ntags: [sync, café]\n---\n\nnew body";
+        assert!(novel_frontmatter_tags(after, &inv, Some(before)).is_empty());
+        // ...but a tag the edit ADDS is still checked.
+        let after = "---\ntags: [sync, café, invented]\n---\n\nnew body";
+        assert_eq!(
+            novel_frontmatter_tags(after, &inv, Some(before)),
+            vec!["invented"]
+        );
+        // And without the note's prior content the same edit is rejected.
+        let after = "---\ntags: [sync, café]\n---\n";
+        assert_eq!(novel_frontmatter_tags(after, &inv, None), vec!["café"]);
     }
 }

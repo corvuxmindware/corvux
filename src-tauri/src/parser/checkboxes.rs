@@ -191,7 +191,9 @@ fn parse_checkbox_line(
     let wikilinks = extract_wikilinks(&text);
     let linked_project = tags
         .iter()
-        .find(|t| t.starts_with("project/"))
+        // LR-6: the `project/` namespace is matched by tag identity, so
+        // `#Project/Atlas` links like `#project/atlas` (value stays verbatim).
+        .find(|t| super::tags::fold_tag(t).starts_with("project/"))
         .cloned()
         .unwrap_or_default();
     let linked_person = wikilinks.first().cloned().unwrap_or_default();
@@ -295,32 +297,16 @@ pub(crate) fn checkbox_task_text(line: &str) -> Option<String> {
 
 fn extract_inline_tags(text: &str) -> Vec<String> {
     let mut out = Vec::new();
-    let bytes = text.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'#' {
-            let preceded_ok = i == 0 || bytes[i - 1].is_ascii_whitespace();
-            if !preceded_ok {
-                i += 1;
-                continue;
+    // LR-7: the tag rule (Unicode characters, whitespace boundary, the
+    // non-numeric rule) lives in ONE place — `parser::tags::scan_inline_tag` —
+    // shared with the note-level scanner so a task line and its note never
+    // disagree about what a tag is. `#` is ASCII, so a byte hit is a char
+    // boundary.
+    for (i, b) in text.bytes().enumerate() {
+        if b == b'#' {
+            if let Some(end) = super::tags::scan_inline_tag(text, i) {
+                out.push(text[i + 1..end].to_string());
             }
-            i += 1;
-            let mut tag = String::new();
-            while i < bytes.len() {
-                let c = bytes[i];
-                if c.is_ascii_alphanumeric() || c == b'-' || c == b'_' || c == b'/' {
-                    tag.push(c as char);
-                    i += 1;
-                } else {
-                    break;
-                }
-            }
-            // Same Obsidian rule as parser/tags.rs: at least one non-digit.
-            if !tag.is_empty() && tag.chars().any(|c| !c.is_ascii_digit()) {
-                out.push(tag);
-            }
-        } else {
-            i += 1;
         }
     }
     out
@@ -508,7 +494,9 @@ fn parse_frontmatter_task_item(
     let wikilinks = extract_wikilinks(&text);
     let linked_project = tags
         .iter()
-        .find(|t| t.starts_with("project/"))
+        // LR-6: the `project/` namespace is matched by tag identity, so
+        // `#Project/Atlas` links like `#project/atlas` (value stays verbatim).
+        .find(|t| super::tags::fold_tag(t).starts_with("project/"))
         .cloned()
         .unwrap_or_default();
     let linked_person = wikilinks.first().cloned().unwrap_or_default();
@@ -808,6 +796,26 @@ mod tests {
         assert_eq!(tasks[0].wikilinks, vec!["Ravi".to_string()]);
         assert_eq!(tasks[0].linked_person, "Ravi");
         assert_eq!(tasks[0].linked_project, "project/atlas");
+    }
+
+    /// LR-7: the task-line tag scan shares the note-level rule, so a Unicode
+    /// tag in a task is whole (it used to be truncated at the first non-ASCII
+    /// letter) and an emoji ends it.
+    #[test]
+    fn project_namespace_matches_by_tag_identity() {
+        let tasks = t("- [ ] Ship #Project/Atlas 📅 2026-05-02");
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].linked_project, "Project/Atlas", "verbatim value");
+    }
+
+    #[test]
+    fn task_line_tags_are_unicode_aware() {
+        let tasks = t("- [ ] Plan #café and #日本語 trip #go🚀 #2024 📅 2026-05-02");
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(
+            tasks[0].tags,
+            vec!["café".to_string(), "日本語".to_string(), "go".to_string()]
+        );
     }
 
     #[test]

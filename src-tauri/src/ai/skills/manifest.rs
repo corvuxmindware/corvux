@@ -223,8 +223,11 @@ fn scalar_field(frontmatter: &str, key: &str) -> Option<String> {
     None
 }
 
-/// Convenience: read SKILL.md from disk and parse. Used by
-/// `SkillRegistry::refresh`.
+/// Read a SKILL.md from disk with plain `std::fs` and parse it. Used ONLY for the
+/// user's global `~/.corvux/skills` folder, which is not part of any roost and
+/// may legitimately be a link farm. Roost-local manifests never come through
+/// here — they are read by `roost_scan` through the roost filesystem, which
+/// refuses links that leave the roost (AT-5).
 pub fn read_and_parse(skill_md_path: &Path) -> Result<SkillManifest, SkillParseError> {
     let folder = skill_md_path
         .parent()

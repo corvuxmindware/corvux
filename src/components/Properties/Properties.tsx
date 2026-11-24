@@ -9,6 +9,7 @@ import {
   removeTagFromProperty,
   addTagToProperty,
 } from "../../lib/frontmatter";
+import { isValidTagText } from "../../lib/tags";
 import { tabStore } from "../../stores/tabs";
 
 interface PropertiesProps {
@@ -424,7 +425,9 @@ function sanitizeTagInput(raw: string): string {
 // look saved while silently never appearing in the graph.
 function isValidTag(tag: string): boolean {
   if (tag.length === 0) return false;
-  return /[^0-9]/.test(tag);
+  // Same rule as the indexer (Unicode-aware: Arabic-Indic digits are numbers
+  // too) — see `lib/tags.ts`.
+  return isValidTagText(tag);
 }
 
 function TagList(props: { propKey: string; values: string[] }) {

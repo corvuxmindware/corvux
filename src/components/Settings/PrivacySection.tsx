@@ -250,8 +250,8 @@ export default function PrivacySection() {
           Every save is recorded as a revertable diff so you can roll a note
           back from the History pane. This log is stored{" "}
           <strong class="text-text-primary">only on this device and never syncs</strong>{" "}
-          — up to 500 edits are kept per note. Export it as JSON for your own
-          records, or clear it entirely.
+          — up to 500 edits and about 16 MB are kept per note, oldest dropped
+          first. Export it as JSON for your own records, or clear it entirely.
         </p>
         <div class="flex flex-wrap gap-2 pt-1">
           <button

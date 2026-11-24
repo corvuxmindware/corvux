@@ -523,21 +523,40 @@ impl RoostIndex {
     }
 
     /// Every tag across the roost with its use count, most-used first (ties
-    /// broken alphabetically). Frontmatter `tags` + inline `#tags`, deduped
-    /// per note so one note tagged `#sync` twice counts once. This is the
-    /// existing tag vocabulary a caller should reuse instead of inventing
-    /// near-duplicate variants.
+    /// broken alphabetically). Frontmatter `tags` + inline `#tags`. One entry
+    /// per tag IDENTITY (`frontmatter::fold_tag`, LR-6): `#ML` and `#ml` are
+    /// one tag, counted once per NOTE (a note carrying both counts once), and
+    /// shown under their most-used spelling (ties → byte-wise smallest — the
+    /// same rule as the app's tag inventory). This is the existing tag
+    /// vocabulary a caller should reuse instead of inventing near-duplicate
+    /// variants.
     pub fn tag_counts(&self) -> Vec<(String, usize)> {
-        let mut counts: HashMap<String, usize> = HashMap::new();
+        // identity → (notes carrying it, spelling → notes using that spelling)
+        let mut groups: HashMap<String, (usize, HashMap<String, usize>)> = HashMap::new();
         for note in self.notes.values() {
-            let mut seen: HashSet<String> = HashSet::new();
+            let mut seen_keys: HashSet<String> = HashSet::new();
+            let mut seen_spellings: HashSet<String> = HashSet::new();
             for t in crate::frontmatter::all_tags(&note.content) {
-                if seen.insert(t.to_lowercase()) {
-                    *counts.entry(t).or_default() += 1;
+                let key = crate::frontmatter::fold_tag(&t);
+                let group = groups.entry(key.clone()).or_default();
+                if seen_keys.insert(key) {
+                    group.0 += 1;
+                }
+                if seen_spellings.insert(t.clone()) {
+                    *group.1.entry(t).or_default() += 1;
                 }
             }
         }
-        let mut v: Vec<(String, usize)> = counts.into_iter().collect();
+        let mut v: Vec<(String, usize)> = groups
+            .into_values()
+            .filter_map(|(count, spellings)| {
+                let display = spellings
+                    .into_iter()
+                    .max_by(|a, b| a.1.cmp(&b.1).then_with(|| b.0.cmp(&a.0)))
+                    .map(|(s, _)| s)?;
+                Some((display, count))
+            })
+            .collect();
         v.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
         v
     }
@@ -940,7 +959,7 @@ impl RoostIndex {
         for (rel, note) in &self.notes {
             let mut seen: HashSet<String> = HashSet::new();
             for t in crate::frontmatter::all_tags(&note.content) {
-                let t = t.to_lowercase();
+                let t = crate::frontmatter::fold_tag(&t);
                 if seen.insert(t.clone()) {
                     tag_notes.entry(t).or_default().push(rel.as_str());
                 }
@@ -1118,12 +1137,20 @@ fn shared_dir_prefix(candidate_rel: &str, source_dir: &str) -> usize {
 
 /// First body line containing any term, plus the next non-empty line for
 /// context (2 lines). Trimmed and length-capped so snippets stay scannable.
+///
+/// AT-3 (MCP side): memory per hit is bounded by the cap, not by the line. The
+/// search runs this for EVERY matching note before ranking, so a note whose
+/// body is one 1 MB line (pasted base64) must not cost a lowercased copy of
+/// the note plus a 1 MB clone of the line per hit: lines are lowercased lazily,
+/// one at a time, until the first hit, and each piece is capped BEFORE the two
+/// are joined. (Unlike the app's `line_matches`, this keeps one snippet per
+/// note, so there is no per-match clone to amplify.)
 fn snippet_for(content: &str, terms: &[String]) -> String {
     let lines: Vec<&str> = content.lines().collect();
-    let lc: Vec<String> = lines.iter().map(|l| l.to_lowercase()).collect();
-    let first = lc
-        .iter()
-        .position(|l| terms.iter().any(|t| l.contains(t.as_str())));
+    let first = lines.iter().position(|l| {
+        let lower = l.to_lowercase();
+        terms.iter().any(|t| lower.contains(t.as_str()))
+    });
     let Some(i) = first else {
         return lines
             .iter()
@@ -1131,10 +1158,10 @@ fn snippet_for(content: &str, terms: &[String]) -> String {
             .map(|l| cap_snippet(l.trim()))
             .unwrap_or_default();
     };
-    let mut snip = lines[i].trim().to_string();
+    let mut snip = cap_snippet(lines[i].trim());
     if let Some(nextline) = lines[i + 1..].iter().find(|l| !l.trim().is_empty()) {
         snip.push(' ');
-        snip.push_str(nextline.trim());
+        snip.push_str(&cap_snippet(nextline.trim()));
     }
     cap_snippet(&snip)
 }
@@ -1195,6 +1222,49 @@ mod tests {
         assert!(idx
             .search(&["atlas".into(), "missing".into()], None, None, None, 10)
             .is_empty());
+    }
+
+    /// AT-3 (MCP side): a note that is ONE 1 MiB line (pasted base64) and the
+    /// one-letter query. One bounded snippet per note, never a clone of the line
+    /// per match, and the snippet is the capped prefix as before.
+    #[test]
+    fn search_snippet_on_a_one_megabyte_single_line_note_is_capped() {
+        let blob = "abcdefgh".repeat(131_072);
+        let (_d, _v, idx) = fresh(&[("blob.md", blob.as_str()), ("small.md", "a tiny note\n")]);
+        let hits = idx.search(&["a".into()], None, None, None, 10);
+        assert_eq!(hits.len(), 2);
+        for h in &hits {
+            assert!(
+                h.snippet.len() <= 200 + '…'.len_utf8(),
+                "{}",
+                h.snippet.len()
+            );
+        }
+        let blob_hit = hits.iter().find(|h| h.rel == "blob.md").unwrap();
+        assert!(blob_hit.snippet.starts_with("abcdefgh"));
+        assert!(blob_hit.snippet.ends_with('…'));
+    }
+
+    #[test]
+    fn snippet_caps_each_piece_before_joining_and_keeps_the_old_shape() {
+        // First line hit, next non-empty line appended, whole thing capped.
+        let s = snippet_for(
+            "intro\nthe needle line\n\nnext line here\n",
+            &["needle".into()],
+        );
+        assert_eq!(s, "the needle line next line here");
+        // A huge hit line is capped at 200 bytes + ellipsis; the next line is
+        // not even reached.
+        let long = format!("needle {}\nsecond\n", "x".repeat(1_000_000));
+        let s = snippet_for(&long, &["needle".into()]);
+        assert_eq!(s.len(), 200 + '…'.len_utf8());
+        assert!(!s.contains("second"));
+        // Multi-byte text is cut on a char boundary.
+        let s = snippet_for(
+            &format!("needle {}", "界".repeat(5_000)),
+            &["needle".into()],
+        );
+        assert!(s.ends_with('…'));
     }
 
     #[test]
@@ -1488,6 +1558,57 @@ mod tests {
         assert_eq!(map.get("idea"), Some(&1));
         // Sorted count-desc then alpha: the two 2-count tags lead, idea last.
         assert_eq!(counts.last().unwrap().0, "idea");
+    }
+
+    /// LR-6: `tag_counts` per-note dedup was already case-insensitive but the
+    /// ROOST-wide map was keyed by the raw spelling, so `#ML` (2 notes) and
+    /// `#ml` (3 notes) were two vocabulary entries — and `canonicalize_tags`,
+    /// which snaps to this list, could pick the wrong one. One entry per
+    /// identity, counted once per NOTE, under the most-used spelling.
+    #[test]
+    fn lr6_tag_counts_group_case_variants_by_identity() {
+        let (_d, _v, idx) = fresh(&[
+            (
+                "A.md",
+                "---\ntags: [ML, ml]\n---\n\n# A\n\n#Ml inline too\n",
+            ),
+            ("B.md", "# B\n\n#ml\n"),
+            ("C.md", "---\ntags: [ml]\n---\n\n# C\n"),
+            ("D.md", "# D\n\n#ML\n"),
+            ("E.md", "# E\n\n#other\n"),
+        ]);
+        // ml-identity: A, B, C, D = 4 notes (A carries three spellings: once).
+        // Spelling usage by notes: ml = A,B,C (3), ML = A,D (2), Ml = A (1).
+        assert_eq!(
+            idx.tag_counts(),
+            vec![("ml".to_string(), 4), ("other".to_string(), 1)]
+        );
+    }
+
+    #[test]
+    fn lr7_tag_counts_fold_unicode_case_and_normalization() {
+        let (_d, _v, idx) = fresh(&[
+            ("A.md", "# A\n\n#café\n"),
+            ("B.md", "# B\n\n#CAFÉ\n"),
+            ("C.md", "---\ntags: [cafe\u{301}]\n---\n\n# C\n"),
+            ("D.md", "# D\n\n#日本語\n"),
+        ]);
+        let counts = idx.tag_counts();
+        assert_eq!(counts.len(), 2, "{counts:?}");
+        assert_eq!(counts[0].1, 3);
+        assert_eq!(counts[1], ("日本語".to_string(), 1));
+    }
+
+    #[test]
+    fn lr6_suggest_links_pairs_notes_sharing_a_rare_tag_across_case() {
+        // `quic` / `QUIC` / NFD-equivalents are ONE rare tag: the pair shares it.
+        let (_d, _v, idx) = fresh(&[
+            ("P1.md", "---\ntags:\n  - quic\n---\n\n# P1\ntransport\n"),
+            ("P2.md", "---\ntags:\n  - QUIC\n---\n\n# P2\nhandshake\n"),
+        ]);
+        let s = idx.suggest_links(None, 10);
+        assert_eq!(s.len(), 1, "expected exactly the quic/QUIC pair");
+        assert_eq!(s[0].shared_tags, vec![("quic".to_string(), 2)]);
     }
 
     #[test]

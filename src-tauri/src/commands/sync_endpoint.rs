@@ -148,9 +148,15 @@ pub(super) async fn authorize_pin_change(
 pub(super) const SYNC_PAIR_DECLINED: &str = "SYNC_PAIR_DECLINED";
 
 /// Cap on the confirmed-peer record (each entry required a human click).
+/// Two things make room when it fills: `sync_unpair` removes the unpaired
+/// peer's entry ([`forget_confirmed_peer`]), and a full record drops the
+/// entries that no longer vouch for anything ([`prune_unpaired`]).
 const MAX_CONFIRMED_PEERS: usize = 512;
 
-/// Serializes the confirmed-peers read-modify-write.
+/// Serializes the confirmed-peers read-modify-write. A native dialog must
+/// NEVER be awaited while this is held (it would stall every pairing and
+/// unpair for up to the dialog timeout) — `sync_invariants::sy7_*` pins that:
+/// once the lane is taken, a function awaits nothing else.
 static CONFIRMED_PEERS_WRITE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// Backend-owned record of sync peers the user confirmed in a native
@@ -165,18 +171,42 @@ static CONFIRMED_PEERS_WRITE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const
 /// frontend auto-dial loop is inert since SYN-M10; the engine's own
 /// reconnect supervisor does not cross this IPC boundary). Fail closed:
 /// unreadable or garbage ⇒ empty ⇒ every pair re-confirms.
+///
+/// An entry lives exactly as long as the trust it records (SY-4): `sync_unpair`
+/// removes the peer's entry ([`forget_confirmed_peer`]), and a full record drops
+/// the entries of peers that are no longer paired ([`prune_unpaired`]). Entries
+/// written by builds before that fix for peers unpaired earlier are not found by
+/// either until the peer is paired and unpaired again, or the record fills up.
 pub(super) fn confirmed_peers_file(dir: &std::path::Path) -> std::path::PathBuf {
     dir.join("confirmed_sync_peers.json")
 }
 
-fn load_confirmed_peers(dir: &std::path::Path) -> std::collections::BTreeSet<String> {
-    let Ok(text) = std::fs::read_to_string(confirmed_peers_file(dir)) else {
-        return Default::default();
+/// Read the record, telling "nothing there / garbage" (both: empty — the gate
+/// trusts nothing from them) apart from "could not be read" (`Err`). Only
+/// [`forget_confirmed_peer`] needs the difference: it must not claim a peer was
+/// forgotten from a record it could not read.
+fn try_load_confirmed_peers(
+    dir: &std::path::Path,
+) -> Result<std::collections::BTreeSet<String>, String> {
+    let text = match std::fs::read_to_string(confirmed_peers_file(dir)) {
+        Ok(text) => text,
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::InvalidData
+            ) =>
+        {
+            return Ok(Default::default())
+        }
+        Err(e) => return Err(format!("read confirmed peers: {e}")),
     };
-    match serde_json::from_str::<Vec<String>>(&text) {
-        Ok(list) => list.into_iter().collect(),
-        Err(_) => Default::default(),
-    }
+    Ok(serde_json::from_str::<Vec<String>>(&text)
+        .map(|list| list.into_iter().collect())
+        .unwrap_or_default())
+}
+
+fn load_confirmed_peers(dir: &std::path::Path) -> std::collections::BTreeSet<String> {
+    try_load_confirmed_peers(dir).unwrap_or_default()
 }
 
 fn save_confirmed_peers(
@@ -269,7 +299,10 @@ fn identity_is_node(id: &crate::sync::store::peer_store::PairedIdentity, node: &
 /// today (DHCP reuse). TCP pairing is the legacy path; a pre-upgrade TCP peer
 /// is asked about once.
 ///
-/// Scope matches the confirmed record: app-wide, not per roost (SY-4, open).
+/// Scope matches the confirmed record: app-wide, not per roost. So a device
+/// that is still paired in ANOTHER roost counts as paired here even after it was
+/// unpaired in this one (SY-4 residual: per-roost scoping would add a prompt for
+/// every user who pairs one device into a second roost).
 /// Any read or decode problem counts as "not paired" (the dialog asks).
 fn already_paired(app_data_dir: &std::path::Path, key: &str) -> bool {
     let Some(node) = iroh_node_of_key(key) else {
@@ -348,32 +381,128 @@ pub(super) async fn authorize_first_pair(
     {
         return Err(SYNC_PAIR_DECLINED.to_string());
     }
+    record_user_confirmation(app_data_dir, key, MAX_CONFIRMED_PEERS).await;
+    Ok(PairAuth::UserConfirmed)
+}
+
+/// The user just answered yes for `key`: remember it, durably if possible.
+/// The pair proceeds whatever happens here — the user said yes — but an answer
+/// that cannot be written is remembered for THIS run only (across a restart an
+/// unwritable record is not trusted: fail closed).
+///
+/// Holds the record lane for its whole body and awaits nothing after taking it.
+async fn record_user_confirmation(app_data_dir: &std::path::Path, key: &str, cap: usize) {
     let _lane = CONFIRMED_PEERS_WRITE.lock().await;
     let mut peers = load_confirmed_peers(app_data_dir);
     if peers.contains(key) {
         // Recorded concurrently — but the user answered yes to THIS request.
-        return Ok(PairAuth::UserConfirmed);
+        return;
     }
-    if peers.len() >= MAX_CONFIRMED_PEERS {
-        // Nothing in the app removes entries from this record yet (SY-4), so
-        // refusing here would be a dead end after the user said yes. The pair
+    if peers.len() >= cap {
+        // SY-4: make room by dropping entries that no longer vouch for anything
+        // (a peer that was unpaired, or never finished pairing). Peers that are
+        // still paired keep their entry, so nobody who is paired is asked again.
+        let dropped = prune_unpaired(app_data_dir, &mut peers);
+        tracing::info!(
+            dropped,
+            limit = cap,
+            "sync pair: confirmed-peer record was full — dropped stale entries"
+        );
+    }
+    if peers.len() >= cap {
+        // Every entry is a peer that is still paired: nothing to drop. The pair
         // proceeds; this run remembers it; a restart asks again unless the
         // pairing completed (then the paired-peer registry knows the peer).
         tracing::warn!(
-            limit = MAX_CONFIRMED_PEERS,
+            limit = cap,
             "sync pair: confirmed-peer record is full — remembered for this run only"
         );
         session_confirmed_peers().insert(key.to_string());
-        return Ok(PairAuth::UserConfirmed);
+        return;
     }
     peers.insert(key.to_string());
     if let Err(e) = save_confirmed_peers(app_data_dir, &peers) {
-        // The pair proceeds and this run remembers the answer; across a
-        // restart the unwritable record is not trusted (fail closed).
         tracing::warn!(error = %e, "sync pair: persisting confirmed peer failed — remembered for this run only");
         session_confirmed_peers().insert(key.to_string());
     }
-    Ok(PairAuth::UserConfirmed)
+}
+
+/// Keep only the entries that still vouch for something: an iroh peer that is
+/// currently paired in a trusted registry ([`already_paired`]). Everything else
+/// — an unpaired or never-paired iroh peer, and every `tcp:` entry (TCP never
+/// counts as paired, SA-3) — only means "asked once", and is asked again.
+/// Returns how many were dropped.
+fn prune_unpaired(
+    app_data_dir: &std::path::Path,
+    peers: &mut std::collections::BTreeSet<String>,
+) -> usize {
+    let before = peers.len();
+    peers.retain(|key| iroh_node_of_key(key).is_some() && already_paired(app_data_dir, key));
+    before - peers.len()
+}
+
+/// SY-4: forget the first-pair confirmation of a peer the user just unpaired —
+/// the persisted record AND this run's session memory — so that connecting to it
+/// again asks in the native dialog. Without it a hijacked webview could re-pair
+/// an unpaired identity (a lost phone) silently.
+///
+/// Fail closed: a record that cannot be read or rewritten is an `Err`, and the
+/// caller (`sync_unpair`) then refuses the unpair instead of claiming it while
+/// the old trust remains. An empty `keys` is a no-op.
+///
+/// Holds the record lane and awaits nothing after taking it.
+pub(super) async fn forget_confirmed_peer(
+    app_data_dir: &std::path::Path,
+    keys: &[String],
+) -> Result<(), String> {
+    if keys.is_empty() {
+        return Ok(());
+    }
+    let _lane = CONFIRMED_PEERS_WRITE.lock().await;
+    session_confirmed_peers().retain(|k| !keys.contains(k));
+    let mut peers = try_load_confirmed_peers(app_data_dir)?;
+    let before = peers.len();
+    peers.retain(|k| !keys.contains(k));
+    if peers.len() != before {
+        save_confirmed_peers(app_data_dir, &peers)?;
+    }
+    Ok(())
+}
+
+/// Every confirm key (see [`peer_confirm_key`]) under which the user could have
+/// confirmed this peer: its iroh NodeId (the recorded id, and the one inside a
+/// stored `corvux1:` ticket) and, for a legacy pairing, its `tcp:` address.
+/// Built from the peer's own record, so it matches what the pairing commands
+/// keyed on at pair time.
+pub(super) fn confirm_keys_for_peer(
+    record: &crate::sync::store::peer_store::PeerRecord,
+) -> Vec<String> {
+    let mut keys: Vec<String> = Vec::new();
+    let mut push = |key: String| {
+        if !keys.contains(&key) {
+            keys.push(key);
+        }
+    };
+    if let Some(node) = record
+        .peer_node_id
+        .and_then(|bytes| iroh::EndpointId::from_bytes(&bytes).ok())
+    {
+        push(peer_confirm_key("iroh", &node.to_string()));
+    }
+    match record.last_known_addr.as_deref() {
+        Some(addr) if addr.starts_with("corvux1:") => {
+            if let Ok(peer) = crate::sync::transport::iroh::decode_ticket(addr) {
+                push(peer_confirm_key("iroh", &peer.id.to_string()));
+            }
+        }
+        Some(addr) => {
+            if let Ok(sock) = addr.parse::<std::net::SocketAddr>() {
+                push(peer_confirm_key("tcp", &sock.to_string()));
+            }
+        }
+        None => {}
+    }
+    keys
 }
 
 /// R1-in (sharp-edges residual): showing the pairing code / starting the
@@ -961,6 +1090,277 @@ mod first_pair_gate_tests {
             !load_confirmed_peers(&unwritable).contains(&key),
             "nothing persisted, so a restart asks again"
         );
+    }
+
+    // ── SY-4: unpair forgets the confirmation ───────────────────────────
+
+    /// Confirm `key` through the dialog (the record then trusts it), with no
+    /// paired-peer registry anywhere — the "confirmed, then unpaired" state.
+    async fn confirm_once(dir: &std::path::Path, key: &str) {
+        let allow = Scripted::allow();
+        assert_eq!(
+            authorize_first_pair(dir, key, "peer", &allow)
+                .await
+                .unwrap(),
+            PairAuth::UserConfirmed
+        );
+        assert_eq!(allow.times_asked(), 1);
+    }
+
+    async fn is_asked_again(dir: &std::path::Path, key: &str) -> bool {
+        let deny = Scripted::deny();
+        let refused = authorize_first_pair(dir, key, "peer", &deny)
+            .await
+            .map(|_| false)
+            .unwrap_or_else(|e| e == SYNC_PAIR_DECLINED);
+        refused && deny.times_asked() == 1
+    }
+
+    /// The finding's scenario, end to end: confirm → pair → unpair a lost phone
+    /// → a hijacked webview names the same NodeId again. Before the fix the
+    /// record still trusted it and the pair went through with no dialog.
+    #[tokio::test]
+    async fn unpairing_a_peer_makes_the_dialog_come_back() {
+        let dir = TempDir::new().unwrap();
+        let key = peer_confirm_key("iroh", &node(51).to_string());
+        confirm_once(dir.path(), &key).await;
+
+        // Trusted until unpaired.
+        let silent = Scripted::deny();
+        authorize_first_pair(dir.path(), &key, "peer", &silent)
+            .await
+            .unwrap();
+        assert_eq!(silent.times_asked(), 0);
+
+        forget_confirmed_peer(dir.path(), std::slice::from_ref(&key))
+            .await
+            .unwrap();
+        assert!(!load_confirmed_peers(dir.path()).contains(&key));
+        assert!(
+            is_asked_again(dir.path(), &key).await,
+            "an unpaired peer must be asked about again"
+        );
+    }
+
+    /// A confirmation that could not be written lives in this run's memory; the
+    /// unpair must clear that too or the peer stays trusted until restart.
+    #[tokio::test]
+    async fn unpairing_also_clears_the_session_only_confirmation() {
+        let parent = TempDir::new().unwrap();
+        let unwritable = parent.path().join("missing"); // every save fails
+        let key = peer_confirm_key("iroh", &node(52).to_string());
+        confirm_once(&unwritable, &key).await;
+        assert!(session_confirmed_peers().contains(&key));
+
+        forget_confirmed_peer(&unwritable, std::slice::from_ref(&key))
+            .await
+            .unwrap();
+        assert!(!session_confirmed_peers().contains(&key));
+        assert!(is_asked_again(&unwritable, &key).await);
+    }
+
+    #[tokio::test]
+    async fn forgetting_one_peer_leaves_the_others_confirmed() {
+        let dir = TempDir::new().unwrap();
+        let gone = peer_confirm_key("iroh", &node(53).to_string());
+        let kept = peer_confirm_key("iroh", &node(54).to_string());
+        confirm_once(dir.path(), &gone).await;
+        confirm_once(dir.path(), &kept).await;
+
+        forget_confirmed_peer(dir.path(), std::slice::from_ref(&gone))
+            .await
+            .unwrap();
+        assert!(is_asked_again(dir.path(), &gone).await);
+        let silent = Scripted::deny();
+        authorize_first_pair(dir.path(), &kept, "peer", &silent)
+            .await
+            .unwrap();
+        assert_eq!(silent.times_asked(), 0, "an unrelated peer stays confirmed");
+    }
+
+    #[tokio::test]
+    async fn forgetting_nothing_or_an_unknown_peer_changes_nothing() {
+        let dir = TempDir::new().unwrap();
+        forget_confirmed_peer(dir.path(), &[]).await.unwrap();
+        assert!(
+            !confirmed_peers_file(dir.path()).exists(),
+            "no keys: not even a record is created"
+        );
+        let key = peer_confirm_key("iroh", &node(55).to_string());
+        confirm_once(dir.path(), &key).await;
+        let before = std::fs::read_to_string(confirmed_peers_file(dir.path())).unwrap();
+        forget_confirmed_peer(dir.path(), &["iroh:never-seen".to_string()])
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(confirmed_peers_file(dir.path())).unwrap(),
+            before
+        );
+    }
+
+    /// Fail closed: if the record cannot be rewritten the unpair is refused
+    /// (an Err), and the old confirmation is NOT silently left behind as if it
+    /// had been removed.
+    #[tokio::test]
+    async fn forgetting_fails_closed_when_the_record_cannot_be_rewritten() {
+        let dir = TempDir::new().unwrap();
+        let key = peer_confirm_key("iroh", &node(56).to_string());
+        confirm_once(dir.path(), &key).await;
+        // A directory squatting on the temp name makes the rewrite fail.
+        std::fs::create_dir(dir.path().join("confirmed_sync_peers.json.tmp")).unwrap();
+        let err = forget_confirmed_peer(dir.path(), std::slice::from_ref(&key))
+            .await
+            .unwrap_err();
+        assert!(err.contains("write confirmed peers"), "{err}");
+        assert!(
+            load_confirmed_peers(dir.path()).contains(&key),
+            "the record is unchanged, so the caller must treat the unpair as failed"
+        );
+    }
+
+    #[tokio::test]
+    async fn forgetting_fails_closed_when_the_record_cannot_be_read() {
+        let dir = TempDir::new().unwrap();
+        // A directory where the record should be: unreadable, not absent.
+        std::fs::create_dir(confirmed_peers_file(dir.path())).unwrap();
+        let key = peer_confirm_key("iroh", &node(57).to_string());
+        assert!(forget_confirmed_peer(dir.path(), &[key]).await.is_err());
+    }
+
+    fn record_for(
+        node_id: Option<[u8; 32]>,
+        addr: Option<&str>,
+    ) -> crate::sync::store::peer_store::PeerRecord {
+        let mut r = crate::sync::store::peer_store::PeerRecord::new(
+            crate::sync::identity::DeviceId([7u8; 16]),
+            [0u8; 32],
+            "phone".into(),
+        );
+        r.peer_node_id = node_id;
+        r.last_known_addr = addr.map(str::to_string);
+        r
+    }
+
+    /// The keys must be exactly what the pairing commands keyed on, or the
+    /// unpair removes nothing: `iroh:` + the NodeId's Display, `tcp:` + the
+    /// socket address.
+    #[test]
+    fn the_keys_for_a_peer_match_the_ones_the_pair_commands_use() {
+        let by_id = node(61);
+        let by_ticket = node(62);
+        let ticket =
+            crate::sync::transport::iroh::encode_ticket(&iroh::EndpointAddr::new(by_ticket), None)
+                .unwrap();
+        let keys = confirm_keys_for_peer(&record_for(Some(*by_id.as_bytes()), Some(&*ticket)));
+        assert_eq!(
+            keys,
+            vec![
+                peer_confirm_key("iroh", &by_id.to_string()),
+                peer_confirm_key("iroh", &by_ticket.to_string()),
+            ]
+        );
+
+        // The same node recorded twice is one key.
+        let same = confirm_keys_for_peer(&record_for(Some(*by_ticket.as_bytes()), Some(&*ticket)));
+        assert_eq!(same, vec![peer_confirm_key("iroh", &by_ticket.to_string())]);
+
+        let tcp = confirm_keys_for_peer(&record_for(None, Some("10.0.0.5:4242")));
+        assert_eq!(tcp, vec![peer_confirm_key("tcp", "10.0.0.5:4242")]);
+
+        assert!(confirm_keys_for_peer(&record_for(None, None)).is_empty());
+        assert!(confirm_keys_for_peer(&record_for(None, Some("not an address"))).is_empty());
+        assert!(confirm_keys_for_peer(&record_for(None, Some("corvux1:garbage"))).is_empty());
+    }
+
+    // ── SY-4: the record's cap has a real removal path ──────────────────
+
+    #[tokio::test]
+    async fn a_full_record_drops_stale_entries_and_keeps_paired_peers() {
+        let app_data = TempDir::new().unwrap();
+        let paired = node(71);
+        pair_in_registry(
+            app_data.path(),
+            "id-00000000000000000000000000000071",
+            true,
+            Some(*paired.as_bytes()),
+            None,
+        );
+        let paired_key = peer_confirm_key("iroh", &paired.to_string());
+        let stale_iroh = peer_confirm_key("iroh", &node(72).to_string());
+        let stale_tcp = peer_confirm_key("tcp", "10.0.0.72:4242");
+        let mut full = BTreeSet::new();
+        full.insert(paired_key.clone());
+        full.insert(stale_iroh.clone());
+        full.insert(stale_tcp.clone());
+        full.insert(peer_confirm_key("iroh", &node(73).to_string()));
+        save_confirmed_peers(app_data.path(), &full).unwrap();
+
+        let fresh = peer_confirm_key("iroh", &node(74).to_string());
+        record_user_confirmation(app_data.path(), &fresh, 4).await;
+
+        let after = load_confirmed_peers(app_data.path());
+        assert!(after.contains(&fresh), "the new confirmation is recorded");
+        assert!(after.contains(&paired_key), "a still-paired peer is kept");
+        assert!(!after.contains(&stale_iroh));
+        assert!(!after.contains(&stale_tcp));
+        assert_eq!(after.len(), 2);
+    }
+
+    /// When every entry is a peer that is still paired there is nothing to
+    /// drop: the pair still proceeds (the user said yes), this run remembers it,
+    /// and nobody who is paired loses their entry.
+    #[tokio::test]
+    async fn a_record_full_of_paired_peers_falls_back_to_this_run_only() {
+        let app_data = TempDir::new().unwrap();
+        let (a, b) = (node(75), node(76));
+        pair_in_registry(
+            app_data.path(),
+            "id-00000000000000000000000000000075",
+            true,
+            Some(*a.as_bytes()),
+            None,
+        );
+        pair_in_registry(
+            app_data.path(),
+            "id-00000000000000000000000000000076",
+            true,
+            Some(*b.as_bytes()),
+            None,
+        );
+        let mut full = BTreeSet::new();
+        full.insert(peer_confirm_key("iroh", &a.to_string()));
+        full.insert(peer_confirm_key("iroh", &b.to_string()));
+        save_confirmed_peers(app_data.path(), &full).unwrap();
+
+        let fresh = peer_confirm_key("iroh", &node(77).to_string());
+        record_user_confirmation(app_data.path(), &fresh, 2).await;
+
+        assert_eq!(
+            load_confirmed_peers(app_data.path()),
+            full,
+            "nothing evicted"
+        );
+        assert!(session_confirmed_peers().contains(&fresh));
+    }
+
+    #[test]
+    fn pruning_keeps_only_peers_that_are_still_paired() {
+        let app_data = TempDir::new().unwrap();
+        let paired = node(78);
+        pair_in_registry(
+            app_data.path(),
+            "id-00000000000000000000000000000078",
+            true,
+            Some(*paired.as_bytes()),
+            None,
+        );
+        let mut peers = BTreeSet::new();
+        peers.insert(peer_confirm_key("iroh", &paired.to_string()));
+        peers.insert(peer_confirm_key("iroh", &node(79).to_string()));
+        peers.insert(peer_confirm_key("tcp", "10.0.0.79:4242"));
+        peers.insert("garbage".to_string());
+        assert_eq!(prune_unpaired(app_data.path(), &mut peers), 3);
+        assert_eq!(peers.len(), 1);
     }
 
     #[test]

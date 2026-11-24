@@ -18,6 +18,10 @@
 //! - local delete — `mark_note_deleted` (commit the tombstone, then reconcile
 //!   the disk trash under the SAME guard — re-removing a copy a racing adopt
 //!   recreated, so disk can't disagree with the tombstone)
+//! - watcher / rescan-INFERRED delete — `verify_then_tombstone` →
+//!   `commit_tombstone(InferredFromDisk)` (the doc-not-deleted and file-still-
+//!   absent checks run UNDER the guard, in the same critical section as the
+//!   commit, so a file recreated since the watcher looked is never tombstoned)
 //! - local restore / undo-delete — `restore_note` (clear the tombstone, then
 //!   reconcile the disk write back under the SAME guard)
 //! - local rename / move — `notify_local_rename` (decomposes into

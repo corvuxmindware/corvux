@@ -15,6 +15,7 @@ use notify_debouncer_full::{new_debouncer, DebounceEventResult, Debouncer, Recom
 use tracing::warn;
 
 use super::registry::{self, SkillRegistry};
+use super::roost_scan;
 
 /// Debounce window — long enough to coalesce a save burst, short enough
 /// the agent picks up a new skill mid-session if the user is editing
@@ -65,7 +66,8 @@ pub fn spawn_watcher(
     .map_err(|e| format!("notify debouncer failed: {e}"))?;
 
     if let Some(dir) = roost_skills_dir.as_deref() {
-        if dir.exists() {
+        // AT-5: only attach to a folder that stays inside the roost.
+        if roost_scan::definitions_dir_exists(dir, "skills") {
             debouncer
                 .watch(dir, RecursiveMode::Recursive)
                 .map_err(|e| format!("watch roost skills: {e}"))?;
@@ -103,9 +105,13 @@ pub fn spawn_default_watcher(
     let roost_dir = roost_root.map(registry::roost_skills_dir);
     let global_dir = registry::global_skills_dir();
     if let Some(ref dir) = roost_dir {
-        // Best-effort create so the watcher has something to attach to;
-        // ignore EEXIST and permission errors silently.
-        let _ = std::fs::create_dir_all(dir);
+        // Best-effort create so the watcher has something to attach to. It goes
+        // through the roost filesystem (AT-5): a raw `create_dir_all` followed a
+        // `.corvux` link and made the folder OUTSIDE the roost. A read-only
+        // roost is fine, so failures are only logged.
+        if let Err(e) = roost_scan::ensure_definitions_dir(dir, "skills") {
+            tracing::debug!(error = %e, "skill: not creating the roost skills folder");
+        }
     }
     spawn_watcher(registry, roost_dir, global_dir)
 }

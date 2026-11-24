@@ -12,6 +12,9 @@
 
 mod manifest;
 mod registry;
+// Shared by the subagent registry too (same `.corvux/<kind>/<name>/<FILE>.md`
+// layout): the one hardened way to read roost-local definitions (AT-5).
+pub(crate) mod roost_scan;
 mod watcher;
 
 #[allow(unused_imports)] // first consumer is the skill_list / skill_load tools

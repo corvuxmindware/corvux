@@ -46,14 +46,63 @@ pub struct TaskRow {
 /// IPC handler. Sort order: open before completed; earliest due first;
 /// stable tiebreak on path then source line.
 pub fn query_all_tasks(db: &cozo::DbInstance) -> Result<Vec<TaskRow>, String> {
-    let script = r#"
+    query_tasks_scoped(db, None)
+}
+
+/// One note's task rows — identical row shape, exclusion filter and order to
+/// [`query_all_tasks`], but O(this note's tasks): the `note_id = $note_id`
+/// unification joins into the `:task` key prefix instead of scanning the whole
+/// relation. Lets `GraphDb` keep its cached task list current on a single-note
+/// index by replacing just that note's rows (DB-3) instead of re-reading every
+/// task in the roost on each save.
+pub(crate) fn query_note_tasks(
+    db: &cozo::DbInstance,
+    note_id: &str,
+) -> Result<Vec<TaskRow>, String> {
+    query_tasks_scoped(db, Some(note_id))
+}
+
+/// Canonical task-list order (open before completed; earliest due first;
+/// stable tiebreak on path then source line). The ONE comparator shared by the
+/// full query and the incremental merge in `GraphDb`, so a patched cache is
+/// byte-identical to a fresh `query_all_tasks`.
+pub(crate) fn task_row_cmp(a: &TaskRow, b: &TaskRow) -> std::cmp::Ordering {
+    a.completed
+        .cmp(&b.completed)
+        .then_with(|| sort_key_due(&a.due_at).cmp(&sort_key_due(&b.due_at)))
+        .then_with(|| a.note_path.cmp(&b.note_path))
+        .then_with(|| a.source_line.cmp(&b.source_line))
+}
+
+fn query_tasks_scoped(
+    db: &cozo::DbInstance,
+    note_id: Option<&str>,
+) -> Result<Vec<TaskRow>, String> {
+    let all_script = r#"
         ?[note_id, source_line, text, due_at, completed, completed_at, linked_person, linked_project, note_title, note_path] :=
             *task{ note_id, source_line, text, due_at, completed, completed_at, linked_person, linked_project },
             *notes{ id: note_id, title: note_title, path: note_path }
     "#;
+    let one_script = r#"
+        ?[note_id, source_line, text, due_at, completed, completed_at, linked_person, linked_project, note_title, note_path] :=
+            note_id = $note_id,
+            *task{ note_id, source_line, text, due_at, completed, completed_at, linked_person, linked_project },
+            *notes{ id: note_id, title: note_title, path: note_path }
+    "#;
+    let mut params = BTreeMap::new();
+    let script = match note_id {
+        None => all_script,
+        Some(id) => {
+            params.insert(
+                "note_id".to_string(),
+                cozo::DataValue::Str(id.to_string().into()),
+            );
+            one_script
+        }
+    };
 
     let result = db
-        .run_script(script, BTreeMap::new(), ScriptMutability::Immutable)
+        .run_script(script, params, ScriptMutability::Immutable)
         .map_err(|e| format!("list_tasks query failed: {e}"))?;
 
     let mut rows: Vec<TaskRow> = Vec::with_capacity(result.rows.len());

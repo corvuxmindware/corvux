@@ -607,6 +607,8 @@ pub async fn search_roost(
     // shipped empty `matches[]`). A hit outside the active backend is rejected;
     // raw absolute-path fallback would cross the active-roost boundary.
     let terms = positive_query_terms(&query);
+    // AT-3: bound the matches recorded across the whole call, not just per note.
+    let mut match_budget = MAX_MATCHES_PER_SEARCH;
     let mut results = Vec::with_capacity(fused.len());
     for (path, score, match_type, snippet) in fused {
         let content_opt = read_search_hit(backend.as_ref(), &path).await;
@@ -619,7 +621,8 @@ pub async fn search_roost(
             tracing::debug!(%path, "search: skipping hit with unreadable file (likely deleted off-app)");
             continue;
         };
-        let matches = line_matches(&content, &terms);
+        let matches = line_matches_capped(&content, &terms, match_budget.min(MAX_MATCHES_PER_NOTE));
+        match_budget -= matches.len();
         let name = Path::new(&path)
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
@@ -810,29 +813,166 @@ fn positive_query_terms(raw: &str) -> Vec<String> {
     terms
 }
 
+/// Most line matches recorded per note (AT-3). A note can match thousands of
+/// times (query `a` over pasted base64); the UI lists ten per note and shows a
+/// count, so this only bounds memory. `MAX_MATCHES_PER_NOTE * 50` (the hydrate
+/// lane's note limit) equals [`MAX_MATCHES_PER_SEARCH`], so no hydrated note
+/// is starved by an earlier one.
+const MAX_MATCHES_PER_NOTE: usize = 100;
+
+/// Most line matches recorded across one `search_roost` call (AT-3). Bounds the
+/// grep fallback, which walks every note and has no note limit of its own.
+const MAX_MATCHES_PER_SEARCH: usize = 5_000;
+
+/// A (trimmed) line up to this many bytes is stored whole in
+/// [`SearchMatch::text`]; a longer one is stored as a window around the match.
+const SNIPPET_WHOLE_LINE_BYTES: usize = 512;
+
+/// Chars of a long line kept before / after the match start in the window.
+const SNIPPET_BEFORE_CHARS: usize = 60;
+const SNIPPET_AFTER_CHARS: usize = 180;
+
 /// Find every occurrence of any `term` (case-insensitive) across `content`,
 /// recording 1-based line, trimmed line text, and byte column. Shared by the
 /// FTS hydrate path and the grep fallback so both report offsets the same way.
+/// At most [`MAX_MATCHES_PER_NOTE`] matches are returned. Production callers
+/// pass their remaining per-search budget to [`line_matches_capped`] directly;
+/// this per-note-cap form is what the unit tests exercise.
+#[cfg(test)]
 fn line_matches(content: &str, terms: &[String]) -> Vec<SearchMatch> {
+    line_matches_capped(content, terms, MAX_MATCHES_PER_NOTE)
+}
+
+/// [`line_matches`] with an explicit cap (the remaining per-search budget may
+/// be lower than the per-note cap).
+///
+/// AT-3: memory per recorded match is bounded. A line longer than
+/// [`SNIPPET_WHOLE_LINE_BYTES`] is not cloned per match (a 1 MB line and the
+/// query `a` used to clone it ~16k times = ~16 GB); [`line_snippet`] stores a
+/// char-boundary-safe window around the match instead, and the scan stops at
+/// `cap` matches.
+///
+/// `col` is the byte offset of the match in the lowercased line, as before.
+/// For a windowed (long-line) match it is NOT an index into `text`.
+fn line_matches_capped(content: &str, terms: &[String], cap: usize) -> Vec<SearchMatch> {
     let mut matches = Vec::new();
-    if terms.is_empty() {
+    if terms.is_empty() || cap == 0 {
         return matches;
     }
-    for (line_idx, line) in content.lines().enumerate() {
+    'lines: for (line_idx, line) in content.lines().enumerate() {
         let line_lower = line.to_lowercase();
+        let trimmed = line.trim();
+        // Short lines (the normal case) are cloned whole, once per match.
+        let whole = (trimmed.len() <= SNIPPET_WHOLE_LINE_BYTES).then_some(trimmed);
         for term in terms {
             let mut search_from = 0;
-            while let Some(col) = line_lower[search_from..].find(term.as_str()) {
+            // Monotonic cursors for windowing a long line: matches of one term
+            // only move forward, so each term costs O(line) in total instead
+            // of O(line) per match.
+            let mut lower_cursor = CharCursor::new(&line_lower);
+            let mut orig_cursor = CharCursor::new(line);
+            while let Some(rel) = line_lower[search_from..].find(term.as_str()) {
+                let col = search_from + rel;
+                let text = match whole {
+                    Some(t) => t.to_string(),
+                    None => line_snippet(&mut lower_cursor, &mut orig_cursor, col),
+                };
                 matches.push(SearchMatch {
                     line: line_idx + 1,
-                    text: line.trim().to_string(),
-                    col: search_from + col,
+                    text,
+                    col,
                 });
-                search_from += col + term.len();
+                if matches.len() >= cap {
+                    break 'lines;
+                }
+                search_from = col + term.len();
             }
         }
     }
     matches
+}
+
+/// A forward-only position into a string, so a run of increasing targets walks
+/// the string once. `count` is whatever the advance method counts: chars for
+/// [`CharCursor::advance_to_byte`], LOWERCASED chars for
+/// [`CharCursor::advance_to_lowered_chars`].
+struct CharCursor<'a> {
+    s: &'a str,
+    byte: usize,
+    count: usize,
+}
+
+impl<'a> CharCursor<'a> {
+    fn new(s: &'a str) -> Self {
+        Self {
+            s,
+            byte: 0,
+            count: 0,
+        }
+    }
+
+    /// Advance to `byte` (a char boundary of `s`; never moves back) and return
+    /// the number of chars before it.
+    fn advance_to_byte(&mut self, byte: usize) -> usize {
+        while self.byte < byte {
+            let Some(c) = self.s[self.byte..].chars().next() else {
+                break;
+            };
+            self.byte += c.len_utf8();
+            self.count += 1;
+        }
+        self.count
+    }
+
+    /// Advance over chars of the ORIGINAL line until their lowercase forms
+    /// total `target` chars (never moves back; never splits a char) and return
+    /// the byte offset. `str::to_lowercase` can turn one char into several
+    /// (`İ` -> `i` + a combining dot), so a position found in the lowercased
+    /// line is translated to the original line through this count, not by
+    /// assuming one char maps to one char.
+    fn advance_to_lowered_chars(&mut self, target: usize) -> usize {
+        while self.count < target {
+            let Some(c) = self.s[self.byte..].chars().next() else {
+                break;
+            };
+            let width = c.to_lowercase().count();
+            if self.count + width > target {
+                break;
+            }
+            self.byte += c.len_utf8();
+            self.count += width;
+        }
+        self.byte
+    }
+}
+
+/// A window of a long line around the match at lowercased-byte offset `col`:
+/// up to [`SNIPPET_BEFORE_CHARS`] chars before and [`SNIPPET_AFTER_CHARS`]
+/// after, trimmed, with `…` marking each cut end. Both cursors must be used
+/// with non-decreasing `col`. Lowercasing can change a line's byte length and
+/// char count, so the position is carried from the lowercased line to the
+/// original one by counting lowercased chars (see
+/// [`CharCursor::advance_to_lowered_chars`]); the window start is always a char
+/// boundary of the original line, so the slice cannot split a character.
+fn line_snippet(lower: &mut CharCursor<'_>, orig: &mut CharCursor<'_>, col: usize) -> String {
+    let match_char = lower.advance_to_byte(col);
+    let start_byte = orig.advance_to_lowered_chars(match_char.saturating_sub(SNIPPET_BEFORE_CHARS));
+    // End: at most BEFORE + AFTER chars past the window start (a bounded walk;
+    // the shared cursor stays at the start for the next, later match).
+    let end_byte = orig.s[start_byte..]
+        .char_indices()
+        .nth(SNIPPET_BEFORE_CHARS + SNIPPET_AFTER_CHARS)
+        .map_or(orig.s.len(), |(i, _)| start_byte + i);
+    let window = orig.s[start_byte..end_byte].trim();
+    let mut out = String::with_capacity(window.len() + 6);
+    if start_byte > 0 {
+        out.push('\u{2026}');
+    }
+    out.push_str(window);
+    if end_byte < orig.s.len() {
+        out.push('\u{2026}');
+    }
+    out
 }
 
 /// Grep-based search — the fallback before FTS5 is warmed. SRX-6: walks and
@@ -844,14 +984,22 @@ async fn grep_search(backend: &dyn RoostFs, query: &str) -> Result<Vec<SearchRes
     let pairs = crate::roostfs::walk::list_markdown_path_pairs(backend).await?;
 
     let mut results = Vec::new();
+    // AT-3: this walk has no note limit of its own, so the TOTAL matches kept
+    // are bounded; once the budget is spent the scan stops (cold-window
+    // fallback only — the FTS lane takes over as soon as the index completes).
+    let mut match_budget = MAX_MATCHES_PER_SEARCH;
     for (abs, rel) in &pairs {
+        if match_budget == 0 {
+            break;
+        }
         let Ok(bytes) = backend.read(rel).await else {
             continue;
         };
         let Ok(content) = String::from_utf8(bytes) else {
             continue;
         };
-        let matches = line_matches(&content, &terms);
+        let matches = line_matches_capped(&content, &terms, match_budget.min(MAX_MATCHES_PER_NOTE));
+        match_budget -= matches.len();
         if !matches.is_empty() {
             let name = Path::new(abs)
                 .file_name()
@@ -1159,6 +1307,146 @@ mod tests {
     #[test]
     fn line_matches_empty_terms_yields_empty() {
         assert!(line_matches("some content here", &[]).is_empty());
+    }
+
+    // ── AT-3: bounded memory per match ──────────────────────────────
+
+    /// Upper bound on one stored snippet, in chars (window + two ellipses).
+    const MAX_SNIPPET_CHARS: usize = SNIPPET_BEFORE_CHARS + SNIPPET_AFTER_CHARS + 2;
+
+    /// The audit's exact shape: one 1 MiB line (pasted base64) and the
+    /// one-letter query a 150 ms-debounced search box sends first. The old code
+    /// cloned the whole line per match (~16 GB); now it keeps at most
+    /// `MAX_MATCHES_PER_NOTE` small windows.
+    #[test]
+    fn one_megabyte_line_is_capped_in_count_and_snippet_size() {
+        let content = "abcdefgh".repeat(131_072); // 1 MiB, ONE line
+        assert_eq!(content.len(), 1 << 20);
+        let m = line_matches(&content, &positive_query_terms("a"));
+        assert_eq!(m.len(), MAX_MATCHES_PER_NOTE, "per-note cap");
+        let stored: usize = m.iter().map(|x| x.text.len()).sum();
+        assert!(
+            stored <= MAX_MATCHES_PER_NOTE * (MAX_SNIPPET_CHARS + 2 * '\u{2026}'.len_utf8()),
+            "stored {stored} bytes of snippet text"
+        );
+        for x in &m {
+            assert!(
+                x.text.chars().count() <= MAX_SNIPPET_CHARS,
+                "{}",
+                x.text.len()
+            );
+            assert!(x.text.contains('a'), "window must contain the match");
+            assert_eq!(x.line, 1);
+        }
+        // Matches advance through the line in order.
+        assert!(m.windows(2).all(|w| w[0].col < w[1].col));
+    }
+
+    /// Many terms on the huge line: still bounded, and the scan stays fast
+    /// (the per-term cursors walk the line once, not once per match).
+    #[test]
+    fn one_megabyte_line_with_many_terms_stays_bounded_and_fast() {
+        let content = "lorem ipsum dolor ".repeat(60_000); // ~1 MB, one line
+        let terms = positive_query_terms("lorem ipsum dolor sit");
+        let started = std::time::Instant::now();
+        let m = line_matches(&content, &terms);
+        assert!(m.len() <= MAX_MATCHES_PER_NOTE);
+        assert!(m
+            .iter()
+            .all(|x| x.text.chars().count() <= MAX_SNIPPET_CHARS));
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "windowing a long line must be linear: {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn match_far_into_a_long_line_gets_a_window_around_it() {
+        let content = format!("{}NeEdLe{}", "x".repeat(5_000), "y".repeat(5_000));
+        let m = line_matches(&content, &positive_query_terms("needle"));
+        assert_eq!(m.len(), 1);
+        let t = &m[0].text;
+        assert!(t.contains("NeEdLe"), "original casing kept: {t}");
+        assert!(t.starts_with('\u{2026}') && t.ends_with('\u{2026}'), "{t}");
+        assert!(t.chars().count() <= MAX_SNIPPET_CHARS);
+        assert_eq!(m[0].col, 5_000, "col is still the byte offset in the line");
+    }
+
+    #[test]
+    fn short_lines_are_stored_whole_and_trimmed_as_before() {
+        let line = format!("   {} needle {}   ", "a".repeat(100), "b".repeat(100));
+        let m = line_matches(&line, &positive_query_terms("needle"));
+        assert_eq!(m.len(), 1);
+        assert_eq!(m[0].text, line.trim());
+        assert!(!m[0].text.contains('\u{2026}'));
+    }
+
+    /// Windows are char-boundary safe for multi-byte text and for characters
+    /// whose lowercase is a different number of chars (`İ` -> `i` + U+0307).
+    #[test]
+    fn long_line_windows_never_split_a_character() {
+        for filler in ["界", "😀", "é", "İ", "ẞ"] {
+            let content = format!("{0}needle{0}", filler.repeat(2_000));
+            let m = line_matches(&content, &positive_query_terms("needle"));
+            assert_eq!(m.len(), 1, "filler {filler}");
+            let t = &m[0].text;
+            assert!(
+                t.contains("needle"),
+                "filler {filler}: window lost the match: {t}"
+            );
+            assert!(t.chars().count() <= MAX_SNIPPET_CHARS, "filler {filler}");
+        }
+        // The match sits at the very start / very end of a long line.
+        let head = format!("needle{}", "界".repeat(3_000));
+        let m = line_matches(&head, &positive_query_terms("needle"));
+        assert!(m[0].text.starts_with("needle") && m[0].text.ends_with('\u{2026}'));
+        let tail = format!("{}needle", "界".repeat(3_000));
+        let m = line_matches(&tail, &positive_query_terms("needle"));
+        assert!(m[0].text.ends_with("needle") && m[0].text.starts_with('\u{2026}'));
+    }
+
+    #[test]
+    fn match_cap_applies_across_lines_and_terms() {
+        let content = "alpha beta\n".repeat(500);
+        let terms = positive_query_terms("alpha beta");
+        assert_eq!(line_matches(&content, &terms).len(), MAX_MATCHES_PER_NOTE);
+        // An explicit smaller budget wins; zero budget scans nothing.
+        assert_eq!(line_matches_capped(&content, &terms, 7).len(), 7);
+        assert!(line_matches_capped(&content, &terms, 0).is_empty());
+    }
+
+    /// The grep fallback has no note limit, so the TOTAL is bounded and the
+    /// walk stops once the budget is spent.
+    #[tokio::test]
+    async fn grep_total_matches_are_bounded_across_many_notes() {
+        let dir = TempDir::new().unwrap();
+        // 120 notes x 100 hits = 12 000 > MAX_MATCHES_PER_SEARCH.
+        for i in 0..120 {
+            fs::write(dir.path().join(format!("n{i:03}.md")), "hit ".repeat(100)).unwrap();
+        }
+        let backend = NativeFs::new(dir.path());
+        let results = grep_search(&backend, "hit").await.unwrap();
+        let total: usize = results.iter().map(|r| r.matches.len()).sum();
+        assert!(total <= MAX_MATCHES_PER_SEARCH, "total {total}");
+        assert!(total >= MAX_MATCHES_PER_SEARCH - MAX_MATCHES_PER_NOTE);
+        assert!(results
+            .iter()
+            .all(|r| r.matches.len() <= MAX_MATCHES_PER_NOTE));
+    }
+
+    /// End to end on disk: a 1 MiB single-line note searched with the
+    /// one-letter query returns a bounded, small result.
+    #[tokio::test]
+    async fn grep_one_megabyte_single_line_note_returns_a_small_result() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("blob.md"), "abcdefgh".repeat(131_072)).unwrap();
+        let backend = NativeFs::new(dir.path());
+        let results = grep_search(&backend, "a").await.unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].matches.len(), MAX_MATCHES_PER_NOTE);
+        let bytes: usize = results[0].matches.iter().map(|m| m.text.len()).sum();
+        assert!(bytes < 64 * 1024, "result text is {bytes} bytes");
     }
 
     // ── SRX-6: grep fallback over the RoostFs backend ───────────────

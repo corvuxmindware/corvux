@@ -14,9 +14,12 @@
 //! - [`watcher`] — filesystem watcher that emits `LocalChange`s.
 //! - [`peer`]    — per-connection state machine (handshake → sync loop).
 //! - [`note_locks`] — per-note guard serializing each note's commit+disk.
+//! - [`disk_seen`] — evidence a note's file was on disk (gates inferred tombstones).
+//! - [`removal_guard`] — mass-missing breaker: suppresses inferred deletes when the roost looks gone.
 
 mod accept;
 mod dial;
+mod disk_seen;
 #[allow(clippy::module_inception)]
 pub mod engine;
 mod fanout;
@@ -25,6 +28,7 @@ mod outbox;
 pub mod peer;
 mod policy;
 mod queue_ops;
+mod removal_guard;
 mod scan;
 pub mod state;
 mod util;
