@@ -1,0 +1,83 @@
+name: Release Windows installer
+
+# Builds the Windows NSIS installer from this repository on a GitHub-hosted
+# runner and uploads it as a workflow artifact.
+#
+# This is the "trusted build" step that SignPath Foundation code signing
+# attaches to. SignPath requires that the file it signs was produced by a
+# GitHub Actions workflow in this repository, on GitHub-hosted agents, and
+# stored as a workflow artifact first. After SignPath approves the project,
+# add a signing job that needs `build-windows` and submits the
+# `corvux-windows-unsigned` artifact with the SignPath GitHub action.
+# Until then the artifact is UNSIGNED.
+#
+# updater signature: this build uses src-tauri/tauri.self-build.conf.json, which
+# turns updater artifacts off, so it needs no secrets. The minisign `.sig` that
+# the in-app updater verifies must be produced AFTER Authenticode signing
+# (signing changes the file's bytes) — do that in the signing job, not here.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-windows:
+    name: Build Windows installer (NSIS, unsigned)
+    runs-on: windows-latest # GitHub-hosted — required for SignPath OSS signing
+    timeout-minutes: 90
+    outputs:
+      # Handed to the SignPath signing job (added after approval).
+      artifact-id: ${{ steps.upload.outputs.artifact-id }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      # No `version:` — reads the pinned pnpm from package.json `packageManager`.
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+          cache-dependency-path: pnpm-lock.yaml
+
+      - name: Install Rust 1.96.0
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.96.0
+
+      - name: pnpm install
+        run: pnpm install --frozen-lockfile
+
+      - name: Release version consistency
+        run: pnpm release:version:check
+
+      # beforeBuildCommand (`pnpm build && pnpm sidecar`) builds the frontend and
+      # stages the corvux-mcp sidecar for the host triple.
+      - name: Build NSIS installer
+        run: pnpm tauri build --bundles nsis --config src-tauri/tauri.self-build.conf.json
+
+      - name: Stage installer
+        shell: pwsh
+        run: |
+          $found = @(Get-ChildItem -Path src-tauri/target/release/bundle/nsis -Filter '*-setup.exe')
+          if ($found.Count -ne 1) {
+            throw "Expected exactly one NSIS installer, found $($found.Count)"
+          }
+          New-Item -ItemType Directory -Force -Path release-out | Out-Null
+          Copy-Item -LiteralPath $found[0].FullName -Destination release-out/
+          Get-ChildItem release-out | Format-Table Name, Length
+
+      - name: Upload unsigned installer
+        id: upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: corvux-windows-unsigned
+          path: release-out/*-setup.exe
+          if-no-files-found: error
+          retention-days: 30
