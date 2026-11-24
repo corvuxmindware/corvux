@@ -74,8 +74,12 @@ class MulticastLockPlugin(private val activity: Activity) : Plugin(activity) {
      */
     private fun ensureLock() {
         if (lock != null) return
+        // Wi-Fi is declared optional (uses-feature required="false"), so the
+        // app installs on devices without it; there getSystemService returns
+        // null. Reject cleanly — the Rust side logs and syncs without mDNS.
         val wifi = activity.applicationContext
-            .getSystemService(Context.WIFI_SERVICE) as WifiManager
+            .getSystemService(Context.WIFI_SERVICE) as? WifiManager
+            ?: throw IllegalStateException("This device has no Wi-Fi; LAN discovery is unavailable")
         val l = wifi.createMulticastLock("corvux-sync")
         l.setReferenceCounted(false)
         lock = l

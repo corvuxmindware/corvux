@@ -1,6 +1,6 @@
 [package]
 name = "corvux-mcp"
-version = "0.2.6"
+version = "0.2.7"
 edition = "2021"
 license = "Apache-2.0"
 description = "Local MCP server for a Corvux roost — exposes tasks, notes, capture, search, and the wiki-link graph to MCP clients (Claude Desktop, Cursor, Claude Code, etc.)"

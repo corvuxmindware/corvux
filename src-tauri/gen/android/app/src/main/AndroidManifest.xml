@@ -6,6 +6,13 @@
     <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
     <!-- CHANGE_WIFI_MULTICAST_STATE is required for mDNS (Phase 2 discovery). -->
     <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
+    <!-- The two Wi-Fi permissions above make Google Play treat Wi-Fi hardware
+         as REQUIRED, hiding Corvux from devices without it (Play pre-review
+         check, 2026-11-24). Wi-Fi only helps LAN sync discovery; notes, search
+         and sync over other networks work without it, and the multicast-lock
+         plugin rejects cleanly when there is no WifiManager. Guarded by
+         tests/android_manifest_guard.rs. -->
+    <uses-feature android:name="android.hardware.wifi" android:required="false" />
     <!-- NEARBY_WIFI_DEVICES is required on Android 13+ for local-network peer ops;
          neverForLocation tells the OS we don't derive location from WiFi scans. -->
     <uses-permission
