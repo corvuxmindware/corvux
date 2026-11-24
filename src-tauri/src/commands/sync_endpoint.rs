@@ -140,6 +140,148 @@ pub(super) async fn authorize_pin_change(
     }
 }
 
+// ── R1: native confirm for pairing with an unknown sync peer ──────────
+
+/// Stable error token when the user declined the first-pair dialog (R1).
+/// The pairing UI matches this to show "cancelled" instead of a raw error.
+/// Keep in sync with `isSyncPairDeclined` in the TS layer.
+pub(super) const SYNC_PAIR_DECLINED: &str = "SYNC_PAIR_DECLINED";
+
+/// Cap on the confirmed-peer record (each entry required a human click).
+const MAX_CONFIRMED_PEERS: usize = 512;
+
+/// Serializes the confirmed-peers read-modify-write.
+static CONFIRMED_PEERS_WRITE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Backend-owned record of sync peers the user confirmed in a native
+/// dialog (`app_data_dir/confirmed_sync_peers.json`) — sharp-edges R1.
+///
+/// `sync_connect` / `sync_connect_iroh` take the peer address/ticket AND
+/// the PIN from the webview, and an attacker running their own node
+/// chooses both — so the app-layer proof alone cannot tell a chosen peer
+/// from a user-chosen one. The first pair with a peer identity the backend
+/// has never confirmed needs the user's answer in a dialog the webview
+/// cannot click. Reconnects to already-confirmed peers stay silent (the
+/// frontend auto-dial loop is inert since SYN-M10; the engine's own
+/// reconnect supervisor does not cross this IPC boundary). Fail closed:
+/// unreadable or garbage ⇒ empty ⇒ every pair re-confirms.
+pub(super) fn confirmed_peers_file(dir: &std::path::Path) -> std::path::PathBuf {
+    dir.join("confirmed_sync_peers.json")
+}
+
+fn load_confirmed_peers(dir: &std::path::Path) -> std::collections::BTreeSet<String> {
+    let Ok(text) = std::fs::read_to_string(confirmed_peers_file(dir)) else {
+        return Default::default();
+    };
+    match serde_json::from_str::<Vec<String>>(&text) {
+        Ok(list) => list.into_iter().collect(),
+        Err(_) => Default::default(),
+    }
+}
+
+fn save_confirmed_peers(
+    dir: &std::path::Path,
+    peers: &std::collections::BTreeSet<String>,
+) -> Result<(), String> {
+    let json = serde_json::to_string_pretty(peers).map_err(|e| e.to_string())?;
+    let tmp = dir.join("confirmed_sync_peers.json.tmp");
+    std::fs::write(&tmp, json.as_bytes()).map_err(|e| format!("write confirmed peers: {e}"))?;
+    std::fs::rename(&tmp, confirmed_peers_file(dir))
+        .map_err(|e| format!("rename confirmed peers: {e}"))
+}
+
+/// Identity key for the confirm record. `kind` distinguishes transports:
+/// `iroh:` + NodeId hex, or `tcp:` + socket address. The decision happens
+/// BEFORE the dial, so the key is the peer identity the webview itself
+/// supplied — which is exactly the value a hijacked renderer chooses.
+pub(super) fn peer_confirm_key(kind: &str, id: &str) -> String {
+    format!("{kind}:{id}")
+}
+
+/// Short, human-checkable form of a peer id for the dialog (64-hex NodeIds
+/// do not fit; the first 16 chars are enough to compare with the host card).
+pub(super) fn short_id(id: &str, chars: usize) -> String {
+    super::native_confirm::dialog_safe(
+        &id.chars().take(chars.saturating_sub(1)).collect::<String>(),
+        chars,
+    )
+}
+
+/// The R1 gate: `Ok(())` = this peer may be paired (already confirmed, or
+/// the user just answered yes in the native dialog). Decline / dismiss /
+/// failure to show the dialog ⇒ `Err(SYNC_PAIR_DECLINED)`.
+pub(super) async fn authorize_first_pair(
+    app_data_dir: &std::path::Path,
+    key: &str,
+    shown_id: &str,
+    confirm: &(impl super::native_confirm::NativeConfirm + ?Sized),
+) -> Result<(), String> {
+    if load_confirmed_peers(app_data_dir).contains(key) {
+        return Ok(());
+    }
+    let body = format!(
+        "Corvux is about to pair with this device and sync every note in this \
+         roost with it, in both directions:\n\n{}\n\n\
+         A paired device can read and change all notes in the roost. Only \
+         continue if you recognize this device.\n\n\
+         If you did not just scan a code or enter an address in Corvux, \
+         choose Cancel.",
+        super::native_confirm::dialog_safe(shown_id, 120)
+    );
+    if !confirm
+        .confirm("Pair with this device?", &body, "Pair")
+        .await
+    {
+        return Err(SYNC_PAIR_DECLINED.to_string());
+    }
+    let _lane = CONFIRMED_PEERS_WRITE.lock().await;
+    let mut peers = load_confirmed_peers(app_data_dir);
+    if peers.len() >= MAX_CONFIRMED_PEERS && !peers.contains(key) {
+        return Err(format!(
+            "Too many confirmed sync peers (limit {MAX_CONFIRMED_PEERS}); unpair one first."
+        ));
+    }
+    peers.insert(key.to_string());
+    if let Err(e) = save_confirmed_peers(app_data_dir, &peers) {
+        // Fail safe: the pair proceeds, but the next pair with this peer
+        // will confirm again rather than trusting an unwritable record.
+        tracing::warn!(error = %e, "sync pair: persisting confirmed peer failed");
+    }
+    Ok(())
+}
+
+/// R1-in (sharp-edges residual): showing the pairing code / starting the
+/// listener is what admits an INBOUND first pair — `sync_listen_iroh` mints
+/// the ticket + opens the enrollment window, and both it and the ticket+PIN
+/// come from (or go to) the webview. A hijacked renderer can reveal a fresh
+/// code to an attacker's device with no user gesture, so the reveal itself
+/// needs the user's answer in a native OS dialog. Decline/dismiss/failure ⇒
+/// `Err` and the caller must not mint a ticket nor open the window. Reconnect
+/// autostart (`sync_try_autostart`) deliberately does NOT open the enrollment
+/// window, so it is unaffected.
+pub(super) async fn authorize_pairing_reveal(
+    confirm: &(impl super::native_confirm::NativeConfirm + ?Sized),
+) -> Result<(), String> {
+    let body = "Corvux is about to show your sync pairing code (and accept a \
+                new device while pairing is active).\n\n\
+                Any device that gets this code can pair and then read and \
+                change every note in this roost.\n\n\
+                If you did not just choose \u{201c}Show code\u{201d} in Corvux, \
+                choose Cancel.";
+    if confirm
+        .confirm("Show your pairing code?", body, "Show code")
+        .await
+    {
+        Ok(())
+    } else {
+        Err(
+            "Pairing cancelled: the confirmation was cancelled, so no pairing \
+             code was shown and no device can pair."
+                .into(),
+        )
+    }
+}
+
 #[cfg(test)]
 mod pin_tests {
     use super::super::native_confirm::test_support::Scripted;
@@ -317,5 +459,83 @@ mod tests {
             err.contains("allowlist"),
             "expected allowlist error, got: {err}"
         );
+    }
+}
+
+/// R1 (sharp-edges residual): pairing copies the whole roost to a peer the
+/// webview named, so the first pair needs a native confirm; a confirmed
+/// peer never prompts again.
+#[cfg(test)]
+mod first_pair_gate_tests {
+    use super::super::native_confirm::test_support::Scripted;
+    use super::*;
+    use std::collections::BTreeSet;
+    use tempfile::TempDir;
+
+    #[test]
+    fn confirmed_peers_round_trip_and_fail_closed() {
+        let dir = TempDir::new().unwrap();
+        assert!(load_confirmed_peers(dir.path()).is_empty());
+        let mut peers = BTreeSet::new();
+        peers.insert(peer_confirm_key("iroh", &"a".repeat(64)));
+        peers.insert(peer_confirm_key("tcp", "192.168.1.9:4242"));
+        save_confirmed_peers(dir.path(), &peers).unwrap();
+        assert_eq!(load_confirmed_peers(dir.path()), peers);
+        std::fs::write(confirmed_peers_file(dir.path()), b"not json").unwrap();
+        assert!(load_confirmed_peers(dir.path()).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_confirmed_peer_pairs_without_a_dialog() {
+        let dir = TempDir::new().unwrap();
+        let key = peer_confirm_key("tcp", "10.0.0.5:4242");
+        let mut peers = BTreeSet::new();
+        peers.insert(key.clone());
+        save_confirmed_peers(dir.path(), &peers).unwrap();
+
+        let dialog = Scripted::deny(); // would refuse if asked — it must not be
+        authorize_first_pair(dir.path(), &key, "10.0.0.5:4242", &dialog)
+            .await
+            .unwrap();
+        assert_eq!(dialog.times_asked(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_new_peer_needs_the_dialog_and_a_decline_refuses() {
+        let dir = TempDir::new().unwrap();
+        let key = peer_confirm_key("iroh", &"b".repeat(64));
+        let dialog = Scripted::deny();
+        let err = authorize_first_pair(dir.path(), &key, "bbbb…64hex", &dialog)
+            .await
+            .unwrap_err();
+        assert_eq!(err, SYNC_PAIR_DECLINED);
+        assert_eq!(dialog.times_asked(), 1);
+        assert!(
+            load_confirmed_peers(dir.path()).is_empty(),
+            "a declined peer must not be recorded as confirmed"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_allowed_new_peer_is_persisted_and_never_prompts_again() {
+        let dir = TempDir::new().unwrap();
+        let key = peer_confirm_key("iroh", &"c".repeat(64));
+        let dialog = Scripted::allow();
+        authorize_first_pair(dir.path(), &key, "cccc…64hex", &dialog)
+            .await
+            .unwrap();
+        assert_eq!(dialog.times_asked(), 1);
+
+        let re_dialog = Scripted::deny();
+        authorize_first_pair(dir.path(), &key, "cccc…64hex", &re_dialog)
+            .await
+            .unwrap();
+        assert_eq!(re_dialog.times_asked(), 0, "confirmed peers pair silently");
+    }
+
+    #[test]
+    fn short_id_truncates_on_char_boundaries() {
+        assert_eq!(short_id(&"ab".repeat(40), 16).chars().count(), 15);
+        assert_eq!(short_id("short", 16), "short");
     }
 }

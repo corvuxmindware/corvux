@@ -280,6 +280,18 @@ mod no_raw_fs_writes_test {
                 "persisted TLS identity in app-data",
             ),
             (
+                "roost.rs",
+                "let Ok(text) = fs::read_to_string(confirmed_roots_file(dir)) else {",
+                1,
+                "confirmed first-open roots record in app-data (R2)",
+            ),
+            (
+                "sync_endpoint.rs",
+                "let Ok(text) = std::fs::read_to_string(confirmed_peers_file(dir)) else {",
+                1,
+                "confirmed first-pair peers record in app-data (R1)",
+            ),
+            (
                 "task_notify.rs",
                 "let entries = match std::fs::read_to_string(&path) {",
                 1,

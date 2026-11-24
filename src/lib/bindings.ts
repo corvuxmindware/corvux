@@ -933,6 +933,11 @@ export const commands = {
 	 *  config. `action` is `"connect" | "disconnect" | "status"`; `roost` is
 	 *  the absolute roost path (required for `connect`). Returns the helper's
 	 *  status line for display.
+	 * 
+	 *  R5 (sharp-edges residual): `connect` registers the roost with Claude
+	 *  Desktop for PERSISTENT read/write access — the same trust decision as
+	 *  pairing a sync peer, and the webview can trigger it silently. It needs
+	 *  the user's answer in a native dialog; disconnect/status prompt nothing.
 	 */
 	claudeDesktopMcp: (action: string, roost: string | null, mode: string | null) => typedError<string, string>(__TAURI_INVOKE("claude_desktop_mcp", { action, roost, mode })),
 	/**

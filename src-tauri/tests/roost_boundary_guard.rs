@@ -222,11 +222,12 @@ const RAW_FS_BASELINE: &[(&str, usize, &str)] = &[
     ("commands/ai/consent.rs", 3, "APP-PRIVATE: ai_consent.json next to settings.json in app-data"),
     ("commands/ai/settings.rs", 3, "APP-PRIVATE: settings.json temp+atomic replace in app-data"),
     ("commands/graph.rs", 1, "APP-PRIVATE: rebuild_database deletes derived graph.db/search.db files in the per-roost app-data index dir"),
-    ("commands/roost.rs", 15,"ROOST bootstrap + app-data: creates/backs up app-created roost dirs before any backend exists, native tree scanner with AUDIT-076 symlink filtering (MR-B4), roosts.json manifest, index-dir delete"),
+    ("commands/roost.rs", 18,"ROOST bootstrap + app-data: creates/backs up app-created roost dirs before any backend exists, native tree scanner with AUDIT-076 symlink filtering (MR-B4), roosts.json manifest, index-dir delete, confirmed_roost_roots.json first-open record (R2 — APP-PRIVATE)"),
     ("commands/roost_tree_cache.rs", 3, "APP-PRIVATE: derived file-tree cache in app-data"),
     ("commands/sync.rs", 6, "APP-PRIVATE: sync prefs + TLS identity in app-data (also ratcheted by sync_invariants.rs)"),
+    ("commands/sync_endpoint.rs", 3, "APP-PRIVATE: confirmed_sync_peers.json first-pair record in app-data (R1)"),
     ("commands/task_notify.rs", 3, "APP-PRIVATE: missed-notification ledger in app-data"),
-    ("db/queries/notes.rs", 1, "ROOST (F7, OPEN): file_mtime_secs stats a DB-stored absolute path; metadata only, no content read, never returned to the webview. Real fix = RoostFs mtime + store RoostRel"),
+    ("db/queries/notes.rs", 1, "ROOST (F7, hardened): file_mtime_secs stats a DB-stored absolute path with symlink_metadata (no follow); metadata only, no content read, never returned to the webview. Real fix = RoostFs mtime + store RoostRel"),
     ("db/schema.rs", 5, "APP-PRIVATE: pre-migration snapshot/rollback of graph.db in the app-data index dir"),
     ("db/search_db.rs", 2, "APP-PRIVATE: search.db dir creation and corrupt-DB cleanup in app-data"),
 ];
@@ -422,6 +423,48 @@ const WIRING: &[(&str, &str, &str, &str)] = &[
         "delete_roost_index",
         "authorize_removals(",
         "F10: deleting a roost's index + sync credentials needs a native confirmation",
+    ),
+    (
+        "commands/roost.rs",
+        "open_roost",
+        "roost_open_needs_confirm(",
+        "R2: opening a root the backend never confirmed must hit the native first-open gate",
+    ),
+    (
+        "commands/roost.rs",
+        "open_roost",
+        "CONFIRMED_ROOTS_WRITE.lock()",
+        "R2: the confirmed-roots read-modify-write is one lane",
+    ),
+    (
+        "commands/sync.rs",
+        "sync_connect",
+        "authorize_first_pair(",
+        "R1: pairing with an unconfirmed peer needs a native confirmation",
+    ),
+    (
+        "commands/sync.rs",
+        "sync_connect_iroh",
+        "authorize_first_pair(",
+        "R1: pairing with an unconfirmed NodeId needs a native confirmation",
+    ),
+    (
+        "commands/sync.rs",
+        "sync_listen_iroh",
+        "authorize_pairing_reveal(",
+        "R1-in: revealing the pairing code / opening the enrollment window needs a native confirmation",
+    ),
+    (
+        "commands/sync.rs",
+        "sync_start_listening",
+        "authorize_pairing_reveal(",
+        "R1-in: starting the inbound listener + enrollment window needs a native confirmation",
+    ),
+    (
+        "commands/mcp.rs",
+        "claude_desktop_mcp",
+        ".confirm(",
+        "R5: giving Claude Desktop persistent roost access needs a native confirmation",
     ),
 ];
 

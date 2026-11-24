@@ -30,3 +30,25 @@ describe("isScopeExpiredError", () => {
     expect(isScopeExpiredError(undefined)).toBe(false);
   });
 });
+
+/**
+ * `isRoostOpenDeclined` — recognizes the backend's `ROOST_OPEN_DECLINED`
+ * token (R2 native first-open confirmation) so openRoost can stay on the
+ * current roost quietly. Must stay in sync with `ROOST_OPEN_DECLINED` in
+ * commands/roost.rs.
+ */
+import { isRoostOpenDeclined } from "../../src/stores/roosts";
+
+describe("isRoostOpenDeclined", () => {
+  it("matches the bare token and an embedded / wrapped form", () => {
+    expect(isRoostOpenDeclined("ROOST_OPEN_DECLINED")).toBe(true);
+    expect(isRoostOpenDeclined("open_roost failed: ROOST_OPEN_DECLINED")).toBe(true);
+    expect(isRoostOpenDeclined(new Error("ROOST_OPEN_DECLINED"))).toBe(true);
+  });
+
+  it("does NOT match an ordinary open failure or the scope-expired token", () => {
+    expect(isRoostOpenDeclined("SCOPE_EXPIRED")).toBe(false);
+    expect(isRoostOpenDeclined("stat failed: Operation not permitted")).toBe(false);
+    expect(isRoostOpenDeclined(null)).toBe(false);
+  });
+});

@@ -40,6 +40,12 @@ pub(crate) enum Escalation {
     /// `agent_autonomy.auto_approve_reads` false → true: someone who chose to
     /// review every read loses that choice.
     AutoApproveReads,
+    /// A provider API key is being saved or replaced (R3). Every FUTURE chat
+    /// is sent to that provider under this key's account — a key chosen by
+    /// someone else is a persistent exfil channel that outlives the attack
+    /// (the CSP trim closed the webview's direct POST; this closes the
+    /// "future chats" half). Removing a key is not an escalation.
+    ProviderKey(&'static str),
 }
 
 /// Upper bound on escalations in ONE save. The native dialog lists every one of
@@ -78,6 +84,9 @@ impl Escalation {
             Self::AutoApproveReads => {
                 "Let the AI agent read your notes without asking you first".into()
             }
+            Self::ProviderKey(p) => format!(
+                "Save an API key for {p} — every future chat is sent under this key's account",
+            ),
         }
     }
 
@@ -89,6 +98,7 @@ impl Escalation {
             | Self::UnblockPath(_)
             | Self::AutoApproveReads => "settings.agent_autonomy",
             Self::ProviderHost(_) | Self::ProviderHostPlaintext(_) => "settings.ollama_base_url",
+            Self::ProviderKey(_) => "settings.provider_key",
         }
     }
 }
@@ -187,14 +197,6 @@ pub(crate) fn plan_settings_update(
         push_unique(Escalation::AutoApproveReads, &mut escalations);
     }
 
-    if escalations.len() > MAX_ESCALATIONS_PER_SAVE {
-        return Err(format!(
-            "This save changes {} security settings at once. Apply them a few at a time \
-             (at most {MAX_ESCALATIONS_PER_SAVE}) so each one can be confirmed.",
-            escalations.len()
-        ));
-    }
-
     // ── F11: provider keys — None = unchanged ───────────────────────────
     let (gem_u, gem) = plan_key(&merged.gemini_api_key, &current.gemini_api_key);
     let (or_u, or) = plan_key(&merged.openrouter_api_key, &current.openrouter_api_key);
@@ -209,6 +211,32 @@ pub(crate) fn plan_settings_update(
         ol_u = KeyUpdate::Clear;
         ol = None;
     }
+
+    // ── R3: saving/replacing a key routes every FUTURE chat to that key's
+    // account — confirm out-of-band. Re-saving the SAME key and REMOVING a
+    // key widen nothing.
+    for (update, current_key, provider) in [
+        (&gem_u, &current.gemini_api_key, "Gemini"),
+        (&or_u, &current.openrouter_api_key, "OpenRouter"),
+        (&ol_u, &current.ollama_api_key, "Ollama"),
+        (&oa_u, &current.openai_api_key, "OpenAI"),
+        (&an_u, &current.anthropic_api_key, "Anthropic"),
+    ] {
+        if let KeyUpdate::Set(new_key) = update {
+            if current_key.as_ref() != Some(new_key) {
+                push_unique(Escalation::ProviderKey(provider), &mut escalations);
+            }
+        }
+    }
+
+    if escalations.len() > MAX_ESCALATIONS_PER_SAVE {
+        return Err(format!(
+            "This save changes {} security settings at once. Apply them a few at a time \
+             (at most {MAX_ESCALATIONS_PER_SAVE}) so each one can be confirmed.",
+            escalations.len()
+        ));
+    }
+
     merged.gemini_api_key = gem;
     merged.openrouter_api_key = or;
     merged.ollama_api_key = ol;
@@ -621,19 +649,40 @@ mod tests {
     }
 
     #[test]
-    fn setting_or_clearing_keys_is_never_an_escalation() {
-        // Deliberate, and worth stating the limit of: replacing a key (or
-        // switching provider) can send content to a vendor account the webview
-        // chose, but the webview already holds the note text and CSP
-        // `connect-src` already lets it POST to those same vendor hosts
-        // directly — so a prompt here would add friction without closing a
-        // path. It becomes worth gating once the CSP is narrowed (see the
-        // audit's "residual gaps").
+    fn setting_a_new_key_escalates_but_clearing_or_resaving_does_not() {
+        // R3: replacing a key (or setting a first one) routes every FUTURE
+        // chat to that key's vendor account — a persistence channel that
+        // outlives the attack. Gated now that the CSP trim closed the
+        // webview's direct POST to those hosts. Removing a key or re-saving
+        // the SAME key widens nothing.
         let mut cur = base();
         cur.gemini_api_key = key("old");
+        // Replace → escalate.
         let mut inc = cur.clone();
         inc.gemini_api_key = key("new");
-        inc.openai_api_key = key("");
+        assert_eq!(
+            plan_settings_update(&cur, inc).unwrap().escalations,
+            vec![Escalation::ProviderKey("Gemini")]
+        );
+        // First-ever set → escalate (an attacker-chosen first key is the
+        // same channel).
+        let mut inc = base();
+        inc.openai_api_key = key("a");
+        assert_eq!(
+            plan_settings_update(&base(), inc).unwrap().escalations,
+            vec![Escalation::ProviderKey("OpenAI")]
+        );
+        // Clear only → never.
+        let mut inc = cur.clone();
+        inc.gemini_api_key = key("");
+        inc.anthropic_api_key = key("");
+        assert!(plan_settings_update(&cur, inc)
+            .unwrap()
+            .escalations
+            .is_empty());
+        // Re-save the same value → no re-prompt on unrelated saves.
+        let mut inc = cur.clone();
+        inc.model = "other".into();
         assert!(plan_settings_update(&cur, inc)
             .unwrap()
             .escalations

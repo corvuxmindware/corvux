@@ -466,7 +466,13 @@ impl LinkResolver {
 /// client, and the sync engine already re-indexes files it receives, so the
 /// sync-OFF external-edit scenario this guards is desktop-shaped.)
 pub fn file_mtime_secs(abs_path: &str) -> Option<f64> {
-    std::fs::metadata(abs_path)
+    // F7 hardening: `symlink_metadata` does NOT follow a final symlink, so a
+    // vault-folder attacker cannot swap an indexed note for a link and use
+    // the TARGET's mtime as an existence/oracle signal here. For real notes
+    // (never symlinks — RoostFs rejects link escapes) it is identical to
+    // `metadata`. Full fix is still tracked: store roost-relative paths and
+    // take mtimes through the backend.
+    std::fs::symlink_metadata(abs_path)
         .and_then(|m| m.modified())
         .ok()
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())

@@ -20,9 +20,16 @@ export function errMsg(e: unknown): string {
  *  - `save_settings`:        "Not saved: the security confirmation was cancelled, …"
  *  - `sync_pin_custom_queue_host`: "Not trusted: the confirmation was cancelled, …"
  *  - `write_roost_manifest` / `delete_roost_index`: "Roost removal was cancelled."
+ *  - `open_roost` (R2):      the `ROOST_OPEN_DECLINED` token
+ *  - `sync_connect` / `sync_connect_iroh` (R1): the `SYNC_PAIR_DECLINED` token
  *  Matched case-insensitively as substrings so a wrapper prefix
  *  ("Error: …") doesn't hide it. */
-const SECURITY_CANCEL_MARKERS = ["confirmation was cancelled", "roost removal was cancelled"];
+const SECURITY_CANCEL_MARKERS = [
+  "confirmation was cancelled",
+  "roost removal was cancelled",
+  "roost_open_declined",
+  "sync_pair_declined",
+];
 
 /** True when `e` is the user declining a native security confirmation —
  *  a choice, not a failure. Callers should revert any optimistic UI and

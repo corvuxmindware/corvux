@@ -1046,7 +1046,12 @@ mod save_core_tests {
 
     #[tokio::test]
     async fn an_ordinary_save_never_prompts_and_persists() {
-        let (_d, state) = state_with(Settings::default());
+        // Ordinary = no security-bearing change: re-saving the SAME key (R3
+        // only escalates a set/replace) plus a model tweak. A first-ever or
+        // replaced key now prompts — see the R3 tests in settings_guard.
+        let mut current = Settings::default();
+        current.gemini_api_key = Some("GEMINI-SENTINEL".into());
+        let (_d, state) = state_with(current);
         let mut inc = Settings::default();
         inc.model = "gemini-x".into();
         inc.gemini_api_key = Some("GEMINI-SENTINEL".into());
@@ -1086,7 +1091,9 @@ mod save_core_tests {
 
         assert_eq!(err, SAVE_DECLINED);
         assert_eq!(dialog.times_asked(), 1);
-        assert_eq!(audit, vec![(1, false)]);
+        // R3: the new key is its own escalation line in the same dialog —
+        // one prompt, two listed changes, both declined together.
+        assert_eq!(audit, vec![(2, false)]);
         let mem = state.settings.lock().unwrap();
         assert!(!mem.agent_autonomy.auto_approve_writes);
         assert_eq!(mem.model, Settings::default().model);

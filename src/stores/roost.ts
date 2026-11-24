@@ -17,6 +17,7 @@ import {
   deriveName,
   resolveBookmark,
   isScopeExpiredError,
+  isRoostOpenDeclined,
 } from "./roosts";
 import { startupStore } from "./startup";
 import { saveRoostNote } from "../lib/save";
@@ -260,6 +261,17 @@ function createRoostStore() {
           startupStore.setPhase("idle");
           return; // `finally` resets isOpening
 
+        }
+        // R2: the user said No in the native first-open dialog. Not an
+        // error — restore the previous roost (if any) and say so quietly.
+        if (isRoostOpenDeclined(initial.error)) {
+          await restorePreviousBackend();
+          if (superseded()) return;
+          if (!opts?.silent) {
+            toastStore.show("Cancelled — roost was not opened.", "info", 4000);
+          }
+          startupStore.setPhase("idle");
+          return; // `finally` resets isOpening
         }
         throw initial.error;
       }

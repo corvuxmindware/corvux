@@ -66,6 +66,84 @@ enum ScopeResume {
     Expired,
 }
 
+/// Stable error token returned by `open_roost` when the user declined the
+/// native first-open confirmation (R2). The frontend matches this to stay on
+/// the current roost instead of surfacing a raw error. Keep in sync with
+/// `isRoostOpenDeclined` in the TS layer.
+const ROOST_OPEN_DECLINED: &str = "ROOST_OPEN_DECLINED";
+
+/// Cap on the confirmed-roots record. Every entry past the first required a
+/// human click in a native dialog, so the list cannot be flooded silently;
+/// the cap just keeps the file bounded.
+const MAX_CONFIRMED_ROOTS: usize = 256;
+
+/// Serializes the confirmed-roots read-modify-write (R2). The dialog is
+/// deliberately NOT held under this lane — a dialog left open must not
+/// block other roost work.
+static CONFIRMED_ROOTS_WRITE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Backend-owned record of roost roots the user confirmed in a native
+/// dialog (`app_data_dir/confirmed_roost_roots.json`) — sharp-edges R2.
+///
+/// `roosts.json` cannot serve as this list: it is written by the webview,
+/// and the F10 gate confirms REMOVALS only, so a hijacked renderer can ADD
+/// any path (the home folder) and then call `open_roost` on it. This file
+/// is written only by the backend, only after a native confirm answered
+/// yes. Fail closed: unreadable or garbage ⇒ empty ⇒ every open re-confirms.
+fn confirmed_roots_file(dir: &Path) -> PathBuf {
+    dir.join("confirmed_roost_roots.json")
+}
+
+fn load_confirmed_roots(dir: &Path) -> std::collections::BTreeSet<String> {
+    let Ok(text) = fs::read_to_string(confirmed_roots_file(dir)) else {
+        return Default::default();
+    };
+    match serde_json::from_str::<Vec<String>>(&text) {
+        Ok(list) => list.into_iter().collect(),
+        Err(_) => Default::default(),
+    }
+}
+
+fn save_confirmed_roots(
+    dir: &Path,
+    roots: &std::collections::BTreeSet<String>,
+) -> Result<(), String> {
+    let json = serde_json::to_string_pretty(roots).map_err(|e| e.to_string())?;
+    let tmp = dir.join("confirmed_roost_roots.json.tmp");
+    fs::write(&tmp, json.as_bytes()).map_err(|e| format!("write confirmed roots: {e}"))?;
+    fs::rename(&tmp, confirmed_roots_file(dir)).map_err(|e| format!("rename confirmed roots: {e}"))
+}
+
+/// The R2 gate decision, without I/O or dialog: does opening this path need
+/// the user's answer? Keys are compared through [`crate::paths::normalize_key`]
+/// (backslash/case folding per host), the same normalization the index dirs
+/// use.
+fn roost_open_needs_confirm(
+    effective_path: &str,
+    confirmed: &std::collections::BTreeSet<String>,
+) -> bool {
+    !confirmed.contains(&crate::paths::normalize_key(effective_path))
+}
+
+/// Ask the human (R2): opening `effective_path` as a roost hands Corvux
+/// read/write access to everything inside it. `true` = allow and the caller
+/// persists the root as confirmed.
+async fn authorize_roost_open(
+    effective_path: &str,
+    confirm: &(impl super::native_confirm::NativeConfirm + ?Sized),
+) -> bool {
+    let shown = super::native_confirm::dialog_safe(effective_path, 200);
+    let body = format!(
+        "Corvux will read and write every file inside this folder:\n\n{shown}\n\n\
+         Notes, search, sync, and the AI agent will be able to see and change \
+         its contents.\n\nIf you did not just choose this folder in Corvux, \
+         choose Cancel."
+    );
+    confirm
+        .confirm("Open this folder as a roost?", &body, "Open roost")
+        .await
+}
+
 #[tauri::command]
 #[specta::specta]
 pub async fn open_roost(
@@ -102,6 +180,45 @@ pub async fn open_roost(
     // Serialize the complete transition, including scoped-access resolution
     // and candidate validation. Later user requests therefore commit later.
     let _transition = state.transition.lock().await;
+
+    // R2 (sharp-edges residual gap): `open_roost` takes any absolute path,
+    // so a hijacked webview could open the user's home folder as a roost
+    // and read `.ssh/…` through normal file IPC. First open of a root the
+    // backend has never confirmed needs the user's answer in a native OS
+    // dialog the webview cannot click; confirmed roots open silently. The
+    // confirmed set lives backend-side (`confirmed_roost_roots.json`),
+    // because the webview-writable `roosts.json` cannot be the trust
+    // anchor (F10 confirms removals only).
+    {
+        let dir = app
+            .path()
+            .app_data_dir()
+            .map_err(|e| format!("app_data_dir: {e}"))?;
+        if roost_open_needs_confirm(&effective_path, &load_confirmed_roots(&dir)) {
+            if !authorize_roost_open(
+                &effective_path,
+                &super::native_confirm::OsDialog(app.clone()),
+            )
+            .await
+            {
+                tracing::warn!(target_path = %effective_path, "roost_open: first-open declined");
+                return Err(ROOST_OPEN_DECLINED.to_string());
+            }
+            let key = crate::paths::normalize_key(&effective_path);
+            let _lane = CONFIRMED_ROOTS_WRITE.lock().await;
+            let mut roots = load_confirmed_roots(&dir);
+            if roots.len() >= MAX_CONFIRMED_ROOTS && !roots.contains(&key) {
+                return Err(format!(
+                    "Too many confirmed roost roots (limit {MAX_CONFIRMED_ROOTS}); remove a roost first."
+                ));
+            }
+            roots.insert(key);
+            if let Err(e) = save_confirmed_roots(&dir, &roots) {
+                tracing::warn!(error = %e, "roost_open: persisting confirmed root failed — the open proceeds but the next open will confirm again");
+            }
+        }
+    }
+
     let result = open_roost_impl(effective_path.clone(), display_name, app, &state).await;
     let elapsed_ms = started.elapsed().as_millis() as u64;
     match &result {
@@ -1682,5 +1799,75 @@ mod manifest_authority_tests {
         )
         .await
         .unwrap();
+    }
+}
+
+/// R2 (sharp-edges residual): `open_roost` must only grant access to roots
+/// the backend itself confirmed — the webview-writable manifest can add any
+/// path without a dialog (F10 confirms removals only).
+#[cfg(test)]
+mod roost_root_gate_tests {
+    use super::super::native_confirm::test_support::Scripted;
+    use super::*;
+    use std::collections::BTreeSet;
+    use tempfile::TempDir;
+
+    fn set_of(keys: &[&str]) -> BTreeSet<String> {
+        keys.iter()
+            .map(|k| crate::paths::normalize_key(k))
+            .collect()
+    }
+
+    #[test]
+    fn confirmed_roots_round_trip_and_fail_closed() {
+        let dir = TempDir::new().unwrap();
+        assert!(
+            load_confirmed_roots(dir.path()).is_empty(),
+            "no file yet = empty (first run re-confirms)"
+        );
+        let mut roots = set_of(&["/a", "content://tree/x"]);
+        roots.insert(crate::paths::normalize_key("C:\\Notes"));
+        save_confirmed_roots(dir.path(), &roots).unwrap();
+        assert_eq!(load_confirmed_roots(dir.path()), roots);
+
+        // Garbage on disk must fail CLOSED (empty ⇒ re-confirm), never be
+        // interpreted as a confirmed list.
+        std::fs::write(
+            confirmed_roots_file(dir.path()),
+            "{\"oops\": true}".as_bytes(),
+        )
+        .unwrap();
+        assert!(load_confirmed_roots(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn a_confirmed_root_needs_no_dialog_anything_else_does() {
+        let confirmed = set_of(&["/roosts/mine"]);
+        assert!(!roost_open_needs_confirm("/roosts/mine", &confirmed));
+        assert!(
+            roost_open_needs_confirm("/", &confirmed),
+            "the home folder is not a confirmed roost"
+        );
+        assert!(roost_open_needs_confirm("/roosts/other", &confirmed));
+        assert!(roost_open_needs_confirm("/roosts/mine/..", &confirmed));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn root_keys_fold_case_and_slashes_on_windows() {
+        let confirmed = set_of(&["C:\\Notes"]);
+        assert!(!roost_open_needs_confirm("c:/notes", &confirmed));
+    }
+
+    #[tokio::test]
+    async fn authorize_roost_open_reports_the_dialog_answer() {
+        let allowed = Scripted::allow();
+        assert!(authorize_roost_open("/home/me/notes", &allowed).await);
+        assert_eq!(allowed.times_asked(), 1);
+
+        // Fail closed: cancel / dismissed / failed dialog = no access.
+        let denied = Scripted::deny();
+        assert!(!authorize_roost_open("/home/me/notes", &denied).await);
+        assert_eq!(denied.times_asked(), 1);
     }
 }

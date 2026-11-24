@@ -453,9 +453,12 @@ fn recovery_of_missing_files_is_create_only() {
     );
 }
 
-/// Desktop twin: `Path::exists()` is false for EACCES/EIO/a lost iOS grant. The
-/// decisions that gate an overwrite (`create`, `rename`'s target, `exists`) use
-/// `exists_checked`.
+/// Desktop twin: `Path::exists()` is false for EACCES/EIO/a lost iOS grant.
+/// `exists`/`exists_blocking` report through `exists_checked` (a failed stat
+/// is an error, not absence). `create`/`rename` do not exists-gate the target
+/// at all anymore: since the atomic-no-replace rework (TOCTOU-002/003) they
+/// publish through `atomic::rename_no_replace`, which FAILS if the target
+/// exists — there is no check→act window left to get wrong.
 #[test]
 fn native_overwrite_gating_uses_the_checked_existence_helper() {
     let src = read("src/roostfs/native.rs");
@@ -465,9 +468,20 @@ fn native_overwrite_gating_uses_the_checked_existence_helper() {
         "create/rename must not gate on Path::exists()"
     );
     assert!(
-        prod.matches("exists_checked(").count() >= 5,
-        "exists, exists_blocking, create and rename must use exists_checked (+ its definition)"
+        prod.matches("exists_checked(").count() >= 3,
+        "exists and exists_blocking must use exists_checked (+ its definition)"
     );
+    for (name, sig) in [
+        ("create", "async fn create("),
+        ("rename", "async fn rename("),
+    ] {
+        let start = prod.find(sig).unwrap_or_else(|| panic!("{name} not found"));
+        let body = &prod[start..start + prod[start..].find("\n    }\n").expect("end of fn")];
+        assert!(
+            body.contains("atomic::rename_no_replace"),
+            "{name} must publish through atomic::rename_no_replace (fails if the target exists — no TOCTOU window)"
+        );
+    }
 }
 
 /// The ONLY way an original is removed on SAF is the last step of the gated

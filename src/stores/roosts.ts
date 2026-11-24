@@ -61,6 +61,21 @@ export function isScopeExpiredError(err: unknown): boolean {
   return msg.includes("SCOPE_EXPIRED");
 }
 
+/**
+ * Did `open_roost` fail because the user DECLINED the native first-open
+ * confirmation (R2)? Opening a folder as a roost hands Corvux read/write
+ * access to everything inside it, so the backend asks in an OS dialog the
+ * webview cannot click before trusting a root it has never confirmed.
+ * Decline is the user's answer, not an error — the UI stays on the current
+ * roost. Keep the token in sync with `ROOST_OPEN_DECLINED` in
+ * `commands/roost.rs`.
+ */
+export function isRoostOpenDeclined(err: unknown): boolean {
+  const msg =
+    err instanceof Error ? err.message : typeof err === "string" ? err : String(err);
+  return msg.includes("ROOST_OPEN_DECLINED");
+}
+
 function isValidRoostEntry(v: unknown): v is RoostEntry {
   return (
     typeof v === "object" &&

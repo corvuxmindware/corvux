@@ -42,9 +42,50 @@ pub(crate) trait NativeConfirm: Send + Sync {
 /// everywhere else `R` is inferred as the real `Wry`.
 pub(crate) struct OsDialog<R: tauri::Runtime = tauri::Wry>(pub tauri::AppHandle<R>);
 
+/// R6: minimum spacing between two REAL dialogs, epoch millis. A hijacked
+/// renderer can invoke confirm-gated commands in a loop; without a floor it
+/// could keep an OS dialog on screen indefinitely (dialog-spam-as-DoS). A
+/// second dialog inside the window fails CLOSED (reads as "no"). Legitimate
+/// flows never stack two native confirms within a second: each gated command
+/// shows at most one dialog, and no product flow chains two gated commands
+/// back-to-back without a user click between them.
+const MIN_DIALOG_INTERVAL_MS: i64 = 1_000;
+
+/// Epoch-ms timestamp of the last dialog actually shown. 0 = none yet.
+static LAST_DIALOG_SHOWN_MS: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+
+fn now_epoch_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
 #[async_trait]
 impl<R: tauri::Runtime> NativeConfirm for OsDialog<R> {
     async fn confirm(&self, title: &str, body: &str, allow_label: &str) -> bool {
+        use std::sync::atomic::Ordering;
+
+        // R6 cool-down, checked-and-set atomically so two racing commands
+        // cannot both slip inside the window.
+        let now = now_epoch_ms();
+        let last = LAST_DIALOG_SHOWN_MS.load(Ordering::SeqCst);
+        if now.saturating_sub(last) < MIN_DIALOG_INTERVAL_MS {
+            tracing::warn!(
+                "native confirm suppressed (cool-down): another dialog was shown <{MIN_DIALOG_INTERVAL_MS}ms ago — answering No"
+            );
+            return false;
+        }
+        if LAST_DIALOG_SHOWN_MS
+            .compare_exchange(last, now, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            // Another thread showed a dialog in the same instant — this one
+            // yields (fail closed).
+            tracing::warn!("native confirm suppressed (cool-down race) — answering No");
+            return false;
+        }
+
         use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
 
         let (tx, rx) = tokio::sync::oneshot::channel::<bool>();

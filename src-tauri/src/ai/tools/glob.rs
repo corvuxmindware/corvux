@@ -26,7 +26,7 @@ pub fn path_is_blocked(path: &str, patterns: &[String]) -> bool {
     patterns.iter().any(|p| {
         let p = p.trim();
         !p.is_empty() && matches(&normalize(p), &normalized)
-    })
+    }) || short_name_segment_fails_closed(&normalized, patterns)
 }
 
 /// Canonical form for comparison, applied to BOTH the pattern and the path.
@@ -39,15 +39,50 @@ pub fn path_is_blocked(path: &str, patterns: &[String]) -> bool {
 ///   and over-blocking on a case-sensitive file system only errs safe;
 /// * Windows ignores trailing dots and spaces in a name (`Journal./x.md`,
 ///   `Journal /x.md` resolve to `Journal\x.md`), so strip them per segment;
-/// * empty segments (`Journal//x.md`) collapse.
+/// * empty segments (`Journal//x.md`) collapse;
+/// * Unicode is NFC-folded (R7) — macOS APFS stores names decomposed (NFD)
+///   while the user's pattern is almost certainly typed composed (NFC), and
+///   both must match the same.
 fn normalize(s: &str) -> String {
-    s.replace('\\', "/")
+    use unicode_normalization::UnicodeNormalization;
+    s.nfc()
+        .collect::<String>()
+        .replace('\\', "/")
         .split('/')
         .map(|seg| seg.trim_end_matches(['.', ' ']))
         .filter(|seg| !seg.is_empty())
         .collect::<Vec<_>>()
         .join("/")
         .to_lowercase()
+}
+
+/// R7 fail-closed arm: a Windows 8.3 short-name segment (`JOURNA~1`,
+/// `NAME~2.MD`) cannot be expanded to its long form without touching the
+/// filesystem, so a blocked-path glob could be dodged by spelling the
+/// target with one. When ANY blocked pattern is configured, a short-name
+/// segment in a Write/Destructive target is refused outright and the agent
+/// is told to use the full name. Errs safe: a note genuinely called
+/// `Draft~1.md` just needs its (identical) full spelling — the segment
+/// still matches — and over-blocking is the documented direction of this
+/// matcher.
+fn short_name_segment_fails_closed(normalized_path: &str, patterns: &[String]) -> bool {
+    if patterns.iter().all(|p| p.trim().is_empty()) {
+        return false;
+    }
+    normalized_path.split('/').any(is_short_name_segment)
+}
+
+/// `NAME~1` or `NAME~1.EXT` — 1–8 base chars before the tilde (the DOS
+/// generation always fits the 8.3 slot), `~`, 1+ digits.
+fn is_short_name_segment(seg: &str) -> bool {
+    let stem = seg.split_once('.').map_or(seg, |(stem, _)| stem);
+    let Some((base, gen)) = stem.split_once('~') else {
+        return false;
+    };
+    !base.is_empty()
+        && base.len() <= 8
+        && base.chars().all(|c| c.is_ascii_alphanumeric())
+        && gen.chars().all(|c| c.is_ascii_digit())
 }
 
 /// Match `path` against `pattern`. Trailing `/` on the pattern is
@@ -122,6 +157,40 @@ mod tests {
             "Journal/2026-05-20.md",
             &pats(&["", "   "])
         ));
+        // The 8.3 fail-closed arm only arms when a pattern is configured.
+        assert!(!path_is_blocked("JOURNA~1/x.md", &pats(&[])));
+    }
+
+    // ── R7: spellings the filesystem treats as the same path ───────────
+
+    #[test]
+    fn nfc_and_nfd_spellings_match_the_same_pattern() {
+        // macOS APFS stores "café" decomposed (NFD: e + U+0301); the user's
+        // pattern is typed composed (NFC). Both must be blocked.
+        let nfc = "caf\u{e9}/secret.md";
+        let nfd = "cafe\u{301}/secret.md";
+        assert_ne!(nfc, nfd, "fixture must actually differ pre-normalization");
+        let p = pats(&["café/**"]);
+        assert!(path_is_blocked(nfc, &p));
+        assert!(path_is_blocked(nfd, &p));
+    }
+
+    #[test]
+    fn windows_short_name_segments_fail_closed() {
+        let p = pats(&["Journal/**"]);
+        assert!(path_is_blocked("JOURNA~1/2026.md", &p), "8.3 stem");
+        assert!(path_is_blocked("Journal/JOURNA~1.md", &p), "8.3 leaf");
+        assert!(path_is_blocked("name~2.md", &p), "8.3 with extension");
+        // Not short-name shaped → normal matching decides (and here: not
+        // blocked, which is correct — they aren't the blocked folder).
+        assert!(
+            !path_is_blocked("JournalX~notes.md", &p),
+            "tilde but >8 chars"
+        );
+        assert!(
+            !path_is_blocked("Other/notes~ideas.md", &p),
+            "tilde, no digits"
+        );
     }
 
     #[test]

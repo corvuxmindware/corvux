@@ -10,6 +10,7 @@ use std::path::PathBuf;
 use tauri::State;
 
 use super::files::RoostFsState;
+use super::native_confirm::NativeConfirm;
 
 /// Absolute path to the bundled `corvux-mcp` helper.
 fn sidecar_path() -> Result<PathBuf, String> {
@@ -143,9 +144,15 @@ fn build_mcp_args(
 /// config. `action` is `"connect" | "disconnect" | "status"`; `roost` is
 /// the absolute roost path (required for `connect`). Returns the helper's
 /// status line for display.
+///
+/// R5 (sharp-edges residual): `connect` registers the roost with Claude
+/// Desktop for PERSISTENT read/write access — the same trust decision as
+/// pairing a sync peer, and the webview can trigger it silently. It needs
+/// the user's answer in a native dialog; disconnect/status prompt nothing.
 #[tauri::command]
 #[specta::specta]
 pub async fn claude_desktop_mcp(
+    app: tauri::AppHandle,
     action: String,
     roost: Option<String>,
     mode: Option<String>,
@@ -156,7 +163,24 @@ pub async fn claude_desktop_mcp(
         let requested = roost
             .as_deref()
             .ok_or_else(|| "Open a roost before connecting.".to_string())?;
-        Some(active_native_roost(requested, state.inner()).await?)
+        let confirmed_roost = active_native_roost(requested, state.inner()).await?;
+        let body = format!(
+            "Corvux is about to give Claude Desktop persistent read and write \
+             access to this roost:\n\n{}\n\n\
+             Claude Desktop will keep this access until you disconnect it.\
+             \n\nIf you did not just choose \u{201c}Connect\u{201d} in Corvux, \
+             choose Cancel.",
+            crate::commands::native_confirm::dialog_safe(&confirmed_roost, 160)
+        );
+        if !crate::commands::native_confirm::OsDialog(app)
+            .confirm("Connect Claude Desktop to this roost?", &body, "Connect")
+            .await
+        {
+            return Err("Not connected: the confirmation was cancelled, so Claude \
+                 Desktop was not given access."
+                .into());
+        }
+        Some(confirmed_roost)
     } else {
         None
     };

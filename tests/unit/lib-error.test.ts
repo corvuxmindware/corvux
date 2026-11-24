@@ -59,6 +59,9 @@ describe("isSecurityCancel", () => {
     "Not saved: the security confirmation was cancelled, so nothing was changed.",
     "Not trusted: the confirmation was cancelled, so the host was not pinned.",
     "Roost removal was cancelled.",
+    // R1/R2 stable tokens (commands/sync.rs, commands/roost.rs).
+    "SYNC_PAIR_DECLINED",
+    "ROOST_OPEN_DECLINED",
   ];
 
   it("recognises every backend decline message", () => {
@@ -68,6 +71,7 @@ describe("isSecurityCancel", () => {
   it("recognises a decline wrapped in an Error or an 'Error: ' prefix", () => {
     expect(isSecurityCancel(new Error(DECLINES[0]))).toBe(true);
     expect(isSecurityCancel(`Error: ${DECLINES[2]}`)).toBe(true);
+    expect(isSecurityCancel(new Error(DECLINES[3]))).toBe(true);
   });
 
   it("is case-insensitive", () => {

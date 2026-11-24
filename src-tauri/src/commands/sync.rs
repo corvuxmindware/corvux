@@ -1659,6 +1659,12 @@ pub async fn sync_start_listening(
     port: u16,
     pin: String,
 ) -> Result<u16, String> {
+    // R1-in: starting the legacy listener announces on mDNS and opens the
+    // first-pair enrollment window — the inbound-pairing trust decision.
+    // Confirm out-of-band before binding anything. (No frontend caller
+    // today; the gate is for the next one.)
+    super::sync_endpoint::authorize_pairing_reveal(&super::native_confirm::OsDialog(app.clone()))
+        .await?;
     let pin = crate::sensitive::SecretString::from(pin);
     let guard = state.engine.lock().await;
     let engine = guard.as_ref().ok_or("sync engine not initialized")?;
@@ -1782,10 +1788,31 @@ pub async fn sync_connect(
     pinned_fingerprint_hex: Option<String>,
 ) -> Result<String, String> {
     let pin = crate::sensitive::SecretString::from(pin);
-    let guard = state.engine.lock().await;
-    let engine = guard.as_ref().ok_or("sync engine not initialized")?;
     let addr: SocketAddr = addr.parse().map_err(|e| format!("invalid address: {e}"))?;
     let pin = Pin::parse(&pin).ok_or("invalid PIN — must be 6 digits")?;
+    // R1 (sharp-edges residual): the address AND the PIN both come from the
+    // webview, and an attacker running a node chooses both — the app-layer
+    // proof cannot tell a chosen peer from a user-chosen one. First pair
+    // with an unconfirmed peer needs the user's answer in a native dialog;
+    // confirmed peers (reconnects included) stay silent. Runs BEFORE the
+    // engine lock so an open dialog cannot stall other sync commands.
+    {
+        use tauri::Manager;
+        let dir = app
+            .path()
+            .app_data_dir()
+            .map_err(|e| format!("app_data_dir: {e}"))?;
+        let key = super::sync_endpoint::peer_confirm_key("tcp", &addr.to_string());
+        super::sync_endpoint::authorize_first_pair(
+            &dir,
+            &key,
+            &addr.to_string(),
+            &super::native_confirm::OsDialog(app.clone()),
+        )
+        .await?;
+    }
+    let guard = state.engine.lock().await;
+    let engine = guard.as_ref().ok_or("sync engine not initialized")?;
     let pinned =
         resolve_pinned_fingerprint(engine, addr, pinned_fingerprint_hex.as_deref()).await?;
     let device_id = match engine.connect_peer(addr, pin, pinned).await {
@@ -1849,6 +1876,13 @@ pub async fn sync_listen_iroh(
     state: State<'_, SyncEngineState>,
     rotate: bool,
 ) -> Result<IrohHostingInfo, String> {
+    // R1-in: this command mints the pairing ticket AND opens the enrollment
+    // window that admits an inbound first pair — and the ticket + PIN are
+    // handed to the webview. Confirm the reveal out-of-band before the
+    // listener exists; decline ⇒ no ticket, no window, nothing paired.
+    // Runs before the engine lock so an open dialog stalls nothing.
+    super::sync_endpoint::authorize_pairing_reveal(&super::native_confirm::OsDialog(app.clone()))
+        .await?;
     // Sticky hosting PIN. The pairing panel used to mint a FRESH random PIN on
     // every "Show code" click and push it here, which rotated the listener's
     // PIN out from under every already-paired device — their stored reconnect
@@ -1942,6 +1976,33 @@ pub async fn sync_connect_iroh(
     let pin_parsed = Pin::parse(&pin).ok_or("invalid PIN — must be 6 digits")?;
     let peer = crate::sync::transport::iroh::decode_ticket(&ticket)
         .map_err(|e| format!("invalid pairing code: {e}"))?;
+
+    // R1 (sharp-edges residual): the ticket AND the PIN both come from the
+    // webview, and an attacker running their own iroh node chooses both.
+    // First pair with an unconfirmed NodeId needs the user's answer in a
+    // native dialog (showing the NodeId prefix to compare with the host
+    // card); confirmed peers (reconnects included) stay silent. Placed
+    // before we bind our own listener, so a decline leaves nothing open.
+    {
+        use tauri::Manager;
+        let dir = app
+            .path()
+            .app_data_dir()
+            .map_err(|e| format!("app_data_dir: {e}"))?;
+        let node_hex = peer.id.to_string();
+        let key = super::sync_endpoint::peer_confirm_key("iroh", &node_hex);
+        let shown = format!(
+            "iroh node {}…",
+            super::sync_endpoint::short_id(&node_hex, 17)
+        );
+        super::sync_endpoint::authorize_first_pair(
+            &dir,
+            &key,
+            &shown,
+            &super::native_confirm::OsDialog(app.clone()),
+        )
+        .await?;
+    }
 
     // Symmetric pairing: bind OUR OWN listener with our sticky hosting PIN and
     // build our dialable ticket, then offer both to the host in the handshake

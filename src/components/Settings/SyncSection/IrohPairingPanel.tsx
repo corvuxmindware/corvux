@@ -9,6 +9,7 @@ import {
 } from "solid-js";
 import qrcode from "qrcode-generator";
 import { commands, unwrap } from "../../../lib/invoke";
+import { isSecurityCancel } from "../../../lib/error";
 import { syncStatusStore } from "../../../stores/sync";
 import { roostStore } from "../../../stores/roost";
 import QrScanner from "./QrScanner";
@@ -101,7 +102,9 @@ export default function IrohPairingPanel() {
       const info = await unwrap(commands.syncListenIroh(false));
       setMode({ kind: "showing", ticket: info.ticket, pin: info.pin });
     } catch (e) {
-      setError(String(e));
+      // R1-in: the native reveal confirmation was cancelled — a choice, not
+      // a failure.
+      setError(isSecurityCancel(e) ? "Pairing cancelled." : String(e));
     }
   };
 
@@ -150,7 +153,9 @@ export default function IrohPairingPanel() {
       // immediately rather than waiting for the next status poll.
       setMode({ kind: "connected", peer: "the other device" });
     } catch (e) {
-      setError(String(e));
+      // R1: the native first-pair dialog was cancelled — a choice, not a
+      // failure. Show it as such instead of the raw backend token.
+      setError(isSecurityCancel(e) ? "Pairing cancelled." : String(e));
       setMode({ kind: "entering" });
     }
   };
