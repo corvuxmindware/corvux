@@ -15,6 +15,7 @@
 		8E201A982121D02C619D21C5 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = FF60AF229906DB6427A26A69 /* Assets.xcassets */; };
 		9D09D8FF0DD5390010D602C5 /* SystemConfiguration.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 20686E4151682EB2522E05F4 /* SystemConfiguration.framework */; };
 		A26DC8A5246687088D10327E /* LaunchScreen.storyboard in Resources */ = {isa = PBXBuildFile; fileRef = 8BDF1F65C1E4FBFBDB660D1A /* LaunchScreen.storyboard */; };
+		FDED25C42AFF9FBD4EDC9DBF /* PrivacyInfo.xcprivacy in Resources */ = {isa = PBXBuildFile; fileRef = C398404E505AA097969E49D5 /* PrivacyInfo.xcprivacy */; };
 		A91CFDDBFA0E07CC0185EFCA /* assets in Resources */ = {isa = PBXBuildFile; fileRef = 9A28E2D10D9A3E5EFE7B4A99 /* assets */; };
 		CB2D4CE2443C5BAC8618E740 /* QuartzCore.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 9D7D4B6C9669A62C0CA28733 /* QuartzCore.framework */; };
 		DCD42A41A87A2F6AE72DD3CF /* Security.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 679B047A986690FF5CD072EE /* Security.framework */; };
@@ -101,6 +102,7 @@
 		882B8FC838A20ECA84AAF3AC /* envelope.rs */ = {isa = PBXFileReference; lastKnownFileType = text; path = envelope.rs; sourceTree = "<group>"; };
 		89291930E38F92B025993B61 /* schema.rs */ = {isa = PBXFileReference; lastKnownFileType = text; path = schema.rs; sourceTree = "<group>"; };
 		8BDF1F65C1E4FBFBDB660D1A /* LaunchScreen.storyboard */ = {isa = PBXFileReference; lastKnownFileType = file.storyboard; path = LaunchScreen.storyboard; sourceTree = "<group>"; };
+		C398404E505AA097969E49D5 /* PrivacyInfo.xcprivacy */ = {isa = PBXFileReference; lastKnownFileType = text.xml; path = PrivacyInfo.xcprivacy; sourceTree = "<group>"; };
 		8BFB8B41DCAA04C879A2408B /* path.rs */ = {isa = PBXFileReference; lastKnownFileType = text; path = path.rs; sourceTree = "<group>"; };
 		8C1BDA325619D5A2E8B9825C /* mock.rs */ = {isa = PBXFileReference; lastKnownFileType = text; path = mock.rs; sourceTree = "<group>"; };
 		8C4C7E5D2349DB6E081A9ED0 /* handshake.rs */ = {isa = PBXFileReference; lastKnownFileType = text; path = handshake.rs; sourceTree = "<group>"; };
@@ -288,6 +290,7 @@
 				9A28E2D10D9A3E5EFE7B4A99 /* assets */,
 				FF60AF229906DB6427A26A69 /* Assets.xcassets */,
 				8BDF1F65C1E4FBFBDB660D1A /* LaunchScreen.storyboard */,
+				C398404E505AA097969E49D5 /* PrivacyInfo.xcprivacy */,
 				FFF4781A6E49A763EA4FBC4B /* corvux_iOS */,
 				65EA15D1581AA01C06712B6E /* Externals */,
 				2C4E614C4B2FE90C3947A6A3 /* Sources */,
@@ -637,6 +640,7 @@
 				8E201A982121D02C619D21C5 /* Assets.xcassets in Resources */,
 				A26DC8A5246687088D10327E /* LaunchScreen.storyboard in Resources */,
 				A91CFDDBFA0E07CC0185EFCA /* assets in Resources */,
+				FDED25C42AFF9FBD4EDC9DBF /* PrivacyInfo.xcprivacy in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -717,7 +721,7 @@
 				PRODUCT_NAME = "Corvux";
 				PROVISIONING_PROFILE_SPECIFIER = "";
 				SDKROOT = iphoneos;
-				TARGETED_DEVICE_FAMILY = "1,2";
+				TARGETED_DEVICE_FAMILY = 1;
 				VALID_ARCHS = arm64;
 			};
 			name = release;
@@ -824,7 +828,7 @@
 				PRODUCT_NAME = "Corvux";
 				PROVISIONING_PROFILE_SPECIFIER = "";
 				SDKROOT = iphoneos;
-				TARGETED_DEVICE_FAMILY = "1,2";
+				TARGETED_DEVICE_FAMILY = 1;
 				VALID_ARCHS = arm64;
 			};
 			name = debug;

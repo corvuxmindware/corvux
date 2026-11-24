@@ -17,7 +17,9 @@
 	<key>CFBundleShortVersionString</key>
 	<string>0.2.5</string>
 	<key>CFBundleVersion</key>
-	<string>24</string>
+	<string>25</string>
+	<key>ITSAppUsesNonExemptEncryption</key>
+	<true/>
 	<key>LSRequiresIPhoneOS</key>
 	<true/>
 	<key>NSCameraUsageDescription</key>
@@ -29,7 +31,7 @@
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>Corvux uses local networking to sync your notes peer-to-peer with your other devices on the same Wi-Fi. No traffic leaves the network and no Corvux server sees your content.</string>
 	<key>NSMicrophoneUsageDescription</key>
-	<string>Corvux uses your microphone only when you tap the voice-memo button. The recording is saved as an attachment in your vault. No background or always-on listening.</string>
+	<string>Corvux uses your microphone only when you tap the voice-memo button. The recording is saved as an attachment in your roost. No background or always-on listening.</string>
 	<key>NSPhotoLibraryUsageDescription</key>
 	<string>Corvux opens your photo library only when you tap &quot;Add image&quot; to embed a picture in a note. The selected image is copied into your roost as an attachment. Corvux never browses your library on its own.</string>
 	<key>UILaunchStoryboardName</key>

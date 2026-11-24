@@ -36,6 +36,8 @@ targets:
         buildPhase: resources
         type: folder
       - path: LaunchScreen.storyboard
+      - path: PrivacyInfo.xcprivacy
+        buildPhase: resources
     info:
       path: corvux_iOS/Info.plist
       properties:
@@ -52,7 +54,17 @@ targets:
           - UIInterfaceOrientationLandscapeLeft
           - UIInterfaceOrientationLandscapeRight
         CFBundleShortVersionString: 0.2.5
-        CFBundleVersion: "24"
+        CFBundleVersion: "25"
+        # Keys below also live in corvux_iOS/Info.plist. They are repeated here
+        # because xcodegen REWRITES that plist from these properties on any
+        # regen, which would silently drop them (guarded by
+        # tests/ios_bundle_config.rs).
+        ITSAppUsesNonExemptEncryption: true
+        NSCameraUsageDescription: "Corvux uses the camera only when you tap \"Scan QR code\" to pair a device for sync. It reads the pairing code shown on your other device — nothing is recorded or saved."
+        NSMicrophoneUsageDescription: "Corvux uses your microphone only when you tap the voice-memo button. The recording is saved as an attachment in your roost. No background or always-on listening."
+        NSPhotoLibraryUsageDescription: "Corvux opens your photo library only when you tap \"Add image\" to embed a picture in a note. The selected image is copied into your roost as an attachment. Corvux never browses your library on its own."
+        NSLocalNetworkUsageDescription: "Corvux uses local networking to sync your notes peer-to-peer with your other devices on the same Wi-Fi. No traffic leaves the network and no Corvux server sees your content."
+        NSBonjourServices: [_corvux-sync._tcp]
     entitlements:
       path: corvux_iOS/corvux_iOS.entitlements
     scheme:
@@ -61,6 +73,9 @@ targets:
         RUST_LOG: info
     settings:
       base:
+        # iPhone-only for v1 (2026-11-06). Adding iPad later is allowed;
+        # removing it after an iPad-capable release is not.
+        TARGETED_DEVICE_FAMILY: "1"
         ENABLE_BITCODE: false
         ARCHS: [arm64]
         VALID_ARCHS: arm64 

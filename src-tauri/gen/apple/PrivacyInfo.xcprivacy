@@ -14,9 +14,14 @@
     * UserDefaults (CA92.1) — WKWebView / wry read NSUserDefaults belonging
       to this app only.
 
-  If a future build trips an ITMS-91053 warning naming another category
-  (e.g. DiskSpace E174.1, SystemBootTime 35F9.1), add it here with the
-  matching reason code.
+    * DiskSpace (E174.1) — sysinfo::Disks (ai::capability::detect) reads
+      free space to decide whether an on-device model download fits; it
+      links statfs/fstatfs (seen in `nm -u` of the build-24 binary).
+
+  Re-derive this list from the binary, not from memory: `nm -u` the archived
+  app executable and match against Apple's required-reason symbol list.
+  The manifest must also be copied INTO the .app — see the Resources entry in
+  project.yml / project.pbxproj (guarded by tests/ios_bundle_config.rs).
 -->
 <plist version="1.0">
 <dict>
@@ -42,6 +47,14 @@
 			<key>NSPrivacyAccessedAPITypeReasons</key>
 			<array>
 				<string>CA92.1</string>
+			</array>
+		</dict>
+		<dict>
+			<key>NSPrivacyAccessedAPIType</key>
+			<string>NSPrivacyAccessedAPICategoryDiskSpace</string>
+			<key>NSPrivacyAccessedAPITypeReasons</key>
+			<array>
+				<string>E174.1</string>
 			</array>
 		</dict>
 	</array>
