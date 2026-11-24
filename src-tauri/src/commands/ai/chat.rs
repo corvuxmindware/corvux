@@ -265,15 +265,26 @@ pub async fn chat_send(
         None => String::new(),
     };
 
+    // Resolve candidate rows while holding the DB lock, then release it before
+    // reading through the backend captured for this chat. Index-time paths are
+    // untrusted: files may have moved or become symlinks since indexing.
+    let mentioned = match (last_question.as_deref(), roost_backend.as_deref()) {
+        (Some(question), Some(backend)) => {
+            let notes = {
+                let guard = db_state.db.lock().map_err(|e| format!("Lock error: {e}"))?;
+                guard
+                    .as_ref()
+                    .and_then(|db| crate::db::queries::list_all_notes(db, 200).ok())
+                    .unwrap_or_default()
+            };
+            find_mentioned_notes(&notes, backend, question).await
+        }
+        _ => Vec::new(),
+    };
+
     let system = {
         let db_guard = db_state.db.lock().map_err(|e| format!("Lock error: {e}"))?;
         if let Some(db) = db_guard.as_ref() {
-            // Always check for explicit name mentions first — works even
-            // before roost embedding has caught up. RAG path will append.
-            let mentioned = match last_question.as_deref() {
-                Some(q) => find_mentioned_notes(db, q),
-                None => Vec::new(),
-            };
             let mention_section = if mentioned.is_empty() {
                 String::new()
             } else {
@@ -574,25 +585,23 @@ fn format_roost_index(db: &cozo::DbInstance) -> Option<String> {
 /// Scan the user's question for mentions of any note in the roost index and
 /// return up to `MAX_INJECTED` matched (title, content) pairs, content capped
 /// at `MAX_BYTES` per note. Lets the AI answer "what's in [[brainstorm]]?"
-/// queries before roost embedding has caught up — semantic search is the
-/// primary path, this is a safety net for explicit name mentions.
+/// queries without a search round trip. Reads always use the active backend,
+/// revalidating stored paths at use time rather than trusting the index.
 ///
 /// Matching: case-insensitive substring against the title, AND against the
 /// title with a leading `_` stripped (so `_brainstorm.md` matches the user
 /// typing "brainstorm"). Min length 4 to avoid common-word false positives
 /// like "the" or "and" pulling random notes into context.
-fn find_mentioned_notes(db: &cozo::DbInstance, question: &str) -> Vec<(String, String)> {
-    use crate::db::queries;
+async fn find_mentioned_notes(
+    notes: &[crate::db::queries::NoteIndexEntry],
+    backend: &dyn crate::roostfs::RoostFs,
+    question: &str,
+) -> Vec<(String, String)> {
     const MAX_INJECTED: usize = 3;
     const MAX_BYTES: usize = 8 * 1024;
     const MIN_TITLE_LEN: usize = 4;
 
     let q_lower = question.to_lowercase();
-    let notes = match queries::list_all_notes(db, 200) {
-        Ok(n) => n,
-        Err(_) => return Vec::new(),
-    };
-
     let mut out = Vec::new();
     for note in notes.iter() {
         if out.len() >= MAX_INJECTED {
@@ -608,16 +617,21 @@ fn find_mentioned_notes(db: &cozo::DbInstance, question: &str) -> Vec<(String, S
         if !hit {
             continue;
         }
-        match std::fs::read_to_string(&note.path) {
-            Ok(mut content) => {
-                if content.len() > MAX_BYTES {
-                    content.truncate(MAX_BYTES);
-                    content.push_str("\n…[truncated]");
-                }
-                out.push((note.title.clone(), content));
-            }
-            Err(_) => continue,
+        let Some(rel) = crate::commands::files::to_rel(&note.path, backend.display_root()) else {
+            continue;
+        };
+        let Ok(bytes) = backend.read(&rel).await else {
+            continue;
+        };
+        let Ok(mut content) = String::from_utf8(bytes) else {
+            continue;
+        };
+        if content.len() > MAX_BYTES {
+            let cut = crate::ai::tools::utf8_prefix(&content, MAX_BYTES).len();
+            content.truncate(cut);
+            content.push_str("\n…[truncated]");
         }
+        out.push((note.title.clone(), content));
     }
     out
 }
@@ -877,10 +891,20 @@ mod tests {
 
     // ── find_mentioned_notes ────────────────────────────────────────
 
+    async fn mentioned_hits(
+        db: &DbInstance,
+        root: &std::path::Path,
+        question: &str,
+    ) -> Vec<(String, String)> {
+        let notes = crate::db::queries::list_all_notes(db, 200).unwrap();
+        let backend = crate::roostfs::native::NativeFs::new(root);
+        find_mentioned_notes(&notes, &backend, question).await
+    }
+
     /// A question that names a note by (case-insensitive substring) title
     /// pulls that note's on-disk body into the injected set.
-    #[test]
-    fn mentioned_notes_matches_title_case_insensitive() {
+    #[tokio::test]
+    async fn mentioned_notes_matches_title_case_insensitive() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("brainstorm.md");
         std::fs::write(&path, "body of brainstorm note").unwrap();
@@ -894,7 +918,7 @@ mod tests {
             1.0,
         );
 
-        let hits = find_mentioned_notes(&db, "what's in BRAINSTORM today?");
+        let hits = mentioned_hits(&db, dir.path(), "what's in BRAINSTORM today?").await;
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].0, "brainstorm");
         assert_eq!(hits[0].1, "body of brainstorm note");
@@ -902,8 +926,8 @@ mod tests {
 
     /// A leading underscore on the stored title is stripped before
     /// matching, so the user typing the bare word still hits the note.
-    #[test]
-    fn mentioned_notes_strips_leading_underscore_for_match() {
+    #[tokio::test]
+    async fn mentioned_notes_strips_leading_underscore_for_match() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("_architecture.md");
         std::fs::write(&path, "arch doc body").unwrap();
@@ -917,7 +941,7 @@ mod tests {
             1.0,
         );
 
-        let hits = find_mentioned_notes(&db, "tell me about architecture");
+        let hits = mentioned_hits(&db, dir.path(), "tell me about architecture").await;
         assert_eq!(
             hits.len(),
             1,
@@ -928,8 +952,8 @@ mod tests {
 
     /// Titles shorter than the 4-char floor never match, so common short
     /// words ("the", "and") can't drag random notes into context.
-    #[test]
-    fn mentioned_notes_ignores_short_titles() {
+    #[tokio::test]
+    async fn mentioned_notes_ignores_short_titles() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("ab.md");
         std::fs::write(&path, "tiny").unwrap();
@@ -938,14 +962,14 @@ mod tests {
         put_note(&db, "ab", "ab", &path.to_string_lossy(), 1.0);
 
         // "ab" appears in "about" but is below the MIN_TITLE_LEN floor.
-        let hits = find_mentioned_notes(&db, "what is this about");
+        let hits = mentioned_hits(&db, dir.path(), "what is this about").await;
         assert!(hits.is_empty(), "sub-4-char titles must not match");
     }
 
     /// No more than 3 notes are injected even when the question names
     /// many — caps the prompt-budget blast radius.
-    #[test]
-    fn mentioned_notes_caps_at_three() {
+    #[tokio::test]
+    async fn mentioned_notes_caps_at_three() {
         let dir = TempDir::new().unwrap();
         let db = mem_db_with_notes();
         // Five distinct notes, all named in the question.
@@ -956,23 +980,25 @@ mod tests {
             put_note(&db, t, t, &path.to_string_lossy(), 1.0);
         }
         let q = "compare alpha bravo charlie delta echo";
-        let hits = find_mentioned_notes(&db, q);
+        let hits = mentioned_hits(&db, dir.path(), q).await;
         assert_eq!(hits.len(), 3, "injection cap is 3 notes");
     }
 
     /// A note whose title matches but whose file is missing on disk is
     /// skipped, not surfaced with empty content (and doesn't error).
-    #[test]
-    fn mentioned_notes_skips_unreadable_file() {
+    #[tokio::test]
+    async fn mentioned_notes_skips_unreadable_file() {
+        let dir = TempDir::new().unwrap();
         let db = mem_db_with_notes();
-        put_note(&db, "missing", "missing", "/no/such/path/missing.md", 1.0);
-        let hits = find_mentioned_notes(&db, "open the missing note");
+        let path = dir.path().join("missing.md");
+        put_note(&db, "missing", "missing", &path.to_string_lossy(), 1.0);
+        let hits = mentioned_hits(&db, dir.path(), "open the missing note").await;
         assert!(hits.is_empty(), "unreadable file must be skipped");
     }
 
     /// A question that names nothing in the roost returns no injections.
-    #[test]
-    fn mentioned_notes_no_match_returns_empty() {
+    #[tokio::test]
+    async fn mentioned_notes_no_match_returns_empty() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("brainstorm.md");
         std::fs::write(&path, "body").unwrap();
@@ -985,7 +1011,118 @@ mod tests {
             1.0,
         );
 
-        let hits = find_mentioned_notes(&db, "completely unrelated query string");
+        let hits = mentioned_hits(&db, dir.path(), "completely unrelated query string").await;
         assert!(hits.is_empty());
+    }
+
+    #[tokio::test]
+    async fn mentioned_notes_rejects_paths_outside_active_roost() {
+        let root = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let path = outside.path().join("private.md");
+        std::fs::write(&path, "secret outside the active roost").unwrap();
+        let db = mem_db_with_notes();
+        put_note(&db, "private", "private", &path.to_string_lossy(), 1.0);
+
+        let hits = mentioned_hits(&db, root.path(), "read private").await;
+        assert!(
+            hits.is_empty(),
+            "out-of-roost rows must never enter the prompt"
+        );
+    }
+
+    // Like NativeFs's symlink regressions, these run on Unix CI: creating
+    // symlinks on Windows requires privileges unavailable on many dev machines.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn mentioned_notes_rejects_symlink_swapped_after_indexing() {
+        let root = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let path = root.path().join("private.md");
+        std::fs::write(&path, "original note").unwrap();
+        let db = mem_db_with_notes();
+        put_note(&db, "private", "private", &path.to_string_lossy(), 1.0);
+        let notes = crate::db::queries::list_all_notes(&db, 200).unwrap();
+
+        let secret = outside.path().join("credentials.txt");
+        std::fs::write(&secret, "must not enter the prompt").unwrap();
+        std::fs::remove_file(&path).unwrap();
+        std::os::unix::fs::symlink(&secret, &path).unwrap();
+        let backend = crate::roostfs::native::NativeFs::new(root.path());
+        let hits = find_mentioned_notes(&notes, &backend, "read private").await;
+        assert!(
+            hits.is_empty(),
+            "a stale indexed path must not bypass the backend"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn mentioned_notes_rejects_ancestor_symlink_swapped_after_indexing() {
+        let root = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let folder = root.path().join("folder");
+        std::fs::create_dir(&folder).unwrap();
+        let path = folder.join("private.md");
+        std::fs::write(&path, "original note").unwrap();
+        let db = mem_db_with_notes();
+        put_note(&db, "private", "private", &path.to_string_lossy(), 1.0);
+        let notes = crate::db::queries::list_all_notes(&db, 200).unwrap();
+
+        std::fs::write(
+            outside.path().join("private.md"),
+            "must not enter the prompt",
+        )
+        .unwrap();
+        std::fs::remove_file(&path).unwrap();
+        std::fs::remove_dir(&folder).unwrap();
+        std::os::unix::fs::symlink(outside.path(), &folder).unwrap();
+        let backend = crate::roostfs::native::NativeFs::new(root.path());
+        assert!(find_mentioned_notes(&notes, &backend, "read private")
+            .await
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn mentioned_notes_truncates_unicode_without_splitting_characters() {
+        let root = TempDir::new().unwrap();
+        let path = root.path().join("unicode.md");
+        let db = mem_db_with_notes();
+        put_note(&db, "unicode", "unicode", &path.to_string_lossy(), 1.0);
+
+        for (body, expected) in [
+            ("界".repeat(3000), "界".repeat(2730)),
+            (format!("{}😀suffix", "a".repeat(8191)), "a".repeat(8191)),
+            ("é".repeat(4097), "é".repeat(4096)),
+        ] {
+            std::fs::write(&path, body).unwrap();
+            let hits = mentioned_hits(&db, root.path(), "read unicode").await;
+            assert_eq!(hits.len(), 1);
+            assert_eq!(hits[0].1, format!("{expected}\n…[truncated]"));
+        }
+    }
+
+    #[tokio::test]
+    async fn mentioned_notes_preserves_content_at_the_byte_limit() {
+        let root = TempDir::new().unwrap();
+        let path = root.path().join("unicode.md");
+        let db = mem_db_with_notes();
+        put_note(&db, "unicode", "unicode", &path.to_string_lossy(), 1.0);
+        let body = "😀".repeat(2048);
+        std::fs::write(&path, &body).unwrap();
+        let hits = mentioned_hits(&db, root.path(), "read unicode").await;
+        assert_eq!(hits, vec![("unicode".to_string(), body)]);
+    }
+
+    #[tokio::test]
+    async fn mentioned_notes_skips_non_utf8_content() {
+        let root = TempDir::new().unwrap();
+        let path = root.path().join("invalid.md");
+        std::fs::write(&path, [0xff, 0xfe]).unwrap();
+        let db = mem_db_with_notes();
+        put_note(&db, "invalid", "invalid", &path.to_string_lossy(), 1.0);
+        assert!(mentioned_hits(&db, root.path(), "read invalid")
+            .await
+            .is_empty());
     }
 }

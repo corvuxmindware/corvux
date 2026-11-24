@@ -98,6 +98,7 @@ pub use registry::{SafetyTier, Tool, ToolError, ToolRegistry};
 pub use result::{emit_tool_result, SecretWarningEvent, ToolResult};
 #[allow(unused_imports)] // first consumers are the Default profile + chat.rs wiring
 pub use task::SubagentBundle;
+pub(crate) use truncate::utf8_prefix;
 #[allow(unused_imports)]
 pub use truncate::{truncate_tool_result, MAX_TOOL_RESULT_BYTES};
 
@@ -231,6 +232,117 @@ mod no_raw_fs_writes_test {
              If a write is legitimate (e.g. app-data, not roost), add it \
              to ALLOWLIST with a short justification.",
             violations.join("\n  ")
+        );
+    }
+
+    /// The chat mention leak lived under commands/, outside the agent-tool
+    /// guard. Scan that entire tree for raw file-content reads as well.
+    /// Existing non-backend reads are pinned to exact lines and occurrence
+    /// counts, so an exception cannot silently allow new reads in that file.
+    #[test]
+    fn no_raw_command_reads_outside_allowlist() {
+        const RAW_READS: &[&str] = &["fs::read(", "fs::read_to_string(", "File::open("];
+        const ALLOWED: &[(&str, &str, usize, &str)] = &[
+            (
+                "ai/consent.rs",
+                "std::fs::read_to_string(path)",
+                1,
+                "consent ledger in app-data, not note content",
+            ),
+            (
+                "graph.rs",
+                "let content = std::fs::read_to_string(abs_path)",
+                2,
+                "unused legacy index_roost_two_pass helper; active indexer uses RoostFs",
+            ),
+            (
+                "roost.rs",
+                "match fs::read_to_string(&path) {",
+                1,
+                "roost registry manifest in app-data",
+            ),
+            (
+                "roost.rs",
+                "let existing = fs::read_to_string(&path).unwrap_or_default();",
+                1,
+                "legacy .stignore maintenance, tracked separately as TOCTOU-001",
+            ),
+            (
+                "roost_tree_cache.rs",
+                "let bytes = std::fs::read(&path).ok()?;",
+                1,
+                "derived tree cache in app-data",
+            ),
+            (
+                "sync.rs",
+                "let Ok(bytes) = std::fs::read(&path) else {",
+                1,
+                "sync preferences in app-data",
+            ),
+            (
+                "sync.rs",
+                "let bytes = std::fs::read(&path)?;",
+                1,
+                "persisted TLS identity in app-data",
+            ),
+            (
+                "task_notify.rs",
+                "let entries = match std::fs::read_to_string(&path) {",
+                1,
+                "missed-notification ledger in app-data",
+            ),
+        ];
+
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/commands");
+        let mut pending = vec![root.clone()];
+        let mut seen = vec![0; ALLOWED.len()];
+        let mut violations = Vec::new();
+        while let Some(dir) = pending.pop() {
+            for entry in fs::read_dir(&dir).expect("read command directory") {
+                let entry = entry.expect("command directory entry");
+                let kind = entry.file_type().expect("command entry type");
+                let path = entry.path();
+                if kind.is_dir() {
+                    pending.push(path);
+                    continue;
+                }
+                if path.extension().and_then(|ext| ext.to_str()) != Some("rs") {
+                    continue;
+                }
+                let name = path
+                    .strip_prefix(&root)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                let src = fs::read_to_string(&path)
+                    .expect("read command source")
+                    .replace("\r\n", "\n");
+                let src = strip_balanced_block(&src, "#[cfg(test)]\nmod");
+                let src = strip_balanced_block(&src, "mod tests");
+                for line in src.lines().map(str::trim) {
+                    if line.starts_with("//") || !RAW_READS.iter().any(|call| line.contains(call)) {
+                        continue;
+                    }
+                    match ALLOWED
+                        .iter()
+                        .position(|(file, allowed, _, _)| *file == name && *allowed == line)
+                    {
+                        Some(index) => seen[index] += 1,
+                        None => violations.push(format!("{name}: {line}")),
+                    }
+                }
+            }
+        }
+        for (index, (file, _, count, reason)) in ALLOWED.iter().enumerate() {
+            assert_eq!(
+                seen[index], *count,
+                "review raw-read exception for {file}: {reason}"
+            );
+        }
+        assert!(
+            violations.is_empty(),
+            "Raw command reads must use RoostFs or have a narrowly documented exception:\n{}",
+            violations.join("\n")
         );
     }
 }

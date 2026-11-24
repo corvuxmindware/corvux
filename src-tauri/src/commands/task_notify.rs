@@ -1111,8 +1111,18 @@ const DATE_ONLY_DEFAULT_HHMM: (u32, u32) = (9, 0);
 /// only for a missing/unparseable date.
 fn parse_local_due_to_system_time(due_at: &str) -> Option<SystemTime> {
     let s = due_at.trim();
-    // A date ("YYYY-MM-DD", 10 chars) is mandatory; a time is optional (TRN-1).
-    if s.len() < 10 {
+    // Note metadata and existing indexed values are untrusted. Validate the
+    // complete ASCII shape before using byte offsets: a multibyte character
+    // crossing one of these offsets would otherwise abort release builds.
+    if !matches!(s.len(), 10 | 16)
+        || !s.is_ascii()
+        || s.as_bytes().iter().enumerate().any(|(i, byte)| match i {
+            4 | 7 => *byte != b'-',
+            10 => *byte != b' ',
+            13 => *byte != b':',
+            _ => !byte.is_ascii_digit(),
+        })
+    {
         return None;
     }
     let date = &s[..10];
@@ -1123,7 +1133,7 @@ fn parse_local_due_to_system_time(due_at: &str) -> Option<SystemTime> {
 
     // Use the note's time-of-day when present ("YYYY-MM-DD HH:MM"), else the
     // date-only default (TRN-1) so a dated task still fires.
-    let (hh, mm) = if s.len() >= 16 {
+    let (hh, mm) = if s.len() == 16 {
         let mut time_parts = s[11..16].split(':');
         let hh: u32 = time_parts.next()?.parse().ok()?;
         let mm: u32 = time_parts.next()?.parse().ok()?;
@@ -1236,6 +1246,51 @@ mod tests {
         // A missing/too-short date still yields None — nothing to arm.
         assert!(parse_local_due_to_system_time("").is_none());
         assert!(parse_local_due_to_system_time("2030").is_none());
+    }
+
+    #[test]
+    fn rejects_multibyte_due_dates_without_panicking() {
+        for due_at in [
+            "2026-11-1é",
+            "2030-05-08é10:00",
+            "2030-05-08 10:0é",
+            "2030-05-08 界:00",
+            "２０３０-05-08",
+            "📅 2030-05-08",
+        ] {
+            assert!(
+                parse_local_due_to_system_time(due_at).is_none(),
+                "{due_at:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_malformed_due_date_shapes() {
+        for due_at in [
+            "2030-5-008",
+            "2030/05/08",
+            "2030-05-08T10:00",
+            "2030-05-08 1:00",
+            "2030-05-08 10:00junk",
+            "2030-05-08 10:00:00",
+            "2030-05-08 25:00",
+            "2030-02-30",
+            "2030-05-08garbage",
+        ] {
+            assert!(
+                parse_local_due_to_system_time(due_at).is_none(),
+                "{due_at:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn preserves_valid_due_dates_with_surrounding_whitespace() {
+        assert_eq!(
+            parse_local_due_to_system_time(" 2030-05-08 10:00\n"),
+            parse_local_due_to_system_time("2030-05-08 10:00")
+        );
     }
 
     // Regression: iOS scheduled notifications never fired east of UTC because

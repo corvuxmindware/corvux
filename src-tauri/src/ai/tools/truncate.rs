@@ -10,6 +10,15 @@
 /// but anything above this gets truncated regardless.
 pub const MAX_TOOL_RESULT_BYTES: usize = 32 * 1024;
 
+/// Return the longest prefix within a byte budget without splitting a codepoint.
+pub(crate) fn utf8_prefix(text: &str, max_bytes: usize) -> &str {
+    let mut cut = max_bytes.min(text.len());
+    while !text.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    &text[..cut]
+}
+
 /// Truncate `result` to at most `max_bytes`, breaking on the nearest
 /// preceding newline so we don't cut mid-sentence. Appends a one-line
 /// hint so the LLM knows it can request the rest with a more targeted
@@ -18,14 +27,8 @@ pub fn truncate_tool_result(result: &str, max_bytes: usize) -> String {
     if result.len() <= max_bytes {
         return result.to_string();
     }
-    // Find the last UTF-8 char boundary at or before max_bytes — slicing
-    // without one panics on multi-byte content.
-    let mut cut = max_bytes;
-    while cut > 0 && !result.is_char_boundary(cut) {
-        cut -= 1;
-    }
-    let head = &result[..cut];
-    let break_at = head.rfind('\n').unwrap_or(cut);
+    let head = utf8_prefix(result, max_bytes);
+    let break_at = head.rfind('\n').unwrap_or(head.len());
     format!(
         "{}\n\n[truncated — {} bytes omitted. Use a narrower query or ask roost_read for specific note paths.]",
         &result[..break_at],
@@ -36,6 +39,25 @@ pub fn truncate_tool_result(result: &str, max_bytes: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn utf8_prefix_respects_byte_budgets() {
+        let text = "aé界😀";
+        for (budget, expected) in [
+            (0, ""),
+            (1, "a"),
+            (2, "a"),
+            (3, "aé"),
+            (5, "aé"),
+            (6, "aé界"),
+            (9, "aé界"),
+            (10, text),
+            (usize::MAX, text),
+        ] {
+            assert_eq!(utf8_prefix(text, budget), expected, "budget {budget}");
+        }
+        assert_eq!(utf8_prefix("", usize::MAX), "");
+    }
 
     #[test]
     fn passthrough_when_under_cap() {
