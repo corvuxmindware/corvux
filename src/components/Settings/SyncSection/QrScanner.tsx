@@ -28,6 +28,16 @@ import { log } from "../../../lib/log";
  * - **iOS WKWebView / macOS**: needs `NSCameraUsageDescription`; `playsinline`
  *   keeps the preview from going fullscreen.
  *
+ * ## Why the <video> is built with `document.createElement` (iOS black preview)
+ * Solid compiles JSX `<video>` into a clone of a `<template>`'s content (an
+ * element born in the template's inert document, adopted on insert). On iOS
+ * WKWebView such a <video> plays the camera stream — `readyState` 4, frames
+ * readable via `drawImage`, so jsQR still decodes — but WebKit never composites
+ * its video layer: the preview is the container's black background. Verified
+ * on-device 2026-11-06 (iPhone 16 Pro): template clone → black; the SAME stream
+ * in a `createElement` / `importNode` <video> → live picture. So the element is
+ * created imperatively and inserted as a node. Do not move it back into JSX.
+ *
  * The PIN is intentionally NOT in the QR — it stays manual as the out-of-band
  * MitM check. Scanning only fills the ticket.
  */
@@ -42,7 +52,12 @@ export default function QrScanner(props: {
   onError: (message: string) => void;
   onCancel: () => void;
 }) {
-  let video!: HTMLVideoElement;
+  // Imperative, NOT JSX — see "Why the <video> is built with createElement".
+  const video = document.createElement("video");
+  video.className = "w-full h-full object-cover";
+  video.muted = true;
+  video.playsInline = true;
+  video.setAttribute("playsinline", "");
   let canvas!: HTMLCanvasElement;
   const [status, setStatus] = createSignal<"starting" | "scanning">("starting");
   const [cameras, setCameras] = createSignal<MediaDeviceInfo[]>([]);
@@ -65,6 +80,7 @@ export default function QrScanner(props: {
       raf = null;
     }
     stopStream();
+    video.srcObject = null;
   }
   onCleanup(cleanup);
 
@@ -218,7 +234,7 @@ export default function QrScanner(props: {
         class="relative bg-black rounded overflow-hidden mx-auto"
         style={{ "aspect-ratio": "1 / 1", "max-width": "240px" }}
       >
-        <video ref={video} class="w-full h-full object-cover" />
+        {video}
         <canvas ref={canvas} class="hidden" />
         {/* Aiming frame */}
         <div class="absolute inset-5 border-2 border-accent/70 rounded pointer-events-none" />

@@ -51,6 +51,45 @@ describe("QrScanner", () => {
     expect(onResult).not.toHaveBeenCalled();
   });
 
+  it("builds its preview <video> with document.createElement, not a JSX template clone", () => {
+    // iOS WKWebView bug (verified on iPhone 16 Pro, 2026-11-06): a <video>
+    // cloned from Solid's JSX <template> plays the camera stream (readyState 4,
+    // frames readable via drawImage) but WebKit never composites its video
+    // layer, so the preview is solid black. A createElement'd <video> renders.
+    // Probe on-device: template-clone → black; createElement / importNode /
+    // main-document cloneNode → live picture.
+    mockGetUserMedia(() => new Promise<MediaStream>(() => {})); // stay "starting"
+    const created: Element[] = [];
+    const realCreate = document.createElement.bind(document);
+    const spy = vi
+      .spyOn(document, "createElement")
+      .mockImplementation(((tag: string, opts?: ElementCreationOptions) => {
+        const el = realCreate(tag, opts);
+        created.push(el);
+        return el;
+      }) as typeof document.createElement);
+
+    const container = document.createElement("div");
+    document.body.appendChild(container);
+    try {
+      dispose = render(
+        () => (
+          <QrScanner onResult={() => {}} onError={() => {}} onCancel={() => {}} />
+        ),
+        container,
+      );
+    } finally {
+      spy.mockRestore();
+    }
+
+    const video = container.querySelector("video");
+    expect(video).not.toBeNull();
+    expect(created).toContain(video);
+    // Inline playback must be set on the element itself (iOS).
+    expect(video?.hasAttribute("playsinline")).toBe(true);
+    expect(video?.muted).toBe(true);
+  });
+
   it("reports an error when the device has no camera API at all", async () => {
     // Some webviews expose no mediaDevices (e.g. insecure context). The
     // scanner must degrade to an error, not throw an unhandled exception.
