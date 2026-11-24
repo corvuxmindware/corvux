@@ -1,5 +1,6 @@
 import { splitProps, type JSX } from "solid-js";
 import { settingsStore } from "../../stores/settings";
+import { isLightBackgroundTheme } from "../../lib/theme-kind";
 
 type LogoVariant = "auto" | "dark" | "light";
 
@@ -15,11 +16,10 @@ export default function CorvuxLogo(props: CorvuxLogoProps) {
     const variant = local.variant ?? "auto";
     if (variant === "dark") return "/corvux-logo-dark.png";
     if (variant === "light") return "/corvux-logo-light.png";
-    // Parchment is a light-bg theme, so it needs the black mark — same as
-    // the Light theme. Everything else (dark, nord, synthwave, corvid) is
-    // a dark-bg theme and uses the white mark.
-    const theme = settingsStore.theme();
-    return theme === "light" || theme === "parchment"
+    // Light-background themes (Daylight, Parchment) need the black mark;
+    // dark-background themes use the white one. The list lives in
+    // lib/theme-kind so the logo, native controls and diagrams agree.
+    return isLightBackgroundTheme(settingsStore.theme())
       ? "/corvux-logo-light.png"
       : "/corvux-logo-dark.png";
   };

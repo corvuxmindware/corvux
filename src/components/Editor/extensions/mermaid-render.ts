@@ -12,7 +12,12 @@
  *    suite uses.
  *
  * Mermaid is dynamic-imported on first render so notes without diagrams
- * never pay the ~800 KB bundle cost. SVGs are cached by source hash.
+ * never pay the ~800 KB bundle cost. SVGs are cached by theme + source hash.
+ *
+ * Diagrams follow the app theme: Mermaid's "default" (light) theme on
+ * light-background app themes, "dark" otherwise. Switching the app theme
+ * re-renders the open diagrams. (Until 2026-11-05 Mermaid was always "dark",
+ * so on Daylight/Parchment diagrams showed dark boxes with dark text.)
  *
  * Block decorations must live in a StateField (not a ViewPlugin); same
  * constraint as table-render, image-embed, frontmatter-hide.
@@ -22,17 +27,33 @@ import {
   Decoration,
   DecorationSet,
   EditorView,
+  ViewPlugin,
   WidgetType,
 } from "@codemirror/view";
 import {
   EditorState,
   Range,
+  StateEffect,
   StateField,
   type Transaction,
 } from "@codemirror/state";
 import { isEditMode, setEditMode } from "./edit-mode";
 import { errMsg } from "../../../lib/error";
+import { appliedTheme, isLightBackgroundTheme } from "../../../lib/theme-kind";
 import { attachPinchZoom } from "./mermaid-zoom-dom";
+
+/** The two Mermaid themes we use: "default" is Mermaid's light theme. */
+export type MermaidTheme = "dark" | "default";
+
+/** Mermaid theme for an app theme id (`data-theme`; dark when absent). */
+export function mermaidThemeFor(appTheme: string | null | undefined): MermaidTheme {
+  return isLightBackgroundTheme(appTheme) ? "default" : "dark";
+}
+
+/** Mermaid theme for the app theme currently applied to `<html>`. */
+export function currentMermaidTheme(): MermaidTheme {
+  return mermaidThemeFor(appliedTheme());
+}
 
 // AUDIT-031 (revised 2026-05-23): mermaid emits SVG that we inject via
 // innerHTML, so the XSS surface is real and must stay closed. Our v1 fix
@@ -93,47 +114,82 @@ export function preloadMermaid() {
 }
 function getMermaid() {
   if (!mermaidPromise) {
-    mermaidPromise = import("mermaid").then((m) => {
-      const mermaid = m.default;
-      mermaid.initialize({
-        startOnLoad: false,
-        theme: "dark",
-        securityLevel: "strict",
-        fontFamily: "Inter, -apple-system, sans-serif",
-        // Render node/edge labels as native SVG <text> (+ <tspan> per
-        // <br/>) instead of HTML inside <foreignObject>. iOS WebKit /
-        // WKWebView does NOT scale foreignObject content with the SVG
-        // viewBox — when we shrink a wide diagram to `max-width:100%` the
-        // HTML labels keep their intrinsic px size and render as a giant
-        // overlay on top of the scaled-down diagram (seen on the
-        // text-dense _architecture-flowchart on iPhone). SVG <text> scales
-        // with the viewBox, so labels stay glued to their boxes. Trade-off:
-        // no HTML rich-text in labels, but our diagrams only use plain text
-        // + <br/> line breaks, which SVG labels handle via <tspan>.
-        //
-        // NB: must be the TOP-LEVEL `htmlLabels` key — the nested
-        // `flowchart: { htmlLabels: false }` form is silently ignored in
-        // mermaid 11.x (verified: nested → still <foreignObject>; top-level
-        // → native <text>/<tspan>, <br/> splits into 11 tspans).
-        htmlLabels: false,
-        // v11+ default behaviour on a syntax error is to RESOLVE with an
-        // SVG containing mermaid's built-in bomb icon and the text
-        // "Syntax error in text — mermaid version 11.14.0". The widget's
-        // try/catch never fires because no exception is thrown, so the
-        // bomb SVG ends up in wrap.innerHTML. suppressErrorRendering
-        // forces mermaid to throw instead, falling into our catch block
-        // which renders the inline `⚠ Mermaid parse error — …` text.
-        suppressErrorRendering: true,
-      });
-      return mermaid;
-    });
+    mermaidPromise = import("mermaid").then((m) => m.default);
   }
   return mermaidPromise;
 }
 
-// SVG cache keyed by source hash — survives scrolls, tab switches, and
-// unrelated doc changes. Re-render only fires when a block's source
-// actually changes. Capped at 256 entries (FIFO eviction) so long sessions
+/** Full Mermaid config for one theme. Everything except `theme` is fixed. */
+export function mermaidConfig(theme: MermaidTheme) {
+  return {
+    startOnLoad: false,
+    theme,
+    securityLevel: "strict" as const,
+    fontFamily: "Inter, -apple-system, sans-serif",
+    // Render node/edge labels as native SVG <text> (+ <tspan> per
+    // <br/>) instead of HTML inside <foreignObject>. iOS WebKit /
+    // WKWebView does NOT scale foreignObject content with the SVG
+    // viewBox — when we shrink a wide diagram to `max-width:100%` the
+    // HTML labels keep their intrinsic px size and render as a giant
+    // overlay on top of the scaled-down diagram (seen on the
+    // text-dense _architecture-flowchart on iPhone). SVG <text> scales
+    // with the viewBox, so labels stay glued to their boxes. Trade-off:
+    // no HTML rich-text in labels, but our diagrams only use plain text
+    // + <br/> line breaks, which SVG labels handle via <tspan>.
+    //
+    // NB: must be the TOP-LEVEL `htmlLabels` key — the nested
+    // `flowchart: { htmlLabels: false }` form is silently ignored in
+    // mermaid 11.x (verified: nested → still <foreignObject>; top-level
+    // → native <text>/<tspan>, <br/> splits into 11 tspans).
+    htmlLabels: false,
+    // v11+ default behaviour on a syntax error is to RESOLVE with an
+    // SVG containing mermaid's built-in bomb icon and the text
+    // "Syntax error in text — mermaid version 11.14.0". The widget's
+    // try/catch never fires because no exception is thrown, so the
+    // bomb SVG ends up in wrap.innerHTML. suppressErrorRendering
+    // forces mermaid to throw instead, falling into our catch block
+    // which renders the inline `⚠ Mermaid parse error — …` text.
+    suppressErrorRendering: true,
+  };
+}
+
+// Mermaid's config is global, so `initialize(theme)` + `render` must not
+// interleave with another diagram's pair: a render queued for the old theme
+// would otherwise come out in the new one (and be cached under the wrong
+// key). Chain them; Mermaid renders one diagram at a time anyway.
+let renderChain: Promise<unknown> = Promise.resolve();
+let initializedTheme: MermaidTheme | null = null;
+
+/** A render that takes longer than this is reported as an error, so one
+ *  stuck diagram can't hold every later diagram (in every editor) on
+ *  "Rendering diagram…" behind it in the chain. */
+export const MERMAID_RENDER_TIMEOUT_MS = 20_000;
+
+function withTimeout<T>(work: Promise<T>, ms: number): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`diagram took longer than ${ms / 1000}s to render`)), ms);
+  });
+  return Promise.race([work, timeout]).finally(() => clearTimeout(timer));
+}
+
+function renderSvg(id: string, code: string, theme: MermaidTheme): Promise<string> {
+  const job = renderChain.then(async () => {
+    const mermaid = await getMermaid();
+    if (initializedTheme !== theme) {
+      mermaid.initialize(mermaidConfig(theme));
+      initializedTheme = theme;
+    }
+    const { svg } = await withTimeout(mermaid.render(id, code), MERMAID_RENDER_TIMEOUT_MS);
+    return svg;
+  });
+  renderChain = job.catch(() => undefined);
+  return job;
+}
+
+// SVG cache keyed by theme + source hash — survives scrolls, tab switches,
+// and unrelated doc changes. Re-render only fires when a block's source (or
+// the theme) actually changes. Capped at 256 entries (FIFO eviction) so long sessions
 // with many unique diagrams don't accumulate unbounded memory.
 const SVG_CACHE_MAX = 256;
 const svgCache = new Map<string, string>();
@@ -199,12 +255,15 @@ function findMermaidBlocks(state: EditorState): MermaidBlock[] {
 }
 
 class MermaidWidget extends WidgetType {
-  constructor(private readonly code: string) {
+  constructor(
+    private readonly code: string,
+    private readonly theme: MermaidTheme,
+  ) {
     super();
   }
 
   eq(other: MermaidWidget): boolean {
-    return other.code === this.code;
+    return other.code === this.code && other.theme === this.theme;
   }
 
   toDOM(view: EditorView): HTMLElement {
@@ -245,14 +304,15 @@ class MermaidWidget extends WidgetType {
     (outer as { __cmZoom?: () => void }).__cmZoom = attachPinchZoom(wrap, pan);
 
     const hash = hashCode(this.code);
-    const cached = svgCache.get(hash);
+    const cacheKey = `${this.theme}:${hash}`;
+    const cached = svgCache.get(cacheKey);
     if (cached) {
       // Self-heal: any cache entry written before we set
       // suppressErrorRendering: true could contain mermaid's bomb SVG.
       // Detect those by their identifying text and force a fresh render
       // so the catch block can replace the bomb with our inline error.
       if (cached.includes("Syntax error in text") || cached.includes("aria-roledescription=\"error\"")) {
-        svgCache.delete(hash);
+        svgCache.delete(cacheKey);
       } else {
         pan.innerHTML = sanitizeSvg(cached);
         return outer;
@@ -265,11 +325,11 @@ class MermaidWidget extends WidgetType {
     pan.appendChild(loading);
 
     getMermaid()
-      .then(async (mermaid) => {
+      .then(async () => {
         try {
           const renderId = `${hash}-${Math.random().toString(36).slice(2, 7)}`;
-          const { svg } = await mermaid.render(renderId, this.code);
-          setSvgCache(hash, svg);
+          const svg = await renderSvg(renderId, this.code, this.theme);
+          setSvgCache(cacheKey, svg);
           pan.innerHTML = sanitizeSvg(svg);
         } catch (e) {
           wrap.classList.add("cm-mermaid-error");
@@ -300,7 +360,7 @@ class MermaidWidget extends WidgetType {
   }
 }
 
-function buildDecorations(state: EditorState): DecorationSet {
+function buildDecorations(state: EditorState, theme: MermaidTheme): DecorationSet {
   const sel = state.selection.main;
   const editing = isEditMode(state);
   const blocks = findMermaidBlocks(state);
@@ -313,7 +373,7 @@ function buildDecorations(state: EditorState): DecorationSet {
     if (editing && sel.from <= b.to && sel.to >= b.from) continue;
     out.push(
       Decoration.replace({
-        widget: new MermaidWidget(b.code),
+        widget: new MermaidWidget(b.code, theme),
         block: true,
       }).range(b.from, b.to),
     );
@@ -425,18 +485,62 @@ const mermaidTheme = EditorView.baseTheme({
   },
 });
 
+/** Tells an editor the app theme changed, so its diagrams re-render. */
+export const setMermaidTheme = StateEffect.define<MermaidTheme>();
+
+interface MermaidFieldValue {
+  theme: MermaidTheme;
+  decorations: DecorationSet;
+}
+
 export function mermaidRender() {
-  const field = StateField.define<DecorationSet>({
+  const field = StateField.define<MermaidFieldValue>({
     create(state) {
-      return buildDecorations(state);
+      const theme = currentMermaidTheme();
+      return { theme, decorations: buildDecorations(state, theme) };
     },
     update(value, tr: Transaction) {
+      let theme = value.theme;
+      for (const e of tr.effects) if (e.is(setMermaidTheme)) theme = e.value;
       const modeToggle = tr.effects.some((e) => e.is(setEditMode));
-      if (!tr.docChanged && !tr.selection && !modeToggle) return value;
-      return buildDecorations(tr.state);
+      if (!tr.docChanged && !tr.selection && !modeToggle && theme === value.theme) {
+        return value;
+      }
+      return { theme, decorations: buildDecorations(tr.state, theme) };
     },
-    provide: (f) => EditorView.decorations.from(f),
+    provide: (f) => EditorView.decorations.from(f, (v) => v.decorations),
   });
 
-  return [field, mermaidTheme];
+  // Watch the app theme (the `data-theme` attribute on <html>) and tell this
+  // editor when the Mermaid theme it needs has changed.
+  const themeWatcher = ViewPlugin.fromClass(
+    class {
+      private readonly observer: MutationObserver;
+      private destroyed = false;
+      constructor(view: EditorView) {
+        const sync = () => {
+          if (this.destroyed) return;
+          const theme = currentMermaidTheme();
+          if (view.state.field(field, false)?.theme !== theme) {
+            view.dispatch({ effects: setMermaidTheme.of(theme) });
+          }
+        };
+        this.observer = new MutationObserver(sync);
+        this.observer.observe(document.documentElement, {
+          attributes: true,
+          attributeFilter: ["data-theme"],
+        });
+        // The field read the theme when the state was created; catch a
+        // switch that happened before this view existed. Deferred because
+        // a view can't dispatch while it is being constructed.
+        queueMicrotask(sync);
+      }
+      destroy() {
+        this.destroyed = true;
+        this.observer.disconnect();
+      }
+    },
+  );
+
+  return [field, themeWatcher, mermaidTheme];
 }

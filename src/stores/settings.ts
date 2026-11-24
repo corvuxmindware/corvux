@@ -19,6 +19,7 @@ import type {
 import { lsGet, lsSet } from "../lib/storage";
 import { log } from "../lib/log";
 import { roostSettingsStore } from "./roostSettings";
+import { isLightBackgroundTheme } from "../lib/theme-kind";
 
 export type Theme = "dark" | "light" | "nord" | "synthwave" | "parchment" | "corvid";
 export type EditorFont = "mono" | "sans" | "serif" | "system" | "rounded" | "slab";
@@ -296,9 +297,8 @@ function createSettingsStore() {
   function applyTheme(t: Theme) {
     if (typeof document === "undefined") return;
     // Native scrollbars / form controls follow color-scheme, so any
-    // light-background theme (light, parchment) must declare "light".
-    const isLightBg = t === "light" || t === "parchment";
-    document.documentElement.style.colorScheme = isLightBg ? "light" : "dark";
+    // light-background theme must declare "light" (list in lib/theme-kind).
+    document.documentElement.style.colorScheme = isLightBackgroundTheme(t) ? "light" : "dark";
     if (t === "dark") {
       document.documentElement.removeAttribute("data-theme");
     } else {
