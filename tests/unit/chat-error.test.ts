@@ -67,6 +67,19 @@ describe("classifyChatError", () => {
     expect(info.body).not.toContain("googleapis.com");
   });
 
+  it("omits the purchase CTA and any Pro pitch when purchase links are not allowed (iOS)", () => {
+    // App Store guideline 3.1.1: no buttons/links steering to a non-IAP
+    // purchase. The rate-limit card must still explain the error.
+    const info = classifyChatError(GEMINI_429, { allowPurchaseCta: false });
+    expect(info.kind).toBe("rate_limit");
+    expect(info.title).toBe("Rate limit reached");
+    expect(info.cta).toBeUndefined();
+    expect(info.body).not.toContain("Pro");
+    expect(info.body).not.toContain("Upgrade");
+    expect(info.body).toContain("rate limit");
+    expect(info.body).not.toContain("RESOURCE_EXHAUSTED");
+  });
+
   it("passes through generic errors with the raw message as the body", () => {
     const info = classifyChatError("Network error: connection refused");
     expect(info.kind).toBe("generic");

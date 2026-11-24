@@ -119,12 +119,12 @@ pub(crate) fn persist_settings_file(path: &Path, settings: &Settings) -> Result<
 }
 
 #[cfg(not(windows))]
-fn atomic_replace(from: &Path, to: &Path) -> Result<(), String> {
+pub(crate) fn atomic_replace(from: &Path, to: &Path) -> Result<(), String> {
     std::fs::rename(from, to).map_err(|e| e.to_string())
 }
 
 #[cfg(windows)]
-fn atomic_replace(from: &Path, to: &Path) -> Result<(), String> {
+pub(crate) fn atomic_replace(from: &Path, to: &Path) -> Result<(), String> {
     use windows::core::HSTRING;
     use windows::Win32::Storage::FileSystem::{
         MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,

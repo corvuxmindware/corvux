@@ -8,7 +8,13 @@
 // decision (chosen 2026-05-27) — it only resolves the user's problem if a
 // Pro tier proxies AI through Corvux-managed keys.
 
-export type ChatErrorKind = "rate_limit" | "generic";
+/** `notice` = not an error (e.g. the user declined the AI consent prompt);
+ *  rendered neutral, not red. */
+export type ChatErrorKind = "rate_limit" | "generic" | "notice";
+
+/** Prefix the chat store puts on a declined-consent message so it is shown
+ *  as a neutral notice. Set only by `stores/chat.ts`, never by the backend. */
+export const AI_CONSENT_DECLINED_PREFIX = "AI_CONSENT_DECLINED:";
 
 export interface ChatErrorInfo {
   kind: ChatErrorKind;
@@ -50,8 +56,42 @@ export function isRateLimitError(raw: string): boolean {
   );
 }
 
-export function classifyChatError(raw: string): ChatErrorInfo {
+export interface ClassifyOptions {
+  /** False on iOS: App Store guideline 3.1.1 forbids buttons or links that
+   *  steer users to a purchase outside In-App Purchase, so the card drops
+   *  the Pro pitch and CTA there. Defaults to true. */
+  allowPurchaseCta?: boolean;
+}
+
+export function classifyChatError(raw: string, opts: ClassifyOptions = {}): ChatErrorInfo {
+  const allowPurchaseCta = opts.allowPurchaseCta ?? true;
+  if (raw.startsWith(AI_CONSENT_DECLINED_PREFIX)) {
+    return {
+      kind: "notice",
+      title: "Not sent",
+      body: raw.slice(AI_CONSENT_DECLINED_PREFIX.length),
+      raw,
+    };
+  }
+  // Backend consent gate (`commands/ai/consent.rs`). Normally the prompt in
+  // `ai-consent.ts` runs first; this covers a provider switch in between.
+  if (raw.startsWith("AI_CONSENT_REQUIRED:")) {
+    return {
+      kind: "generic",
+      title: "Permission needed",
+      body: "Corvux needs your permission before sending this to your AI provider. Send your message again to review the request.",
+      raw,
+    };
+  }
   if (isRateLimitError(raw)) {
+    if (!allowPurchaseCta) {
+      return {
+        kind: "rate_limit",
+        title: "Rate limit reached",
+        body: "You've hit your AI provider's rate limit. Wait a minute and try again, or check the usage limits on your provider account.",
+        raw,
+      };
+    }
     return {
       kind: "rate_limit",
       title: "Rate limit reached",

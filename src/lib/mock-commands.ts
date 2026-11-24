@@ -221,6 +221,13 @@ export const mockCommands: typeof RealCommands = {
   resetAiLearning: () => envelope(mockInvoke("reset_ai_learning")),
   agentsMdStatus: () => envelope(mockInvoke("agents_md_status")),
   createAgentsMd: () => envelope(mockInvoke("create_agents_md")),
+  // ── ai/consent.rs ───────────────────────────────────────────────
+  // Browser mock has no third-party egress (chat_send is canned), so it
+  // never needs consent; grant/revoke/list are inert.
+  aiConsentCheck: () => envelope(Promise.resolve(null)),
+  aiConsentGrant: (_id) => envelope(Promise.resolve(null)),
+  aiConsentRevoke: (_id) => envelope(Promise.resolve(null)),
+  aiConsentList: () => envelope(Promise.resolve([] as string[])),
   // ── ai/chat.rs ──────────────────────────────────────────────────
   chatSend: (args) => envelope(mockInvoke("chat_send", { args })),
   chatStop: () => envelope(mockInvoke("chat_stop")),

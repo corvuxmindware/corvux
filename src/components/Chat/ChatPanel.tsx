@@ -908,10 +908,17 @@ export default function ChatPanel(props: ChatPanelProps) {
         </Show>
 
         {/* Error message — classified into a friendly card. Rate-limit
-            errors get the upgrade CTA; everything else shows the message. */}
+            errors get the upgrade CTA (not on iOS); a declined AI-consent
+            prompt is a neutral notice, not a red error. */}
         <Show when={chatStore.errorInfo()}>
           {(info) => (
-            <div class="px-3 py-2 rounded-lg bg-red/10 border border-red/20 text-red text-xs space-y-1.5">
+            <div
+              class={
+                info().kind === "notice"
+                  ? "px-3 py-2 rounded-lg border border-border text-text-secondary text-xs space-y-1.5"
+                  : "px-3 py-2 rounded-lg bg-red/10 border border-red/20 text-red text-xs space-y-1.5"
+              }
+            >
               <div class="font-medium">{info().title}</div>
               <div class="opacity-90">{info().body}</div>
               <Show when={info().cta}>

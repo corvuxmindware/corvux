@@ -2,6 +2,7 @@ import { For, Show, createMemo, createSignal } from "solid-js";
 import { settingsStore } from "../../stores/settings";
 import { commands, unwrap } from "../../lib/invoke";
 import { toastStore } from "../Toast/Toast";
+import AllowedAiProviders from "./AllowedAiProviders";
 
 /**
  * Privacy panel — the "what leaves my device, what stays" surface.
@@ -205,6 +206,7 @@ export default function PrivacySection() {
         <p class="text-[11px] text-text-muted">
           Endpoint: <code class="font-mono">{chatDestination()?.host}</code>
         </p>
+        <AllowedAiProviders />
       </div>
 
       {/* Search */}

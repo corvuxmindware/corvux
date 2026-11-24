@@ -673,7 +673,10 @@ fn build_chat_provider(
         )
     };
 
-    match provider {
+    // Consent target, computed before the match moves the fields it reads.
+    let consent_target =
+        super::consent::required_consent(provider, &ollama_base, &ollama_model, &or_model);
+    let built: Result<Box<dyn LLMProvider>, String> = match provider {
         LlmProvider::Gemini => {
             let key = gemini_key.ok_or(
                 "Gemini is the active provider but no API key is set. \
@@ -743,7 +746,13 @@ fn build_chat_provider(
                 anthropic_model,
             )))
         }
-    }
+    };
+    // Single choke point for guideline 5.1.2(i). This is the only place a
+    // production provider is built (ratchet: tests/ai_consent_guard.rs), and
+    // it leaves only inside `ConsentGated`, which re-checks the user's
+    // per-provider consent before EVERY request — so withdrawing consent
+    // mid-run stops the agent loop and subagents too. See `consent.rs`.
+    super::consent::gate(built?, &settings_state.path, &consent_target)
 }
 
 #[cfg(test)]

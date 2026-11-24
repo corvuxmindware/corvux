@@ -5,6 +5,7 @@
 //!  - `types`     — Tauri-managed state structs (Settings, ChatCancel, ...)
 //!  - `settings`  — get/save settings + device-profile
 //!  - `chat`      — chat_send / chat_stop + system-prompt helpers
+//!  - `consent`   — per-provider consent gate before data goes to a cloud AI
 //!  - `llm`       — download / load / unload / delete the local LLM
 //!
 //! All public items are re-exported here so callers can use the unchanged
@@ -15,6 +16,7 @@
 // `pub use` would re-export the function but not the hidden companion items.
 pub mod chat;
 pub mod connection_test;
+pub mod consent;
 pub mod llm;
 pub mod ollama_models;
 pub mod settings;

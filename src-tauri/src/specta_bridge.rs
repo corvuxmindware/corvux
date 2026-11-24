@@ -118,6 +118,10 @@ pub fn build() -> Builder<tauri::Wry> {
             // ── ai/settings.rs ────────────────────────────────────
             crate::commands::ai::settings::get_settings,
             crate::commands::ai::settings::save_settings,
+            crate::commands::ai::consent::ai_consent_check,
+            crate::commands::ai::consent::ai_consent_grant,
+            crate::commands::ai::consent::ai_consent_revoke,
+            crate::commands::ai::consent::ai_consent_list,
             crate::commands::ai::settings::list_agent_profiles,
             crate::commands::ai::settings::get_device_profile,
             crate::commands::ai::settings::decide_tool,

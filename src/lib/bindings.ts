@@ -665,6 +665,26 @@ export const commands = {
 	 *  so subsequent `get_settings` calls return them.
 	 */
 	saveSettings: (settings: Settings) => typedError<null, string>(__TAURI_INVOKE("save_settings", { settings })),
+	aiConsentCheck: () => typedError<{
+	/**
+	 *  Stable consent key: `gemini`, `openrouter`, `openai`, `anthropic`, or
+	 *  `ollama:<host>` (`ollama:ollama.com` for Ollama cloud models).
+	 */
+	id: string,
+	/**  Human name for the prompt, e.g. "Google Gemini". */
+	provider_name: string,
+	/**  Host the request goes to, e.g. `generativelanguage.googleapis.com`. */
+	host: string,
+	/**
+	 *  Provider-specific sentence for the prompt (may be empty), e.g. that
+	 *  OpenRouter forwards to the model's maker.
+	 */
+	detail: string,
+} | null, string>(__TAURI_INVOKE("ai_consent_check")),
+	aiConsentGrant: (id: string) => typedError<null, string>(__TAURI_INVOKE("ai_consent_grant", { id })),
+	aiConsentRevoke: (id: string) => typedError<null, string>(__TAURI_INVOKE("ai_consent_revoke", { id })),
+	/**  Consent ids currently granted, for Settings → Privacy. */
+	aiConsentList: () => typedError<string[], string>(__TAURI_INVOKE("ai_consent_list")),
 	/**
 	 *  List the available agent profiles for the settings UI. Driven by
 	 *  `AgentProfile::all()` so the frontend stays in sync with whatever
@@ -1003,6 +1023,24 @@ export type AgentsMdStatus = {
  *  in-progress assistant message.
  */
 export type AiChunk = string;
+
+/**  Where a chat would go, as shown in the consent prompt. */
+export type AiConsentTarget = {
+	/**
+	 *  Stable consent key: `gemini`, `openrouter`, `openai`, `anthropic`, or
+	 *  `ollama:<host>` (`ollama:ollama.com` for Ollama cloud models).
+	 */
+	id: string,
+	/**  Human name for the prompt, e.g. "Google Gemini". */
+	provider_name: string,
+	/**  Host the request goes to, e.g. `generativelanguage.googleapis.com`. */
+	host: string,
+	/**
+	 *  Provider-specific sentence for the prompt (may be empty), e.g. that
+	 *  OpenRouter forwards to the model's maker.
+	 */
+	detail: string,
+};
 
 /**
  *  Stream complete. Payload is the full concatenated text — the

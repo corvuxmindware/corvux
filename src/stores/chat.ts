@@ -2,7 +2,9 @@ import { createSignal, createMemo, createRoot } from "solid-js";
 import { createStore, produce } from "solid-js/store";
 import { commands, events, isTauri, unwrap } from "../lib/invoke";
 import { log } from "../lib/log";
-import { classifyChatError } from "../lib/chat-error";
+import { AI_CONSENT_DECLINED_PREFIX, classifyChatError } from "../lib/chat-error";
+import { isIOS } from "../lib/platform";
+import { AiConsentDeclined, ensureAiConsent } from "../lib/ai-consent";
 
 export interface ChatMessage {
   role: "user" | "model";
@@ -150,7 +152,7 @@ function createChatStore() {
   // panel renders this (rate-limit → upgrade CTA) instead of the raw blob.
   const errorInfo = createMemo(() => {
     const raw = error();
-    return raw ? classifyChatError(raw) : null;
+    return raw ? classifyChatError(raw, { allowPurchaseCta: !isIOS() }) : null;
   });
   const [pendingTools, setPendingTools] = createSignal<PendingTool[]>([]);
   const [sessions, setSessions] = createSignal<ChatSession[]>([]);
@@ -474,18 +476,7 @@ function createChatStore() {
     setCurrentActivity("Thinking…");
     setStatus("streaming");
 
-    try {
-      const r = await commands.chatSend({
-        messages: history,
-        context: noteContent ?? null,
-        roost_path: currentRoostPath,
-      });
-      if (r.status === "error") throw r.error;
-    } catch (e: unknown) {
-      const errMsg = typeof e === "string" ? e : "Failed to send message";
-      setStatus("error");
-      setError(errMsg);
-      // Remove empty assistant message
+    const dropEmptyPlaceholder = () =>
       setMessages((prev) => {
         const updated = [...prev];
         const last = updated[updated.length - 1];
@@ -494,6 +485,34 @@ function createChatStore() {
         }
         return updated;
       });
+
+    try {
+      // Guideline 5.1.2(i): explicit permission before the first send to a
+      // third-party AI provider. A decline throws and lands in the catch
+      // below, so the message stays visible but nothing leaves the device.
+      await ensureAiConsent();
+      // The user may have pressed Stop (or switched chats) while the
+      // permission prompt was open — then this turn is over; don't send.
+      if (status() !== "streaming") {
+        dropEmptyPlaceholder();
+        return;
+      }
+      const r = await commands.chatSend({
+        messages: history,
+        context: noteContent ?? null,
+        roost_path: currentRoostPath,
+      });
+      if (r.status === "error") throw r.error;
+    } catch (e: unknown) {
+      if (e instanceof AiConsentDeclined) {
+        // A deliberate choice, not a failure: neutral notice, idle status.
+        setStatus("idle");
+        setError(`${AI_CONSENT_DECLINED_PREFIX}${e.message}`);
+      } else {
+        setStatus("error");
+        setError(typeof e === "string" ? e : "Failed to send message");
+      }
+      dropEmptyPlaceholder();
     }
   }
 
