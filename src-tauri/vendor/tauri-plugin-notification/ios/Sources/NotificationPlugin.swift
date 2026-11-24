@@ -280,6 +280,6 @@ class NotificationPlugin: Plugin {
 }
 
 @_cdecl("init_plugin_notification")
-func initPlugin() -> Plugin {
+public func initPlugin() -> Plugin {
   return NotificationPlugin()
 }

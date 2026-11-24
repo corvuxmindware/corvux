@@ -199,6 +199,6 @@ class IosPickerPlugin: Plugin {
 }
 
 @_cdecl("init_plugin_ios_picker")
-func initPlugin() -> Plugin {
+public func initPlugin() -> Plugin {
   return IosPickerPlugin()
 }
