@@ -18,8 +18,14 @@
 //!     rides the same backup as the ciphertext it decrypts, so the at-rest
 //!     encryption buys nothing against a restore onto another device.
 //!   * `<app_data>/sync/` — the Ed25519 device / iroh-NodeId secret
-//!     (`identity.bin`), the QUIC TLS key (`tls.bin`), and the peer registry
-//!     (`peers.bin`). A cloned identity could authenticate to paired peers.
+//!     (`identity.bin`) and the QUIC TLS key (`tls.bin`). A cloned identity
+//!     could authenticate to paired peers.
+//!
+//! NOT excluded (and that's fine): each roost's peer registry lives at
+//! `<app_data>/vaults/id-*/sync/peers.bin`, not in `<app_data>/sync/`. Since
+//! peer-store v4 it holds no secrets — only peer ids, names, addresses and
+//! (v5) the keychain-scope id, which is a key NAME, not a key; every pairing
+//! credential is in `secrets/` above.
 //!
 //! Excluding a directory excludes its whole subtree, including files created
 //! later, so this is set once at startup rather than threaded through every

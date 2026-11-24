@@ -32,23 +32,41 @@ const QUEUE_PULL_INTERVAL: Duration = Duration::from_secs(300);
 
 /// Domain tag prefixing the store-and-forward queue envelope AAD (M-2).
 /// Distinct from the live-transport AAD so the two contexts can't be confused.
-const QUEUE_ENV_AAD_TAG: &[u8] = b"corvux-queue-env-v2";
+const QUEUE_ENV_AAD_TAG: &[u8] = b"corvux-queue-env-v3";
 
-/// SYN-M7: build the DIRECTIONAL AAD for a queue envelope. Binds the domain
-/// tag, the SENDER then RECIPIENT NodeId, and the protocol version. The per-pair
-/// queue key is the SAME in both directions (one HKDF subkey of the shared
-/// pairing `SessionSecret`), so a CONSTANT AAD (the old `-v1`) let a hostile
-/// relay REFLECT a frame A queued for B back into A's inbox as if from B — A
-/// held the same key + same AAD, so it decrypted. Binding sender→recipient
-/// makes an A→B frame (`aad(A,B)`) fail to open as B→A (`aad(B,A)`), closing the
-/// reflection. Bumping the tag to `-v2` is a deliberate clean break: an in-flight
-/// pre-upgrade frame no longer decrypts and is reaped as unrecoverable (M-8) —
-/// harmless, since the live path re-exchanges that change on reconnect.
-fn queue_env_aad(sender: &[u8; 32], recipient: &[u8; 32]) -> Vec<u8> {
-    let mut aad = Vec::with_capacity(QUEUE_ENV_AAD_TAG.len() + 32 + 32 + 2);
+/// One end of a queue envelope: the device (iroh NodeId) and the roost it
+/// was syncing (its `vault-id.bin`). Bundled so a call site can't pair one
+/// side's NodeId with the other side's roost id.
+#[derive(Clone, Copy)]
+struct QueueEnd<'a> {
+    node: &'a [u8; 32],
+    vault: &'a [u8; 16],
+}
+
+/// Build the AAD for a queue envelope: domain tag ‖ sender NodeId ‖ recipient
+/// NodeId ‖ sender roost id ‖ recipient roost id ‖ protocol version.
+///
+/// - SYN-M7 (direction): the per-pair queue key is the SAME in both directions,
+///   so a constant AAD (`-v1`) let a hostile relay REFLECT a frame A queued for
+///   B back into A's inbox as if from B. Binding sender→recipient makes an A→B
+///   frame fail to open as B→A.
+/// - SYN-I11 (roost): the queue addresses a DEVICE, but a device can sync
+///   several roosts. Without the roost ids, a frame A's Work roost queued for B
+///   could be opened by B's Personal roost (same device pair; the per-pair keys
+///   can coincide for pairings migrated from the old device-scoped keychain)
+///   and written into the wrong roost. With them, a wrong-roost pull fails the
+///   AEAD tag and is never applied.
+///
+/// Each tag bump (`-v2` M7, `-v3` SYN-I11) is a deliberate clean break: an
+/// in-flight pre-upgrade frame no longer decrypts and is reaped as unrecoverable
+/// (M-8) — harmless, since the live path re-exchanges that change on reconnect.
+fn queue_env_aad(sender: QueueEnd, recipient: QueueEnd) -> Vec<u8> {
+    let mut aad = Vec::with_capacity(QUEUE_ENV_AAD_TAG.len() + 32 + 32 + 16 + 16 + 2);
     aad.extend_from_slice(QUEUE_ENV_AAD_TAG);
-    aad.extend_from_slice(sender);
-    aad.extend_from_slice(recipient);
+    aad.extend_from_slice(sender.node);
+    aad.extend_from_slice(recipient.node);
+    aad.extend_from_slice(sender.vault);
+    aad.extend_from_slice(recipient.vault);
     aad.extend_from_slice(&crate::sync::queue::protocol::QUEUE_PROTOCOL_VERSION.to_le_bytes());
     aad
 }
@@ -158,17 +176,18 @@ impl SyncEngine {
             None => return Ok(false),
         };
 
-        // Pick up the persisted recipient address + per-pair key.
-        let (recipient_node_id, pair_key) = {
+        // Pick up the persisted recipient address, per-pair key, and the
+        // recipient's pinned roost id. No pinned roost id (a pairing that hasn't
+        // reconnected since AUDIT-015) → not queue-addressable; the outbox keeps
+        // the intent and the live path syncs it on the next connect.
+        let route = {
             let store = self.inner.peer_store.lock().await;
-            match store.get(peer_device) {
-                Some(rec) => match (rec.peer_node_id, rec.queue_pair_key) {
-                    (Some(n), Some(k)) => (n, k),
-                    _ => return Ok(false),
-                },
+            match store.get(peer_device).and_then(|r| r.queue_route()) {
+                Some(route) => route,
                 None => return Ok(false),
             }
         };
+        let (recipient_node_id, pair_key) = (route.node_id, route.pair_key);
 
         // Compute the FullDoc save for this note.
         let doc_save = {
@@ -191,11 +210,21 @@ impl SyncEngine {
         let cipher = EnvelopeCipher::from_raw_key(
             crate::sync::crypto::pairing::DomainSeparatedKey::from_derived_bytes(pair_key),
         );
-        // M-2 + SYN-M7: directional AAD (sender=us, recipient=peer) so a queue
-        // frame can't be opened as a live-transport frame NOR reflected back to
-        // us as if the peer sent it (the per-pair key is bidirectional).
+        // M-2 + SYN-M7 + SYN-I11: directional, roost-bound AAD (sender = us +
+        // our roost, recipient = peer + the roost we pinned for it) so a queue
+        // frame can't be opened as a live-transport frame, reflected back to us,
+        // or opened by a different roost on the recipient device.
         let sender_node_id = self.inner.identity.verifying_key().to_bytes();
-        let aad = queue_env_aad(&sender_node_id, &recipient_node_id);
+        let aad = queue_env_aad(
+            QueueEnd {
+                node: &sender_node_id,
+                vault: &self.inner.vault_id,
+            },
+            QueueEnd {
+                node: &recipient_node_id,
+                vault: &route.peer_vault_id,
+            },
+        );
         let sealed = cipher.seal(&plaintext, &aad)?;
         let mut combined = Vec::with_capacity(24 + sealed.ciphertext.len());
         combined.extend_from_slice(&sealed.nonce);
@@ -268,27 +297,35 @@ impl SyncEngine {
             let mut saw_stale = false;
 
             for entry in entries {
-                // Resolve sender NodeId → peer record so we know which key to use.
+                // Resolve sender NodeId → peer record → its queue route (key +
+                // the roost id we pinned for it, both needed to open the frame).
                 let resolved = {
                     let store = self.inner.peer_store.lock().await;
                     store.list().into_iter().find_map(|rec| {
-                        if rec.peer_node_id == Some(entry.sender) {
-                            rec.queue_pair_key.map(|k| (rec.device(), k))
-                        } else {
-                            None
-                        }
+                        rec.queue_route()
+                            .filter(|route| route.node_id == entry.sender)
+                            .map(|route| (rec.device(), route))
                     })
                 };
-                let (peer_device, pair_key) = match resolved {
+                let (peer_device, route) = match resolved {
                     Some(t) => t,
                     None => {
-                        // M-8 head-of-line fix: we hold no key for this sender and
-                        // never will without re-pairing, so this ciphertext is dead
-                        // weight — DELETE it rather than skip. A skipped entry sits
-                        // at the FIFO head for up to the 30-day TTL and blocks every
-                        // newer message behind it; an attacker who pushes garbage to
-                        // our NodeId weaponizes exactly that. Re-pairing re-pushes
-                        // current state, so deleting loses nothing recoverable.
+                        // M-8 head-of-line fix: THIS roost holds no route for the
+                        // sender, so it can never open this ciphertext — DELETE it
+                        // rather than skip. A skipped entry sits at the FIFO head for
+                        // up to the 30-day TTL and blocks every newer message behind
+                        // it; an attacker who pushes garbage to our NodeId weaponizes
+                        // exactly that.
+                        //
+                        // Known limitation (decision 2026-11-07, SYN-I11): the queue
+                        // addresses a DEVICE, not a roost, so a frame the sender
+                        // queued for ANOTHER roost on this device (one that isn't
+                        // open right now) also lands here, or fails the roost-bound
+                        // AAD below, and is deleted too. Nothing is lost — the sender
+                        // still holds the change and the live path re-exchanges it
+                        // the next time both devices have that roost open — but its
+                        // OFFLINE delivery is. The real fix is a per-roost mailbox
+                        // tag on the queue server (wire + server change), deferred.
                         debug!(
                             sender = %hex::encode(entry.sender),
                             "try_queue_pull_all: no key for sender — deleting unrecoverable queued message"
@@ -327,20 +364,34 @@ impl SyncEngine {
                 nonce.copy_from_slice(&combined[..24]);
                 // AUDIT-048: re-wrap persisted derived bytes (see push path).
                 let cipher = EnvelopeCipher::from_raw_key(
-                    crate::sync::crypto::pairing::DomainSeparatedKey::from_derived_bytes(pair_key),
+                    crate::sync::crypto::pairing::DomainSeparatedKey::from_derived_bytes(
+                        route.pair_key,
+                    ),
                 );
-                // SYN-M7: open with the directional AAD (sender=the queued
-                // sender, recipient=us). A frame the relay reflected back to us
-                // (claiming a different sender than it was sealed for) fails
-                // here instead of decrypting.
+                // SYN-M7 + SYN-I11: open with the directional, roost-bound AAD
+                // (sender = the queued sender + the roost we pinned for it,
+                // recipient = us + our open roost). A frame reflected back to us,
+                // or sealed for a different roost on this device, fails here
+                // instead of decrypting — it can never be applied to this roost.
                 let recipient_node_id = self.inner.identity.verifying_key().to_bytes();
-                let aad = queue_env_aad(&entry.sender, &recipient_node_id);
+                let aad = queue_env_aad(
+                    QueueEnd {
+                        node: &entry.sender,
+                        vault: &route.peer_vault_id,
+                    },
+                    QueueEnd {
+                        node: &recipient_node_id,
+                        vault: &self.inner.vault_id,
+                    },
+                );
                 let plaintext = match cipher.open(&nonce, &combined[24..], &aad) {
                     Ok(p) => p,
                     Err(e) => {
-                        // Keys rotate forward on every handshake, so an old-key
-                        // ciphertext is permanently undecryptable — delete it.
-                        warn!(error = %e, "try_queue_pull_all: decrypt failed — deleting (stale key, unrecoverable)");
+                        // Permanently undecryptable for THIS roost: tampered, sealed
+                        // under a pre-upgrade AAD tag, reflected, or sealed for a
+                        // different roost on this device (see the known-limitation
+                        // note above) — delete it so it can't clog the FIFO head.
+                        warn!(error = %e, "try_queue_pull_all: decrypt failed — deleting (unrecoverable for this roost)");
                         let _ = client.delete(entry.message_id).await;
                         continue;
                     }
@@ -688,23 +739,84 @@ mod tests {
         use crate::sync::crypto::pairing::DomainSeparatedKey;
         let a = [1u8; 32];
         let b = [2u8; 32];
+        // Same roost id on both ends isolates the DIRECTION binding.
+        let v = [9u8; 16];
+        let end = |node| QueueEnd { node, vault: &v };
         let cipher =
             EnvelopeCipher::from_raw_key(DomainSeparatedKey::from_derived_bytes([0x7u8; 32]));
-        let sealed = cipher.seal(b"queued note", &queue_env_aad(&a, &b)).unwrap();
+        let sealed = cipher
+            .seal(b"queued note", &queue_env_aad(end(&a), end(&b)))
+            .unwrap();
 
         // Correct direction (A→B) opens.
         assert!(
             cipher
-                .open(&sealed.nonce, &sealed.ciphertext, &queue_env_aad(&a, &b))
+                .open(
+                    &sealed.nonce,
+                    &sealed.ciphertext,
+                    &queue_env_aad(end(&a), end(&b))
+                )
                 .is_ok(),
             "the intended recipient must be able to open the frame"
         );
         // Reflected (B→A) must fail despite the shared bidirectional key.
         assert!(
             cipher
-                .open(&sealed.nonce, &sealed.ciphertext, &queue_env_aad(&b, &a))
+                .open(
+                    &sealed.nonce,
+                    &sealed.ciphertext,
+                    &queue_env_aad(end(&b), end(&a))
+                )
                 .is_err(),
             "a reflected A→B frame must not open as B→A (SYN-M7)"
+        );
+    }
+
+    /// SYN-I11: a frame sealed for one roost on the recipient device must NOT
+    /// open in a different roost on that device, nor be accepted as coming from
+    /// a different roost on the sender — even under the same per-pair key (keys
+    /// migrated from the old device-scoped keychain can coincide across roosts).
+    #[test]
+    fn queue_aad_binds_both_roost_ids() {
+        use crate::sync::crypto::pairing::DomainSeparatedKey;
+        let (laptop, phone) = ([1u8; 32], [2u8; 32]);
+        let (laptop_work, laptop_personal) = ([0xA1u8; 16], [0xA2u8; 16]);
+        let (phone_work, phone_personal) = ([0xB1u8; 16], [0xB2u8; 16]);
+        let cipher =
+            EnvelopeCipher::from_raw_key(DomainSeparatedKey::from_derived_bytes([0x7u8; 32]));
+        let aad = |sv: &[u8; 16], rv: &[u8; 16]| {
+            queue_env_aad(
+                QueueEnd {
+                    node: &laptop,
+                    vault: sv,
+                },
+                QueueEnd {
+                    node: &phone,
+                    vault: rv,
+                },
+            )
+        };
+        // Laptop's Work roost queues a change for the phone's Work roost.
+        let sealed = cipher
+            .seal(b"work note", &aad(&laptop_work, &phone_work))
+            .unwrap();
+        let opens = |sv, rv| {
+            cipher
+                .open(&sealed.nonce, &sealed.ciphertext, &aad(sv, rv))
+                .is_ok()
+        };
+
+        assert!(
+            opens(&laptop_work, &phone_work),
+            "the Work roost on the phone opens it"
+        );
+        assert!(
+            !opens(&laptop_work, &phone_personal),
+            "the phone's Personal roost must NOT open a Work frame"
+        );
+        assert!(
+            !opens(&laptop_personal, &phone_work),
+            "must not open as if from the laptop's Personal roost"
         );
     }
 

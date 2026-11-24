@@ -8,6 +8,9 @@
 //!   SYN-I4 — structured lifecycle: no NEW untracked `tokio::spawn` sites
 //!            (every task must be owned, cancellable, and drained by stop()).
 //!            Roost transitions also preserve `init → lifecycle` lock order.
+//!   SYN-I11 — per-peer state is roost-scoped: keychain keys for paired-peer
+//!            secrets are built ONLY by `PeerSecret` in `peer_store.rs`
+//!            (scoped to one roost's registry), anywhere in the crate.
 //!
 //! ## Production-only counting (fixed 2026-07-11)
 //!
@@ -158,9 +161,20 @@ fn run_ratchet(
     if commands_sync.exists() {
         files.push(commands_sync);
     }
+    check_ratchet(invariant, &files, needles, baseline, remediation);
+}
 
+/// The ratchet comparison itself, over an explicit file set (so an invariant
+/// whose class can appear anywhere in the crate can scan all of `src/`).
+fn check_ratchet(
+    invariant: &str,
+    files: &[PathBuf],
+    needles: &[&str],
+    baseline: &BTreeMap<&str, usize>,
+    remediation: &str,
+) {
     let mut actual: BTreeMap<String, usize> = BTreeMap::new();
-    for f in &files {
+    for f in files {
         let n = count_production_lines(f, needles);
         if n > 0 {
             actual.insert(rel_key(f), n);
@@ -284,5 +298,38 @@ fn syn_i4_roost_transition_uses_init_then_lifecycle() {
     assert!(
         !stop.contains("sync_shutdown_without_disabling(app"),
         "public shutdown reacquires init and would deadlock under lifecycle"
+    );
+}
+
+/// SYN-I11: per-peer sync secrets are scoped to ONE roost's peer registry.
+/// The keychain is one store per install while `peers.bin` is per roost, so a
+/// key built from the peer device id alone lets the same device paired in two
+/// roosts overwrite (and on unpair, delete) the other roost's credentials. The
+/// only place allowed to spell a secret kind is `PeerSecret::kind()`, which
+/// `scoped_key` / `legacy_key` wrap. Scans the WHOLE crate, not just
+/// `src/sync`, because a stray `format!("sync_pin:{id}")` in any command
+/// module would reintroduce the bug.
+#[test]
+fn syn_i11_peer_secret_keys_only_via_peer_secret() {
+    let mut files = Vec::new();
+    collect_rs_files(&manifest_dir().join("src"), &mut files);
+    let baseline: BTreeMap<&str, usize> = BTreeMap::from([
+        // The four `PeerSecret::kind()` match arms — the single choke point.
+        ("src/sync/store/peer_store.rs", 4),
+    ]);
+    check_ratchet(
+        "SYN-I11 paired-peer secret key",
+        &files,
+        &[
+            "\"sync_pin",
+            "\"sync_queue_key",
+            "\"sync_resumption_token",
+            "\"sync_peer_vault_id",
+        ],
+        &baseline,
+        "Build paired-peer keychain keys ONLY via `PeerSecret::scoped_key` in \
+         src/sync/store/peer_store.rs. A key from the device id alone collides across roosts \
+         (the same phone paired in Work and Personal) — see cx-area-sync SYN-I11. A new secret \
+         kind = a new `PeerSecret` variant (and raise this baseline by one, with a comment).",
     );
 }

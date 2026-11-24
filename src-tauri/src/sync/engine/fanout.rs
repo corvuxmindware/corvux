@@ -274,7 +274,10 @@ impl SyncEngine {
             .list()
             .into_iter()
             .filter(|r| !connected.contains(&r.device()))
-            .filter(|r| r.peer_node_id.is_some() && r.queue_pair_key.is_some())
+            // Same predicate `try_queue_push` uses (incl. the pinned roost id
+            // the envelope AAD needs, SYN-I11) — an intent we could never push
+            // must not sit in the outbox.
+            .filter(|r| r.queue_route().is_some())
             .map(|r| r.device())
             .collect();
         if candidates.is_empty() {

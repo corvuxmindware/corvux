@@ -273,41 +273,13 @@ pub mod keys {
     /// Anthropic (Claude) direct-provider key. Same pattern.
     pub const ANTHROPIC_API_KEY: &str = "anthropic_api_key";
 
-    /// Sync reconnect PIN per paired device. The keychain stores the
-    /// 6-digit PIN the user typed at pair time so the auto-reconnect
-    /// path can re-authenticate without prompting again. Was on disk
-    /// in `peers.bin` (peer-store v3); moved to the keychain in v4 so
-    /// a backup of the app data dir doesn't expose pairing PINs.
-    pub fn sync_pin(device_id_hex: &str) -> String {
-        format!("sync_pin:{device_id_hex}")
-    }
-
-    /// Sync queue per-pair symmetric key (32 bytes hex-encoded). Used by
-    /// the store-and-forward queue to encrypt payloads to a recipient
-    /// without an active handshake. Same migration story as the PIN —
-    /// previously persisted in `peers.bin`, now keychain-backed.
-    pub fn sync_queue_key(device_id_hex: &str) -> String {
-        format!("sync_queue_key:{device_id_hex}")
-    }
-
-    /// SEC-2 per-peer resumption token (32 bytes hex-encoded). Derived from
-    /// the first-pair `SessionSecret` and stored keychain-side; thereafter
-    /// reconnects prove this high-entropy token instead of re-proving the
-    /// human 6-digit PIN, so a PIN that leaks after pairing is no longer a
-    /// permanent credential for joining the roost.
-    pub fn sync_resumption_token(device_id_hex: &str) -> String {
-        format!("sync_resumption_token:{device_id_hex}")
-    }
-
-    /// AUDIT-015: peer's roost id (16 bytes hex-encoded), pinned at first
-    /// pair. Stored keychain-side (alongside PIN + queue key) so a backup
-    /// of `peers.bin` doesn't carry it, and so a peer-record schema bump
-    /// isn't needed. On reconnect, the engine compares the value the peer
-    /// advertises in `Hello` against this — mismatch means the same
-    /// device is now pointing at a different roost.
-    pub fn sync_peer_vault_id(device_id_hex: &str) -> String {
-        format!("sync_peer_vault_id:{device_id_hex}")
-    }
+    // Per-paired-peer sync secrets (reconnect PIN, queue pair key, SEC-2
+    // resumption token, AUDIT-015 pinned peer vault id) are deliberately NOT
+    // built here. Their keys are built only by `PeerSecret` in
+    // `sync/store/peer_store.rs`, scoped to one roost's peer registry
+    // (`<kind>:<scope>:<device>`, SYN-I11). The old device-id-only builders
+    // that lived here let the same device paired in two roosts overwrite
+    // (and on unpair, delete) the other roost's credentials.
 }
 
 #[cfg(test)]

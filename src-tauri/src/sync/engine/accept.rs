@@ -266,8 +266,8 @@ async fn handle_iroh_incoming(
                         got = %hex::encode(peer_vault_id),
                         "AUDIT-015: rejecting reconnect — peer's roost id changed since first pair"
                     );
-                    return Err(crate::sync::error::ProtocolError::Aborted(
-                        "roost id mismatch: this device was previously paired under a different roost".into(),
+                    return Err(crate::sync::error::ProtocolError::PairingRejected(
+                        crate::sync::protocol::PairingFailure::RoostIdMismatch,
                     )
                     .into());
                 }
@@ -365,8 +365,8 @@ async fn handle_incoming(
                         got = %hex::encode(peer_vault_id),
                         "AUDIT-015: rejecting reconnect — peer's roost id changed since first pair"
                     );
-                    return Err(crate::sync::error::ProtocolError::Aborted(
-                        "roost id mismatch: this device was previously paired under a different roost".into(),
+                    return Err(crate::sync::error::ProtocolError::PairingRejected(
+                        crate::sync::protocol::PairingFailure::RoostIdMismatch,
                     )
                     .into());
                 }

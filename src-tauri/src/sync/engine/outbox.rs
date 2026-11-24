@@ -37,17 +37,14 @@ impl SyncEngine {
     /// channel closes mid-send — that change would otherwise be dropped
     /// (the old "peer channel closed, dropping change" hole). No-op when no
     /// queue client is installed or the peer can't receive queue messages
-    /// (no NodeId / no per-pair key).
+    /// (no NodeId / per-pair key / pinned roost id — `PeerRecord::queue_route`).
     pub(super) async fn enqueue_outbox_for_peer(&self, device: DeviceId, note: NotePath) {
         if self.inner.queue_client.read().await.is_none() {
             return;
         }
         let deliverable = {
             let store = self.inner.peer_store.lock().await;
-            store
-                .get(device)
-                .map(|r| r.peer_node_id.is_some() && r.queue_pair_key.is_some())
-                .unwrap_or(false)
+            store.get(device).is_some_and(|r| r.queue_route().is_some())
         };
         if !deliverable {
             return;

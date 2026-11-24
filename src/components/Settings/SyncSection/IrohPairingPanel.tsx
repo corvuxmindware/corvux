@@ -10,7 +10,9 @@ import {
 import qrcode from "qrcode-generator";
 import { commands, unwrap } from "../../../lib/invoke";
 import { syncStatusStore } from "../../../stores/sync";
+import { roostStore } from "../../../stores/roost";
 import QrScanner from "./QrScanner";
+import { mergeConfirmationFor, roostFolderName } from "./pairingRoost";
 
 /// Cross-network sync pairing panel (iroh transport).
 ///
@@ -24,6 +26,8 @@ import QrScanner from "./QrScanner";
 /// - `choose`     — landing state. Two big buttons: show OR enter.
 /// - `showing`    — host generated a code; render QR + PIN + waiting indicator.
 /// - `entering`   — joiner is filling out the ticket + PIN form.
+/// - `confirmMerge` — joiner's roost already has notes: confirm that pairing
+///                  will merge both roosts (permanently) before dialing.
 /// - `connecting` — joiner submitted; awaiting handshake completion.
 /// - `connected`  — pair succeeded. Same surface used by both sides; the
 ///                  host transitions here when it receives `peer_connected`,
@@ -39,6 +43,7 @@ type Mode =
   | { kind: "choose" }
   | { kind: "showing"; ticket: string; pin: string }
   | { kind: "entering" }
+  | { kind: "confirmMerge"; roost: string; notes: number }
   | { kind: "connecting" }
   | { kind: "connected"; peer: string };
 
@@ -118,6 +123,23 @@ export default function IrohPairingPanel() {
       setError("PIN must be 6 digits");
       return;
     }
+    setError(null);
+    // Pairing only checks that the folder names match, then union-merges both
+    // roosts for good — so if this one already has notes, make the user say
+    // yes to that merge first. An empty roost just joins; no prompt.
+    const merge = mergeConfirmationFor(
+      roostStore.roostPath(),
+      roostStore.noteCount(),
+    );
+    if (merge) {
+      setMode({ kind: "confirmMerge", ...merge });
+      return;
+    }
+    await connect();
+  };
+
+  const connect = async () => {
+    const ticket = peerTicket().trim();
     setError(null);
     setMode({ kind: "connecting" });
     try {
@@ -233,6 +255,14 @@ export default function IrohPairingPanel() {
                 <span class="w-2 h-2 rounded-full bg-blue-400 animate-pulse" />
                 Waiting for the other device to scan and enter the PIN…
               </div>
+              <div
+                class="text-text-muted text-[11px]"
+                data-testid="host-merge-note"
+              >
+                {`Pairing merges this roost ("${roostFolderName(
+                  roostStore.roostPath(),
+                )}") with the other device's roost of the same name. Both end up with every note from both, and it can't be undone.`}
+              </div>
               <button
                 class="text-text-muted text-xs hover:text-text-secondary"
                 onClick={reset}
@@ -309,6 +339,45 @@ export default function IrohPairingPanel() {
               <div class="text-red-400 text-xs">{error()}</div>
             </Show>
           </div>
+        </Match>
+
+        {/* ── Confirm merge (joiner already has notes) ─────────────── */}
+        <Match
+          when={(() => {
+            const m = mode();
+            return m.kind === "confirmMerge" ? m : null;
+          })()}
+        >
+          {(merge) => (
+            <div class="space-y-2" data-testid="merge-confirm">
+              <div class="text-text-primary text-sm font-medium">
+                Merge these roosts?
+              </div>
+              <div class="text-text-secondary text-xs leading-relaxed">
+                This roost ("{merge().roost}") has {merge().notes}{" "}
+                {merge().notes === 1 ? "note" : "notes"}. Pairing merges it with
+                the other device's "{merge().roost}" roost: both devices end up
+                with every note from both. If the same note differs on the two
+                devices, one copy is kept next to it as a ".conflict" file.
+              </div>
+              <div class="text-amber-400 text-xs">
+                This can't be undone — unpairing later stops syncing but doesn't
+                separate the notes again.
+              </div>
+              <button
+                class="w-full bg-accent/10 hover:bg-accent/20 border border-accent/40 text-accent rounded px-3 py-1.5 text-sm font-medium"
+                onClick={() => void connect()}
+              >
+                Merge and pair
+              </button>
+              <button
+                class="w-full text-text-muted text-xs hover:text-text-secondary pt-1"
+                onClick={() => setMode({ kind: "entering" })}
+              >
+                Back
+              </button>
+            </div>
+          )}
         </Match>
 
         {/* ── Connecting ───────────────────────────────────────────── */}

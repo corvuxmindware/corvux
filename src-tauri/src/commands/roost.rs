@@ -759,6 +759,9 @@ pub fn read_roost_manifest(app: tauri::AppHandle) -> Result<Option<String>, Stri
 #[specta::specta]
 pub fn delete_roost_index(app: tauri::AppHandle, roost_path: String) -> Result<(), String> {
     let dir = crate::paths::roost_db_dir(&app, &roost_path)?;
+    // SYN-I11: this roost's sync credentials live in the keychain under a
+    // scope only its `sync/peers.bin` knows — delete them before the file goes.
+    crate::sync::store::peer_store::purge_registry_secrets(&dir.join("sync"));
     match fs::remove_dir_all(&dir) {
         Ok(()) => {
             tracing::info!(dir = %dir.display(), "roost: deleted local index dir");

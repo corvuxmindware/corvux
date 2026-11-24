@@ -373,6 +373,8 @@ pub fn gc_orphaned_index_dirs(app: &AppHandle) -> IndexGcReport {
         if !is_orphaned_index_dir(&entry.path(), &name, &live, all_ids_resolved) {
             continue;
         }
+        // SYN-I11: drop the orphan's scoped sync credentials with it.
+        crate::sync::store::peer_store::purge_registry_secrets(&entry.path().join("sync"));
         match std::fs::remove_dir_all(entry.path()) {
             Ok(()) => {
                 tracing::info!(dir = %name, "paths::gc: removed orphaned index dir");

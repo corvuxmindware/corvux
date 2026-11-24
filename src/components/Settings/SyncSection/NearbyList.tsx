@@ -1,5 +1,6 @@
 import { For, Show } from "solid-js";
 import { roostStore } from "../../../stores/roost";
+import { roostFolderName } from "./pairingRoost";
 import type { NearbyPeer } from "./types";
 
 export interface NearbyListProps {
@@ -7,26 +8,9 @@ export interface NearbyListProps {
   onPick: (peer: NearbyPeer) => void;
 }
 
-/// Mirror the Rust-side `roost_folder_name` helper exactly: SAF
-/// `content://` URIs URL-decode then take the last segment; regular
-/// paths just take the last separator-split segment. The two MUST agree
-/// or the Pair button greys out for a roost that the handshake would
-/// actually accept.
+/// The name the sync handshake compares (see `roostFolderName`).
 function ourRoostFolderName(): string {
-  const path = roostStore.roostPath();
-  if (!path) return "";
-  if (path.startsWith("content://")) {
-    const afterScheme = path.slice("content://".length);
-    let decoded: string;
-    try {
-      decoded = decodeURIComponent(afterScheme);
-    } catch {
-      decoded = afterScheme;
-    }
-    const segs = decoded.split("/").filter(Boolean);
-    return segs[segs.length - 1] ?? "";
-  }
-  return path.split(/[\\/]/).filter(Boolean).pop() ?? "";
+  return roostFolderName(roostStore.roostPath());
 }
 
 /// mDNS-discovered peers on the same WiFi. Only renders when at least

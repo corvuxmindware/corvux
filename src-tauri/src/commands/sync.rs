@@ -272,6 +272,47 @@ impl Default for SyncPrefs {
 // sites (`sync_set_queue_endpoint` below) read identically.
 use super::sync_endpoint::validate_queue_endpoint;
 
+/// What the pairing UI shows when a connect fails. A pairing rejection (wrong
+/// PIN, roost mismatch, pairing closed, …) is already a sentence the user can
+/// act on, so it's shown alone; any other failure keeps the technical
+/// `context` prefix for diagnosis. Shared by the TCP and iroh connect commands.
+fn connect_error_message(context: &str, e: &crate::sync::error::SyncError) -> String {
+    e.user_message(context)
+}
+
+#[cfg(test)]
+mod connect_error_message_tests {
+    use super::*;
+    use crate::sync::error::{ProtocolError, SyncError, TransportError};
+    use crate::sync::protocol::PairingFailure;
+
+    #[test]
+    fn rejection_is_shown_as_the_plain_sentence() {
+        let e: SyncError = ProtocolError::PairingRejected(PairingFailure::RoostMismatch {
+            expected: "Work".into(),
+            got: "Notes".into(),
+        })
+        .into();
+        let msg = connect_error_message("connect via iroh failed", &e);
+        assert_eq!(
+            msg,
+            PairingFailure::RoostMismatch {
+                expected: "Work".into(),
+                got: "Notes".into()
+            }
+            .to_string()
+        );
+        assert!(!msg.contains("connect via iroh failed"), "{msg}");
+    }
+
+    #[test]
+    fn other_failures_keep_the_technical_context() {
+        let e: SyncError = TransportError::ConnectTimeout.into();
+        let msg = connect_error_message("connect via iroh failed", &e);
+        assert!(msg.starts_with("connect via iroh failed: "), "{msg}");
+    }
+}
+
 #[cfg(test)]
 mod strict_p2p_default_tests {
     //! Locked Decision #6 re-reversal (2026-07-11): strict-P2P by default for
@@ -1602,7 +1643,7 @@ pub async fn sync_connect(
             id
         }
         Err(e) => {
-            let msg = format!("connect to {addr} failed: {e}");
+            let msg = connect_error_message(&format!("connect to {addr} failed"), &e);
             tracing::warn!("{msg}");
             return Err(msg);
         }
@@ -1791,7 +1832,7 @@ pub async fn sync_connect_iroh(
         // (folded with the ticket secret) and derive+store the token on success.
         .connect_peer_via_iroh(peer, pin_parsed, my_offer, None, ticket_secret)
         .await
-        .map_err(|e| format!("connect via iroh failed: {e}"))?;
+        .map_err(|e| connect_error_message("connect via iroh failed", &e))?;
     info!(device = %device_id.as_hex(), "sync_connect_iroh ok");
 
     // Persist the ticket + PIN against this peer so the engine can dial

@@ -3,8 +3,23 @@
 //! Each roost carries a 16-byte random id at `<roost>/.corvux/vault-id.bin`,
 //! generated on first open. Combined with the `roost_name` already exchanged
 //! in the sync handshake, this gives every roost a globally distinct identity
-//! that travels with the roost folder. Two physically separate roosts both
-//! named "MyBrain" can no longer pair-and-weld their CRDT histories together.
+//! that travels with the roost folder.
+//!
+//! What it does and does NOT guard (be precise — this was over-claimed once):
+//! the id is PINNED at first pair and checked on every reconnect, so once two
+//! devices are paired, neither can later swap in a different roost that happens
+//! to share the folder name (`PairingFailure::RoostIdMismatch`). It is NOT
+//! checked at first pair: two unrelated roosts that share a folder name ("Notes")
+//! DO pair and union-merge on their first sync. The only first-pair guards are
+//! the folder-name match and the pairing UI's merge confirmation.
+//!
+//! The file is copied along with the roost folder. Two folders holding the
+//! same `vault-id.bin` (a copied roost) currently look like ONE roost to this
+//! install — `paths::roost_db_dir` keys the per-roost state dir by this id, so
+//! they share the index, the sync DocStore/outbox and `peers.bin`, and they
+//! advertise the same id to peers. Known, pre-existing, not yet detected
+//! (tracked in cx-area-sync SYN-I11 / area B). Per-peer keychain secrets are
+//! scoped by `peers.bin`'s own `scope`, not by this id (see `peer_store`).
 //!
 //! ## Storage
 //!

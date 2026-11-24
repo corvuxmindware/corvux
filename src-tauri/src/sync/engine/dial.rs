@@ -439,7 +439,7 @@ impl SyncEngine {
                     self.set_peer_state(
                         dev,
                         PeerConnectionState::Failed {
-                            reason: format!("handshake: {e}"),
+                            reason: e.user_message("handshake"),
                             at_millis: now_millis(),
                         },
                     )
@@ -469,14 +469,15 @@ impl SyncEngine {
                             self.set_peer_state(
                                 dev,
                                 PeerConnectionState::Failed {
-                                    reason: "roost id mismatch".into(),
+                                    reason: crate::sync::protocol::PairingFailure::RoostIdMismatch
+                                        .to_string(),
                                     at_millis: now_millis(),
                                 },
                             )
                             .await;
                         }
-                        return Err(crate::sync::error::ProtocolError::Aborted(
-                            "roost id mismatch".into(),
+                        return Err(crate::sync::error::ProtocolError::PairingRejected(
+                            crate::sync::protocol::PairingFailure::RoostIdMismatch,
                         )
                         .into());
                     }
@@ -690,7 +691,7 @@ impl SyncEngine {
                 self.set_peer_state(
                     expected_device,
                     PeerConnectionState::Failed {
-                        reason: format!("iroh handshake: {e}"),
+                        reason: e.user_message("iroh handshake"),
                         at_millis: now_millis(),
                     },
                 )
@@ -746,13 +747,14 @@ impl SyncEngine {
                         self.set_peer_state(
                             expected_device,
                             PeerConnectionState::Failed {
-                                reason: "roost id mismatch".into(),
+                                reason: crate::sync::protocol::PairingFailure::RoostIdMismatch
+                                    .to_string(),
                                 at_millis: now_millis(),
                             },
                         )
                         .await;
-                        return Err(crate::sync::error::ProtocolError::Aborted(
-                            "roost id mismatch".into(),
+                        return Err(crate::sync::error::ProtocolError::PairingRejected(
+                            crate::sync::protocol::PairingFailure::RoostIdMismatch,
                         )
                         .into());
                     }

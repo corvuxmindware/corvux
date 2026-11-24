@@ -1831,6 +1831,7 @@ mod tests {
                 .unwrap();
             ps.remember_queue_pair(b_device, Some([0xCD; 32]), Some([0xEF; 32]))
                 .unwrap();
+            ps.remember_peer_vault_id(b_device, [0xBB; 16]).unwrap();
         }
 
         // Queue client pointed at a closed port → every push fails fast.
@@ -1854,6 +1855,47 @@ mod tests {
         a.stop().await.unwrap();
     }
 
+    /// SYN-I11: the queue envelope binds the recipient's pinned roost id, so a
+    /// peer we hold NO pinned roost id for (paired before AUDIT-015 and not
+    /// reconnected since) is not queue-addressable. The offline fan-out must
+    /// not write an outbox intent it could never push — the live path syncs
+    /// that peer on its next connect instead.
+    #[tokio::test]
+    async fn offline_fanout_skips_peer_without_pinned_roost_id() {
+        use crate::sync::crdt::NoteDoc;
+        use crate::sync::queue::client::QueueClient;
+        use crate::sync::store::peer_store::PeerRecord;
+
+        let (a, _v, _d) = setup_engine();
+        let b_device = DeviceId([0xBB; 16]);
+        {
+            let mut ps = a.inner.peer_store.lock().await;
+            ps.upsert(PeerRecord::new(b_device, [0xBB; 32], "phone".into()))
+                .unwrap();
+            // NodeId + pair key, but deliberately NO pinned peer vault id.
+            ps.remember_queue_pair(b_device, Some([0xCD; 32]), Some([0xEF; 32]))
+                .unwrap();
+            assert!(ps.get(b_device).unwrap().queue_route().is_none());
+        }
+        let dead = Arc::new(QueueClient::new("http://127.0.0.1:1", a.identity_arc()).unwrap());
+        a.set_queue_client(Some(dead)).await;
+        {
+            let store = a.inner.doc_store.lock().await;
+            let mut doc = NoteDoc::new(a.identity().device_id()).unwrap();
+            doc.apply_markdown("offline edit").unwrap();
+            store.save(&NotePath("o.md".into()), &mut doc).unwrap();
+        }
+
+        a.queue_push_to_offline_peers(NotePath("o.md".into())).await;
+        a.enqueue_outbox_for_peer(b_device, NotePath("o.md".into()))
+            .await;
+        assert!(
+            a.outbox_pending_by_peer().await.is_empty(),
+            "no outbox intent for a peer the queue can't address"
+        );
+        a.stop().await.unwrap();
+    }
+
     /// Register an offline peer with queue identity, install a dead queue
     /// client, seed a note, and fan it out so a failed-delivery intent lands
     /// in the outbox. Returns the engine + the peer device id. Shared setup
@@ -1871,6 +1913,7 @@ mod tests {
                 .unwrap();
             ps.remember_queue_pair(b_device, Some([0xCD; 32]), Some([0xEF; 32]))
                 .unwrap();
+            ps.remember_peer_vault_id(b_device, [0xBB; 16]).unwrap();
         }
         let dead = Arc::new(QueueClient::new("http://127.0.0.1:1", a.identity_arc()).unwrap());
         a.set_queue_client(Some(dead)).await;

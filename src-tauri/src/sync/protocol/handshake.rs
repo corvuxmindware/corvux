@@ -74,6 +74,29 @@ const TRANSCRIPT_DOMAIN: &[u8] = b"corvux-sync-transcript-v1";
 /// only arrives in `PairingOk`, *after* the proof, so it isn't available to
 /// both sides symmetrically at proof time. The post-handshake vault-id compare
 /// (accept/dial) covers that.
+/// Max characters of an unauthenticated peer-supplied label we'll show.
+/// Comfortably above any real folder name.
+const UNTRUSTED_LABEL_MAX_CHARS: usize = 64;
+
+/// Reduce a string an UNAUTHENTICATED peer sent (it lands in UI copy) to a
+/// short, single-line label: control characters (newlines included) become
+/// spaces, whitespace runs collapse, and it's cut to
+/// [`UNTRUSTED_LABEL_MAX_CHARS`] with an ellipsis.
+fn untrusted_label(raw: &str) -> String {
+    let cleaned: String = raw
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    let collapsed = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.chars().count() <= UNTRUSTED_LABEL_MAX_CHARS {
+        collapsed
+    } else {
+        let mut cut: String = collapsed.chars().take(UNTRUSTED_LABEL_MAX_CHARS).collect();
+        cut.push('…');
+        cut
+    }
+}
+
 fn build_transcript(client_eph_pub: &[u8; 32], server_eph_pub: &[u8; 32]) -> Vec<u8> {
     let mut t = Vec::with_capacity(TRANSCRIPT_DOMAIN.len() + 2 + 64);
     t.extend_from_slice(TRANSCRIPT_DOMAIN);
@@ -272,6 +295,20 @@ impl ClientHandshake {
                 Message::PairingFailed { reason },
             ) => {
                 self.state = ClientState::Failed;
+                // The rejection arrives BEFORE the peer is authenticated and
+                // its text is shown to the user inside a trusted-sounding
+                // sentence, so never echo the peer's strings raw: `got` is OUR
+                // roost name (we know it — no need to trust the echo) and the
+                // peer's `expected` is reduced to a short, single-line label.
+                let reason = match reason {
+                    PairingFailure::RoostMismatch { expected, .. } => {
+                        PairingFailure::RoostMismatch {
+                            expected: untrusted_label(&expected),
+                            got: self.roost_name.clone(),
+                        }
+                    }
+                    other => other,
+                };
                 Ok(Outcome::Failed(reason))
             }
             (
@@ -1263,6 +1300,45 @@ mod tests {
             },
             _ => panic!("expected PairingFailed"),
         }
+    }
+
+    /// L-4 (security audit 2026-11-07): `PairingFailed` arrives before the
+    /// host is authenticated, and its strings are shown inside a trusted UI
+    /// sentence. The dialer must use ITS OWN roost name for `got` (never the
+    /// host's echo) and reduce the host's `expected` to a short single line.
+    #[test]
+    fn client_never_echoes_untrusted_roost_mismatch_text() {
+        let mut client = ClientHandshake::new(dev(1), "a".into(), "MyBrain".into(), vid(1), pin());
+        let _hello = client.start();
+        let hostile = Message::PairingFailed {
+            reason: PairingFailure::RoostMismatch {
+                expected: format!(
+                    "Work\n\nSECURITY ALERT: visit evil.example to re-verify{}",
+                    "x".repeat(500)
+                ),
+                got: "Spoofed".into(),
+            },
+        };
+        match client.step(hostile).unwrap() {
+            Outcome::Failed(PairingFailure::RoostMismatch { expected, got }) => {
+                assert_eq!(got, "MyBrain", "got = our own roost, not the peer's echo");
+                assert!(!expected.contains('\n'), "single line: {expected:?}");
+                assert!(
+                    expected.chars().count() <= UNTRUSTED_LABEL_MAX_CHARS + 1,
+                    "capped: {} chars",
+                    expected.chars().count()
+                );
+                assert!(expected.starts_with("Work "), "{expected:?}");
+            }
+            other => panic!("expected RoostMismatch failure, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn untrusted_label_keeps_normal_names_intact() {
+        assert_eq!(untrusted_label("Brain-Dump"), "Brain-Dump");
+        assert_eq!(untrusted_label("  My  Notes \t"), "My Notes");
+        assert_eq!(untrusted_label("తెలుగు నోట్స్"), "తెలుగు నోట్స్");
     }
 
     #[test]

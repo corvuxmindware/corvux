@@ -134,6 +134,12 @@ pub enum ProtocolError {
 
     #[error("handshake aborted by peer: {0}")]
     Aborted(String),
+
+    /// Pairing was refused for a reason the user can act on (wrong PIN, roost
+    /// name / roost id mismatch, …). Displays as the plain sentence from
+    /// [`PairingFailure`]'s `Display`, so the UI never shows a Rust debug dump.
+    #[error("{0}")]
+    PairingRejected(crate::sync::protocol::PairingFailure),
 }
 
 /// CRDT layer — Automerge doc lifecycle, markdown round-trip.
@@ -178,6 +184,13 @@ pub enum StoreError {
 
     #[error("decode: {0}")]
     Decode(String),
+
+    /// The OS keychain / mobile secret store failed (locked, access denied,
+    /// unreadable). Distinct from "no such secret": a peer store must fail
+    /// closed on this rather than treat the secret as absent, or a transient
+    /// error becomes a permanent credential loss (SYN-I5).
+    #[error("secret store unavailable: {0}")]
+    Secrets(String),
 }
 
 /// Engine layer — orchestration, peer lifecycle, command dispatch.
@@ -241,6 +254,10 @@ pub enum SyncErrorKind {
     UnsupportedOnMobile,
     Discovery,
     HandshakeAborted,
+    /// The two devices have different roosts open (different folder name, or
+    /// same name but a different roost than the one they paired in). Needs the
+    /// user to open the right roost — never retryable as-is.
+    RoostMismatch,
     Identity,
     Crdt,
     Store,
@@ -249,6 +266,20 @@ pub enum SyncErrorKind {
     /// Use sparingly — the whole point of the structured error is that the
     /// frontend can branch on `kind` without inspecting `message`.
     Other,
+}
+
+impl SyncError {
+    /// What a person should see for this failure. A pairing rejection (wrong
+    /// PIN, roost mismatch, pairing closed, …) is already a sentence they can
+    /// act on, so it's shown alone; anything else keeps the technical
+    /// `context` prefix for diagnosis. The one formatter for connect-command
+    /// errors and per-peer `Failed` reasons, so the two can't drift.
+    pub fn user_message(&self, context: &str) -> String {
+        match self {
+            SyncError::Protocol(ProtocolError::PairingRejected(reason)) => reason.to_string(),
+            other => format!("{context}: {other}"),
+        }
+    }
 }
 
 impl SyncErrorKind {
@@ -317,6 +348,7 @@ impl SyncCommandError {
             SyncErrorKind::UnsupportedOnMobile => "unsupported_on_mobile",
             SyncErrorKind::Discovery => "discovery",
             SyncErrorKind::HandshakeAborted => "handshake_aborted",
+            SyncErrorKind::RoostMismatch => "roost_mismatch",
             SyncErrorKind::Identity => "identity",
             SyncErrorKind::Crdt => "crdt",
             SyncErrorKind::Store => "store",
@@ -356,6 +388,20 @@ impl From<SyncError> for SyncCommandError {
             },
             SyncError::Protocol(p) => match p {
                 ProtocolError::Aborted(_) => SyncErrorKind::HandshakeAborted,
+                ProtocolError::PairingRejected(f) => {
+                    use crate::sync::protocol::PairingFailure as F;
+                    match f {
+                        F::WrongPin => SyncErrorKind::WrongPin,
+                        F::RateLimited => SyncErrorKind::RateLimited,
+                        F::UnsupportedVersion => SyncErrorKind::UnsupportedProtocol,
+                        F::RoostMismatch { .. } | F::RoostIdMismatch => {
+                            SyncErrorKind::RoostMismatch
+                        }
+                        F::AlreadyPaired | F::Cancelled | F::PairingClosed => {
+                            SyncErrorKind::HandshakeAborted
+                        }
+                    }
+                }
                 _ => SyncErrorKind::Other,
             },
             SyncError::Crdt(_) => SyncErrorKind::Crdt,
@@ -490,6 +536,82 @@ mod sync_command_error_tests {
         assert!(SyncErrorKind::ConnectTimeout.retryable());
         // Fingerprint mismatch: never retry silently — could be MitM.
         assert!(!SyncErrorKind::FingerprintMismatch.retryable());
+    }
+
+    /// A pairing rejection reads as a plain sentence — the client used to
+    /// surface `format!("{reason:?}")`, i.e. `RoostMismatch { expected: "Work",
+    /// got: "Notes" }`, straight into the pairing panel.
+    #[test]
+    fn pairing_rejection_displays_human_text() {
+        use crate::sync::protocol::PairingFailure;
+        let err: SyncError = ProtocolError::PairingRejected(PairingFailure::RoostMismatch {
+            expected: "Work".into(),
+            got: "Notes".into(),
+        })
+        .into();
+        let text = err.to_string();
+        assert!(
+            text.contains("\"Work\"") && text.contains("\"Notes\""),
+            "{text}"
+        );
+        assert!(!text.contains("RoostMismatch"), "no debug dump: {text}");
+        assert!(!text.contains('{'), "no debug dump: {text}");
+
+        let text = SyncError::from(ProtocolError::PairingRejected(
+            PairingFailure::RoostIdMismatch,
+        ))
+        .to_string();
+        assert!(!text.contains("RoostIdMismatch"), "{text}");
+        assert!(text.to_lowercase().contains("roost"), "{text}");
+    }
+
+    /// Every rejection reason gets a non-empty, non-debug sentence.
+    #[test]
+    fn every_pairing_failure_has_a_sentence() {
+        use crate::sync::protocol::PairingFailure as F;
+        for f in [
+            F::WrongPin,
+            F::RateLimited,
+            F::UnsupportedVersion,
+            F::AlreadyPaired,
+            F::Cancelled,
+            F::RoostMismatch {
+                expected: "a".into(),
+                got: "b".into(),
+            },
+            F::RoostIdMismatch,
+            F::PairingClosed,
+        ] {
+            let debug = format!("{f:?}");
+            let text = f.to_string();
+            assert!(text.ends_with('.'), "{debug}: {text}");
+            assert!(!text.contains(&debug), "{debug}: {text}");
+        }
+    }
+
+    #[test]
+    fn maps_pairing_rejections_to_actionable_kinds() {
+        use crate::sync::protocol::PairingFailure as F;
+        let kind =
+            |f| SyncCommandError::from(SyncError::from(ProtocolError::PairingRejected(f))).kind;
+        assert_eq!(kind(F::WrongPin), SyncErrorKind::WrongPin);
+        assert_eq!(kind(F::RateLimited), SyncErrorKind::RateLimited);
+        assert_eq!(
+            kind(F::UnsupportedVersion),
+            SyncErrorKind::UnsupportedProtocol
+        );
+        assert_eq!(
+            kind(F::RoostMismatch {
+                expected: "a".into(),
+                got: "b".into()
+            }),
+            SyncErrorKind::RoostMismatch
+        );
+        assert_eq!(kind(F::RoostIdMismatch), SyncErrorKind::RoostMismatch);
+        assert!(
+            !SyncErrorKind::RoostMismatch.retryable(),
+            "needs the user to open the right roost"
+        );
     }
 
     #[test]

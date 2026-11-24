@@ -233,11 +233,12 @@ pub enum Message {
         /// Roost folder name (not full path). Must match on both peers.
         roost_name: String,
         /// AUDIT-015: 16 random bytes generated once per roost and persisted
-        /// at `<roost>/.corvux/vault-id.bin`. Combined with `roost_name`,
-        /// this gives every roost a globally distinct identity, so two
-        /// physically separate "MyBrain" roosts can't pair-and-weld their
-        /// CRDT histories. Peers store the value at first pair; on
-        /// reconnect, mismatch yields `PairingFailure::RoostMismatch`.
+        /// at `<roost>/.corvux/vault-id.bin`. Peers PIN the value at first
+        /// pair; on reconnect a different value yields
+        /// `PairingFailure::RoostIdMismatch`, so an already-paired device
+        /// can't swap in a different same-named roost. Not checked at FIRST
+        /// pair — two unrelated roosts with the same `roost_name` do pair and
+        /// merge (see `sync/vault_id.rs`).
         vault_id: [u8; 16],
         /// Symmetric pairing (Batch E): the DIALER's own redial credentials —
         /// a dialable `corvux1:` ticket for the dialer's endpoint plus the
@@ -445,6 +446,40 @@ pub enum PairingFailure {
     /// of the enum — postcard tags variants by declaration order, so new
     /// variants must never be inserted mid-list.
     PairingClosed,
+}
+
+/// The sentence the pairing UI shows. Written for the device that RECEIVES
+/// the rejection (the dialer): only the host produces `RoostMismatch`, with
+/// `expected` = the host's roost name and `got` = the dialer's.
+impl std::fmt::Display for PairingFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::WrongPin => {
+                f.write_str("Wrong PIN — check the 6-digit code on the other device.")
+            }
+            Self::RateLimited => {
+                f.write_str("Too many pairing attempts — wait a minute and try again.")
+            }
+            Self::UnsupportedVersion => f.write_str(
+                "The other device runs an incompatible version of Corvux — update both devices.",
+            ),
+            Self::AlreadyPaired => f.write_str("These devices are already paired."),
+            Self::Cancelled => f.write_str("Pairing was cancelled on the other device."),
+            Self::RoostMismatch { expected, got } => write!(
+                f,
+                "Roost names don't match — the other device has \"{expected}\" open, this device \
+                 has \"{got}\". Open a roost with the same folder name on both devices."
+            ),
+            Self::RoostIdMismatch => f.write_str(
+                "These devices were paired in a different roost with the same name. Open that \
+                 roost, or unpair the device in Sync settings and pair again.",
+            ),
+            Self::PairingClosed => f.write_str(
+                "The other device isn't accepting new pairings right now — open \"Show code\" on \
+                 it and try again.",
+            ),
+        }
+    }
 }
 
 /// Encode a `Message` to a postcard byte blob.

@@ -409,10 +409,10 @@ async fn run_handshake<T: Transport>(
                         ));
                     }
                     Outcome::Failed(reason) => {
-                        return Err(crate::sync::error::ProtocolError::Aborted(format!(
-                            "{reason:?}"
-                        ))
-                        .into());
+                        // Typed, human-readable (never a `{:?}` dump in the UI).
+                        return Err(
+                            crate::sync::error::ProtocolError::PairingRejected(reason).into()
+                        );
                     }
                     Outcome::Wait => continue,
                 }
