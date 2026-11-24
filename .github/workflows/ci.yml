@@ -42,9 +42,10 @@ jobs:
             libssl-dev \
             pkg-config
 
-      - name: Install stable Rust + clippy
+      - name: Install Rust 1.96.0 + clippy
         uses: dtolnay/rust-toolchain@stable
         with:
+          toolchain: 1.96.0
           components: clippy, rustfmt
 
       - name: Cache cargo registry + target
