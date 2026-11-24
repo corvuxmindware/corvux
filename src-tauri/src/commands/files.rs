@@ -722,9 +722,10 @@ fn cancel_note_alarms(db_state: &State<'_, super::graph::GraphDb>, root: &str, a
 }
 
 /// Remove a note from the FTS search index. Best-effort and fail-soft: a
-/// poisoned lock or missing index logs and returns — a search-index hiccup must
-/// never fail the user-visible delete (markdown on disk is the source of truth,
-/// and the warm-start reconcile purges any straggler). Mirrors
+/// poisoned lock logs and returns — a search-index hiccup must never fail the
+/// user-visible delete (markdown on disk is the source of truth, and the
+/// warm-start reconcile purges any straggler). If the index isn't open yet,
+/// the removal is queued and applied when it opens. Mirrors
 /// [`purge_from_graph`].
 fn purge_from_search(abs_path: &str, search_state: &State<'_, super::search::SearchState>) {
     if let Err(e) = search_state.with_db_for_path(abs_path, |db| db.remove_note(abs_path)) {

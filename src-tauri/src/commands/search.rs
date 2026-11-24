@@ -1,5 +1,5 @@
 use serde::Serialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Mutex;
 use tauri::{AppHandle, Manager, State};
@@ -18,11 +18,23 @@ pub(crate) struct BoundSearchDb {
 }
 
 /// Tauri-managed state wrapping the active roost's FTS5 search database.
-pub struct SearchState(pub(crate) Mutex<Option<BoundSearchDb>>);
+///
+/// The second field holds notes saved or deleted while no index was open.
+/// The index opens lazily (first search, or when the Search panel opens), so
+/// on a fresh launch every save/delete before that point used to fail with
+/// "Search DB not initialized" and was simply dropped. Desktop recovered via
+/// the warm reconcile's mtime check, but SAF roosts have no mtimes, so on
+/// Android those edits never reached search. They are now queued here and
+/// replayed by `init_search` right after it installs the index.
+/// Lock order: the DB mutex first, then the pending mutex.
+pub struct SearchState(
+    pub(crate) Mutex<Option<BoundSearchDb>>,
+    Mutex<HashSet<String>>,
+);
 
 impl Default for SearchState {
     fn default() -> Self {
-        Self(Mutex::new(None))
+        Self(Mutex::new(None), Mutex::new(HashSet::new()))
     }
 }
 
@@ -43,16 +55,47 @@ impl SearchState {
         Ok(())
     }
 
-    /// Run an FTS operation only when `path` belongs to the database's roost.
-    /// The state mutex remains held for the whole operation, preventing a
-    /// delayed write for roost A from racing an A -> B database replacement.
-    pub(crate) fn with_db_for_path<T>(
+    /// Apply an FTS write (upsert/remove) for `path`, but only when `path`
+    /// belongs to the database's roost. The state mutex remains held for the
+    /// whole operation, preventing a delayed write for roost A from racing an
+    /// A -> B database replacement.
+    ///
+    /// When no index is open yet, the write is not lost: `path` is queued and
+    /// `init_search` re-reads it from disk once the index opens. That counts
+    /// as success for the caller.
+    pub(crate) fn with_db_for_path(
         &self,
         path: &str,
-        operation: impl FnOnce(&SearchDb) -> Result<T, String>,
-    ) -> Result<T, String> {
-        self.with_optional_db_for_path(path, operation)?
-            .ok_or_else(|| "Search DB not initialized".to_string())
+        operation: impl FnOnce(&SearchDb) -> Result<(), String>,
+    ) -> Result<(), String> {
+        let guard = self.0.lock().map_err(|e| format!("Lock error: {e}"))?;
+        let Some(bound) = guard.as_ref() else {
+            // Still holding the DB lock, so `init_search` can't install the
+            // index between this check and the queue insert (it would then
+            // miss the path).
+            self.1
+                .lock()
+                .map_err(|e| format!("Lock error: {e}"))?
+                .insert(path.to_string());
+            tracing::debug!(%path, "search: index not open yet; queued for indexing when it opens");
+            return Ok(());
+        };
+        to_rel(path, &bound.roost_path)
+            .ok_or_else(|| "Search path is outside the active roost".to_string())?;
+        operation(&bound.db)
+    }
+
+    /// Remove and return the queued paths that belong to `roost_path`.
+    /// Paths of other roosts stay queued for when that roost is open again.
+    fn take_pending_for(&self, roost_path: &str) -> Vec<String> {
+        let Ok(mut pending) = self.1.lock() else {
+            return Vec::new();
+        };
+        let (mine, others): (Vec<String>, Vec<String>) = pending
+            .drain()
+            .partition(|p| to_rel(p, roost_path).is_some());
+        pending.extend(others);
+        mine
     }
 
     pub(crate) fn with_optional_db_for_path<T>(
@@ -186,6 +229,7 @@ pub async fn init_search(
         // SRX-1: reconcile the warm index against disk — purge ghosts (deleted
         // off-app) and index notes added off-app.
         let db = reconcile_search_against_disk(db, backend.as_ref(), &roost_path).await;
+        let db = replay_into(db, &state, backend.as_ref(), &roost_path).await;
         let final_count = db.note_count()? as u32;
         let _transition = roost_fs.transition.lock().await;
         if !roost_fs.is_generation_current(generation) {
@@ -193,6 +237,8 @@ pub async fn init_search(
         }
         state.install(db, roost_path.clone(), generation)?;
         drop(_transition);
+        // Anything queued while the replay above was reading files.
+        replay_pending_writes(&state, backend.as_ref(), &roost_path).await;
         // DB-5: warm path is where FTS tombstones accumulate — schedule the
         // (day-gated, delayed) compaction pass.
         spawn_search_maintenance(app.clone());
@@ -222,6 +268,8 @@ pub async fn init_search(
         tracing::warn!(error = %e, "search: failed to set index-complete marker");
     }
     let count = files.len();
+    // The cold build may have used a walk cached before these edits.
+    let db = replay_into(db, &state, backend.as_ref(), &roost_path).await;
 
     let _transition = roost_fs.transition.lock().await;
     if !roost_fs.is_generation_current(generation) {
@@ -229,6 +277,8 @@ pub async fn init_search(
     }
     state.install(db, roost_path.clone(), generation)?;
     drop(_transition);
+    // Anything queued while the replay above was reading files.
+    replay_pending_writes(&state, backend.as_ref(), &roost_path).await;
 
     // DB-5: stamp the maintenance clock even on a cold build (the DB was just
     // freshly written, nothing to reclaim) so the pass is skipped for a day.
@@ -236,6 +286,107 @@ pub async fn init_search(
 
     tracing::info!(count, "search: init_search complete (cold), notes indexed");
     Ok(count as u32)
+}
+
+/// A note saved or deleted before the search index opened, as it is on disk
+/// now: its current text, or `None` when it is gone.
+struct QueuedNote {
+    path: String,
+    content: Option<String>,
+}
+
+/// Re-read the queued paths from disk. Best-effort per note, like the warm
+/// reconcile: unreadable or non-UTF-8 notes are skipped with a warning.
+async fn read_queued(
+    backend: &dyn RoostFs,
+    roost_path: &str,
+    paths: Vec<String>,
+) -> Vec<QueuedNote> {
+    let mut out = Vec::with_capacity(paths.len());
+    for path in paths {
+        let Some(rel) = to_rel(&path, roost_path) else {
+            continue;
+        };
+        match backend.read(&rel).await {
+            Ok(bytes) => match String::from_utf8(bytes) {
+                Ok(content) => out.push(QueuedNote {
+                    path,
+                    content: Some(content),
+                }),
+                Err(_) => tracing::warn!(%path, "search: queued note not UTF-8; skipped"),
+            },
+            Err(crate::roostfs::RoostError::NotFound(_)) => out.push(QueuedNote {
+                path,
+                content: None,
+            }),
+            Err(e) => {
+                tracing::warn!(error = %e, %path, "search: could not read a queued note; skipped")
+            }
+        }
+    }
+    out
+}
+
+/// Write one queued note into `db`: index its text, or drop its row if gone.
+fn apply_queued(db: &SearchDb, note: &QueuedNote) -> Result<(), String> {
+    match &note.content {
+        Some(content) => {
+            let title = Path::new(&note.path)
+                .file_stem()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string();
+            db.upsert_note(&note.path, &title, content)
+        }
+        None => db.remove_note(&note.path),
+    }
+}
+
+fn log_replay(notes: &[QueuedNote]) {
+    if notes.is_empty() {
+        return;
+    }
+    let removed = notes.iter().filter(|n| n.content.is_none()).count();
+    tracing::info!(
+        indexed = notes.len() - removed,
+        removed,
+        "search: applied index updates queued before the index opened"
+    );
+}
+
+/// Index the notes saved or deleted before the search index opened (see
+/// [`SearchState`]) straight into `db`, BEFORE `init_search` publishes it.
+/// Doing it before `install` means a save that lands right after the index
+/// opens always wins: it is written after this replay, never overwritten by
+/// the older text read here. Takes and returns `db` by value for the same
+/// `Send` reason as `reconcile_search_against_disk`.
+async fn replay_into(
+    db: SearchDb,
+    state: &SearchState,
+    backend: &dyn RoostFs,
+    roost_path: &str,
+) -> SearchDb {
+    let notes = read_queued(backend, roost_path, state.take_pending_for(roost_path)).await;
+    for note in &notes {
+        if let Err(e) = apply_queued(&db, note) {
+            tracing::warn!(error = %e, path = %note.path, "search: could not apply a queued index update");
+        }
+    }
+    log_replay(&notes);
+    db
+}
+
+/// Same as [`replay_into`], for writes queued after that replay took the
+/// queue but before `install` published the index (normally none). Goes
+/// through the published index, still checked against the active roost.
+async fn replay_pending_writes(state: &SearchState, backend: &dyn RoostFs, roost_path: &str) {
+    let notes = read_queued(backend, roost_path, state.take_pending_for(roost_path)).await;
+    for note in &notes {
+        if let Err(e) = state.with_db_for_path(&note.path, |db| apply_queued(db, note)) {
+            tracing::warn!(error = %e, path = %note.path, "search: could not apply a queued index update");
+        }
+    }
+    log_replay(&notes);
 }
 
 /// Minimum mtime advance (seconds) that counts as "modified while closed".
@@ -799,6 +950,91 @@ mod tests {
             !operation_ran.get(),
             "rejected operation must never reach DB"
         );
+    }
+
+    /// Before the index opens, writes are queued (not errors), and only the
+    /// paths of the roost being opened are handed out.
+    #[test]
+    fn writes_before_the_index_opens_are_queued() {
+        let roost = TempDir::new().unwrap();
+        let other = TempDir::new().unwrap();
+        let state = SearchState::default();
+        let mine = roost.path().join("a.md").to_string_lossy().to_string();
+        let theirs = other.path().join("b.md").to_string_lossy().to_string();
+
+        let ran = std::cell::Cell::new(false);
+        state
+            .with_db_for_path(&mine, |_| {
+                ran.set(true);
+                Ok(())
+            })
+            .expect("a write before the index opens must not fail");
+        assert!(!ran.get(), "no DB yet, so the operation can't run");
+        state.with_db_for_path(&theirs, |_| Ok(())).unwrap();
+
+        let roost_path = roost.path().to_string_lossy().to_string();
+        assert_eq!(state.take_pending_for(&roost_path), vec![mine]);
+        assert!(state.take_pending_for(&roost_path).is_empty());
+        let other_path = other.path().to_string_lossy().to_string();
+        assert_eq!(state.take_pending_for(&other_path), vec![theirs]);
+    }
+
+    /// The replay indexes the note's CURRENT text and drops notes deleted
+    /// before the index opened, even when the index still has old rows.
+    #[tokio::test]
+    async fn queued_writes_are_applied_when_the_index_opens() {
+        let roost = TempDir::new().unwrap();
+        let db_dir = TempDir::new().unwrap();
+        let roost_path = roost.path().to_string_lossy().to_string();
+        let edited = roost.path().join("edited.md");
+        let deleted = roost.path().join("deleted.md");
+        let edited_s = edited.to_string_lossy().to_string();
+        let deleted_s = deleted.to_string_lossy().to_string();
+
+        // Index state from an earlier session.
+        let db = SearchDb::init(db_dir.path()).unwrap();
+        db.upsert_note(&edited_s, "edited", "old words").unwrap();
+        db.upsert_note(&deleted_s, "deleted", "gone soon").unwrap();
+
+        // This session, before the index opens: one edit, one delete.
+        let state = SearchState::default();
+        fs::write(&edited, "fresh words").unwrap();
+        state.with_db_for_path(&edited_s, |_| Ok(())).unwrap();
+        state.with_db_for_path(&deleted_s, |_| Ok(())).unwrap();
+
+        state.install(db, roost_path.clone(), 1).unwrap();
+        let backend = NativeFs::new(roost.path());
+        replay_pending_writes(&state, &backend, &roost_path).await;
+
+        let guard = state.0.lock().unwrap();
+        let db = &guard.as_ref().unwrap().db;
+        assert_eq!(
+            db.content_for(&edited_s).unwrap().as_deref(),
+            Some("fresh words")
+        );
+        assert_eq!(db.content_for(&deleted_s).unwrap(), None);
+    }
+
+    /// The pre-install replay writes into the not-yet-published DB, so the
+    /// queue is empty afterwards and nothing is left for a later overwrite.
+    #[tokio::test]
+    async fn queued_writes_are_applied_before_the_index_is_published() {
+        let roost = TempDir::new().unwrap();
+        let db_dir = TempDir::new().unwrap();
+        let roost_path = roost.path().to_string_lossy().to_string();
+        let note = roost.path().join("n.md");
+        let note_s = note.to_string_lossy().to_string();
+        let db = SearchDb::init(db_dir.path()).unwrap();
+        db.upsert_note(&note_s, "n", "before").unwrap();
+
+        let state = SearchState::default();
+        fs::write(&note, "after").unwrap();
+        state.with_db_for_path(&note_s, |_| Ok(())).unwrap();
+
+        let backend = NativeFs::new(roost.path());
+        let db = replay_into(db, &state, &backend, &roost_path).await;
+        assert_eq!(db.content_for(&note_s).unwrap().as_deref(), Some("after"));
+        assert!(state.take_pending_for(&roost_path).is_empty());
     }
 
     // ── reciprocal_rank_fusion ──────────────────────────────────────
