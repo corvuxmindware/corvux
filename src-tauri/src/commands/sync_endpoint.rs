@@ -207,17 +207,131 @@ pub(super) fn short_id(id: &str, chars: usize) -> String {
     )
 }
 
-/// The R1 gate: `Ok(())` = this peer may be paired (already confirmed, or
-/// the user just answered yes in the native dialog). Decline / dismiss /
-/// failure to show the dialog ⇒ `Err(SYNC_PAIR_DECLINED)`.
+/// Peers confirmed in THIS run whose record could not be written (disk full,
+/// read-only app-data, record full). Without it a failed save made every
+/// later connect to the same peer ask again. Memory only: after a restart the
+/// peer is unconfirmed again unless the paired-peer registry knows it (fail
+/// closed, never trusted from a record that was never written).
+static SESSION_CONFIRMED_PEERS: std::sync::Mutex<std::collections::BTreeSet<String>> =
+    std::sync::Mutex::new(std::collections::BTreeSet::new());
+
+fn session_confirmed_peers() -> std::sync::MutexGuard<'static, std::collections::BTreeSet<String>> {
+    // Plain data; a panic elsewhere cannot leave it half-updated.
+    SESSION_CONFIRMED_PEERS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// The iroh NodeId a confirm key names, in raw bytes, for searching the
+/// paired-peer registry. `None` for any other key (TCP keys and malformed keys
+/// are treated as unknown — see [`already_paired`]).
+fn iroh_node_of_key(key: &str) -> Option<[u8; 32]> {
+    let node = key
+        .strip_prefix("iroh:")?
+        .parse::<iroh::EndpointId>()
+        .ok()?;
+    Some(*node.as_bytes())
+}
+
+/// Does this registry entry describe the iroh node `node`?
+fn identity_is_node(id: &crate::sync::store::peer_store::PairedIdentity, node: &[u8; 32]) -> bool {
+    id.node_id.as_ref() == Some(node)
+        || id
+            .addr
+            .as_deref()
+            .filter(|a| a.starts_with("corvux1:"))
+            .and_then(|a| crate::sync::transport::iroh::decode_ticket(a).ok())
+            .is_some_and(|peer| peer.id.as_bytes() == node)
+}
+
+/// RF-3 (R1 migration): did the user already pair with this iroh peer?
+/// Read-only lookup in the backend-owned paired-peer registries
+/// (`<app_data>/vaults/<index dir>/sync/peers.bin`, written only after a
+/// completed PIN handshake). Pairings made before the R1 dialog existed are
+/// therefore not asked about again on a manual connect, and a device the user
+/// UNPAIRED (removed from `peers.bin`) is asked about again.
+///
+/// Trust boundary (SA-1): the webview can write files inside every roost it
+/// can open — including the marker file `paths::is_marked_index_dir` looks
+/// for, and a fake `sync/peers.bin`. A registry therefore counts ONLY when
+/// its directory
+///   * is a direct child of `vaults/` named exactly like a directory
+///     `roost_db_dir` creates (`id-` + 32 hex, or the legacy 16-hex hash) —
+///     a user folder cannot be given such a name through any webview-reachable
+///     command (named roosts are created under `roosts/`, with a sanitized
+///     slug, and never above an existing folder); AND
+///   * carries the marker; AND
+///   * is not itself a roost root the user confirmed (an index dir is never a
+///     roost; a folder that is both is user content).
+///
+/// TCP peers are deliberately NOT looked up (SA-3): a TCP "peer" is just
+/// `ip:port` text, which proves nothing about who answers on that address
+/// today (DHCP reuse). TCP pairing is the legacy path; a pre-upgrade TCP peer
+/// is asked about once.
+///
+/// Scope matches the confirmed record: app-wide, not per roost (SY-4, open).
+/// Any read or decode problem counts as "not paired" (the dialog asks).
+fn already_paired(app_data_dir: &std::path::Path, key: &str) -> bool {
+    let Some(node) = iroh_node_of_key(key) else {
+        return false;
+    };
+    let Ok(entries) = std::fs::read_dir(app_data_dir.join("vaults")) else {
+        return false;
+    };
+    let roost_roots = super::roost::confirmed_roots_now(app_data_dir);
+    entries.flatten().any(|entry| {
+        let dir = entry.path();
+        let name_ok = dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(crate::paths::is_backend_index_dir_name);
+        if !name_ok || !crate::paths::is_marked_index_dir(&dir) {
+            return false;
+        }
+        if roost_roots.contains(&crate::paths::normalize_key(&dir.to_string_lossy())) {
+            return false;
+        }
+        match crate::sync::store::peer_store::read_paired_identities(&dir.join("sync")) {
+            Ok(ids) => ids.iter().any(|id| identity_is_node(id, &node)),
+            Err(e) => {
+                tracing::debug!(error = %e, "sync pair: a paired-peer registry could not be read");
+                false
+            }
+        }
+    })
+}
+
+/// How [`authorize_first_pair`] authorized a pairing.
+///
+/// The distinction matters (SA-2): only `UserConfirmed` means a human just
+/// answered a native dialog for THIS action, which is the only thing that may
+/// open the inbound enrollment window. `AlreadyKnown` pairs without a dialog,
+/// so a hijacked webview can trigger it at will for any NodeId it can read
+/// from `sync_status` — it must not open a window or reset a guess counter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum PairAuth {
+    /// Confirmed earlier (record / this run) or already paired — no dialog.
+    AlreadyKnown,
+    /// The user answered "yes" in the native dialog just now.
+    UserConfirmed,
+}
+
+/// The R1 gate: `Ok(_)` = this peer may be paired — [`PairAuth::AlreadyKnown`]
+/// (confirmed earlier, remembered this run, or an existing pairing in the
+/// paired-peer registry) or [`PairAuth::UserConfirmed`] (the user just
+/// answered yes in the native dialog). Decline / dismiss / failure to show the
+/// dialog ⇒ `Err(SYNC_PAIR_DECLINED)`.
 pub(super) async fn authorize_first_pair(
     app_data_dir: &std::path::Path,
     key: &str,
     shown_id: &str,
     confirm: &(impl super::native_confirm::NativeConfirm + ?Sized),
-) -> Result<(), String> {
-    if load_confirmed_peers(app_data_dir).contains(key) {
-        return Ok(());
+) -> Result<PairAuth, String> {
+    if load_confirmed_peers(app_data_dir).contains(key)
+        || session_confirmed_peers().contains(key)
+        || already_paired(app_data_dir, key)
+    {
+        return Ok(PairAuth::AlreadyKnown);
     }
     let body = format!(
         "Corvux is about to pair with this device and sync every note in this \
@@ -236,18 +350,30 @@ pub(super) async fn authorize_first_pair(
     }
     let _lane = CONFIRMED_PEERS_WRITE.lock().await;
     let mut peers = load_confirmed_peers(app_data_dir);
-    if peers.len() >= MAX_CONFIRMED_PEERS && !peers.contains(key) {
-        return Err(format!(
-            "Too many confirmed sync peers (limit {MAX_CONFIRMED_PEERS}); unpair one first."
-        ));
+    if peers.contains(key) {
+        // Recorded concurrently — but the user answered yes to THIS request.
+        return Ok(PairAuth::UserConfirmed);
+    }
+    if peers.len() >= MAX_CONFIRMED_PEERS {
+        // Nothing in the app removes entries from this record yet (SY-4), so
+        // refusing here would be a dead end after the user said yes. The pair
+        // proceeds; this run remembers it; a restart asks again unless the
+        // pairing completed (then the paired-peer registry knows the peer).
+        tracing::warn!(
+            limit = MAX_CONFIRMED_PEERS,
+            "sync pair: confirmed-peer record is full — remembered for this run only"
+        );
+        session_confirmed_peers().insert(key.to_string());
+        return Ok(PairAuth::UserConfirmed);
     }
     peers.insert(key.to_string());
     if let Err(e) = save_confirmed_peers(app_data_dir, &peers) {
-        // Fail safe: the pair proceeds, but the next pair with this peer
-        // will confirm again rather than trusting an unwritable record.
-        tracing::warn!(error = %e, "sync pair: persisting confirmed peer failed");
+        // The pair proceeds and this run remembers the answer; across a
+        // restart the unwritable record is not trusted (fail closed).
+        tracing::warn!(error = %e, "sync pair: persisting confirmed peer failed — remembered for this run only");
+        session_confirmed_peers().insert(key.to_string());
     }
-    Ok(())
+    Ok(PairAuth::UserConfirmed)
 }
 
 /// R1-in (sharp-edges residual): showing the pairing code / starting the
@@ -531,6 +657,310 @@ mod first_pair_gate_tests {
             .await
             .unwrap();
         assert_eq!(re_dialog.times_asked(), 0, "confirmed peers pair silently");
+    }
+
+    // ── RF-3: peers paired before the R1 dialog existed ─────────────────
+
+    /// Keychain stand-in: the registry under test holds no secrets.
+    struct NoSecrets;
+    impl crate::sync::store::peer_store::SecretBackend for NoSecrets {
+        fn get(&self, _key: &str) -> Result<Option<crate::sensitive::SecretString>, String> {
+            Ok(None)
+        }
+        fn set(&self, _key: &str, _value: &str) -> Result<(), String> {
+            Ok(())
+        }
+        fn delete(&self, _key: &str) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    /// Write a paired-peer registry the way the engine does, under
+    /// `<app_data>/vaults/<index_dir>/sync`, optionally with the marker
+    /// `roost_db_dir` stamps on every real index dir.
+    fn pair_in_registry(
+        app_data: &std::path::Path,
+        index_dir: &str,
+        marked: bool,
+        node_id: Option<[u8; 32]>,
+        addr: Option<&str>,
+    ) {
+        use crate::sync::store::peer_store::{PeerRecord, PeerStore};
+        let dir = app_data.join("vaults").join(index_dir);
+        std::fs::create_dir_all(dir.join("sync")).unwrap();
+        if marked {
+            std::fs::write(dir.join(".corvux-derived-index"), b"x").unwrap();
+        }
+        let mut store =
+            PeerStore::load_with_secrets(&dir.join("sync"), std::sync::Arc::new(NoSecrets))
+                .unwrap();
+        let mut record = PeerRecord::new(
+            crate::sync::identity::DeviceId([node_id.map_or(1, |n| n[0]); 16]),
+            [0u8; 32],
+            "phone".into(),
+        );
+        record.peer_node_id = node_id;
+        record.last_known_addr = addr.map(str::to_string);
+        store.upsert(record).unwrap();
+    }
+
+    fn node(seed: u8) -> iroh::EndpointId {
+        iroh::SecretKey::from_bytes(&[seed; 32]).public()
+    }
+
+    #[tokio::test]
+    async fn a_peer_paired_before_the_upgrade_is_not_asked_about() {
+        let app_data = TempDir::new().unwrap();
+        let known = node(21);
+        pair_in_registry(
+            app_data.path(),
+            "id-00000000000000000000000000000021",
+            true,
+            Some(*known.as_bytes()),
+            Some("10.0.0.21:4242"),
+        );
+        let dialog = Scripted::deny(); // would refuse if asked — it must not be
+
+        let iroh_key = peer_confirm_key("iroh", &known.to_string());
+        let auth = authorize_first_pair(app_data.path(), &iroh_key, "iroh node", &dialog)
+            .await
+            .unwrap();
+        assert_eq!(auth, PairAuth::AlreadyKnown);
+        assert_eq!(dialog.times_asked(), 0);
+    }
+
+    /// SA-3: a TCP "peer" is `ip:port` text. Seeing that text in a registry
+    /// proves nothing about who answers there today (DHCP reuse), so it must
+    /// not silence the dialog.
+    #[tokio::test]
+    async fn a_tcp_address_in_the_registry_does_not_vouch_for_a_tcp_peer() {
+        let app_data = TempDir::new().unwrap();
+        pair_in_registry(
+            app_data.path(),
+            "id-00000000000000000000000000000021",
+            true,
+            Some(*node(21).as_bytes()),
+            Some("10.0.0.21:4242"),
+        );
+        let dialog = Scripted::deny();
+        let tcp_key = peer_confirm_key("tcp", "10.0.0.21:4242");
+        assert_eq!(
+            authorize_first_pair(app_data.path(), &tcp_key, "10.0.0.21:4242", &dialog)
+                .await
+                .unwrap_err(),
+            SYNC_PAIR_DECLINED
+        );
+        assert_eq!(dialog.times_asked(), 1);
+    }
+
+    /// SA-1: the marker is a plain file the webview can plant in any folder
+    /// it can write. A marked folder whose NAME is not one `roost_db_dir`
+    /// would create must vouch for nothing, even with a perfectly formed
+    /// registry for the attacker's NodeId inside it.
+    #[tokio::test]
+    async fn a_marked_folder_with_a_non_index_name_vouches_for_nothing() {
+        let app_data = TempDir::new().unwrap();
+        let attacker = node(31);
+        for (i, name) in [
+            "my-notes",
+            "id-1234",
+            "id-0000000000000000000000000000003Z",
+            "legacy-roost",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            pair_in_registry(
+                app_data.path(),
+                name,
+                true, // the planted marker
+                Some(*attacker.as_bytes()),
+                None,
+            );
+            let dialog = Scripted::deny();
+            let key = peer_confirm_key("iroh", &attacker.to_string());
+            assert_eq!(
+                authorize_first_pair(app_data.path(), &key, "iroh node", &dialog)
+                    .await
+                    .unwrap_err(),
+                SYNC_PAIR_DECLINED,
+                "folder #{i} ({name}) must not vouch for a peer"
+            );
+            assert_eq!(dialog.times_asked(), 1, "folder #{i} ({name})");
+        }
+    }
+
+    /// SA-1, second line: even a correctly named, marked folder does not vouch
+    /// when it is itself a roost the user opened — an index dir is never a
+    /// roost, so a folder that is both is user content.
+    #[tokio::test]
+    async fn an_index_shaped_folder_that_is_a_confirmed_roost_vouches_for_nothing() {
+        let app_data = TempDir::new().unwrap();
+        let attacker = node(32);
+        let name = "id-00000000000000000000000000000032";
+        pair_in_registry(
+            app_data.path(),
+            name,
+            true,
+            Some(*attacker.as_bytes()),
+            None,
+        );
+        let dir = app_data.path().join("vaults").join(name);
+        let roots = vec![crate::paths::normalize_key(&dir.to_string_lossy())];
+        std::fs::write(
+            app_data.path().join("confirmed_roost_roots.json"),
+            serde_json::to_string(&roots).unwrap(),
+        )
+        .unwrap();
+        let dialog = Scripted::deny();
+        let key = peer_confirm_key("iroh", &attacker.to_string());
+        assert_eq!(
+            authorize_first_pair(app_data.path(), &key, "iroh node", &dialog)
+                .await
+                .unwrap_err(),
+            SYNC_PAIR_DECLINED
+        );
+        assert_eq!(dialog.times_asked(), 1);
+    }
+
+    /// SA-2: callers must be able to tell "a human just said yes" from
+    /// "known already" — only the former may open the enrollment window.
+    #[tokio::test]
+    async fn the_gate_reports_whether_the_user_just_confirmed() {
+        let app_data = TempDir::new().unwrap();
+        let fresh = peer_confirm_key("iroh", &node(33).to_string());
+
+        let allow = Scripted::allow();
+        assert_eq!(
+            authorize_first_pair(app_data.path(), &fresh, "iroh node", &allow)
+                .await
+                .unwrap(),
+            PairAuth::UserConfirmed
+        );
+        assert_eq!(allow.times_asked(), 1);
+
+        // Same peer again: remembered, so no dialog and NOT a fresh confirm.
+        let deny = Scripted::deny();
+        assert_eq!(
+            authorize_first_pair(app_data.path(), &fresh, "iroh node", &deny)
+                .await
+                .unwrap(),
+            PairAuth::AlreadyKnown
+        );
+        assert_eq!(deny.times_asked(), 0);
+
+        // A peer known only from the paired-peer registry: also not a confirm.
+        pair_in_registry(
+            app_data.path(),
+            "id-00000000000000000000000000000034",
+            true,
+            Some(*node(34).as_bytes()),
+            None,
+        );
+        let reg_key = peer_confirm_key("iroh", &node(34).to_string());
+        assert_eq!(
+            authorize_first_pair(app_data.path(), &reg_key, "iroh node", &deny)
+                .await
+                .unwrap(),
+            PairAuth::AlreadyKnown
+        );
+        assert_eq!(deny.times_asked(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_peer_known_only_by_its_reconnect_ticket_is_recognised() {
+        let app_data = TempDir::new().unwrap();
+        let known = node(22);
+        let ticket =
+            crate::sync::transport::iroh::encode_ticket(&iroh::EndpointAddr::new(known), None)
+                .unwrap();
+        pair_in_registry(
+            app_data.path(),
+            "id-00000000000000000000000000000022",
+            true,
+            None,
+            Some(&*ticket),
+        );
+        let dialog = Scripted::deny();
+        let key = peer_confirm_key("iroh", &known.to_string());
+        authorize_first_pair(app_data.path(), &key, "iroh node", &dialog)
+            .await
+            .unwrap();
+        assert_eq!(dialog.times_asked(), 0);
+    }
+
+    #[tokio::test]
+    async fn an_unpaired_peer_is_still_asked_about() {
+        let app_data = TempDir::new().unwrap();
+        pair_in_registry(
+            app_data.path(),
+            "id-00000000000000000000000000000023",
+            true,
+            Some(*node(23).as_bytes()),
+            Some("10.0.0.23:4242"),
+        );
+        let dialog = Scripted::deny();
+        let stranger = peer_confirm_key("iroh", &node(24).to_string());
+        assert_eq!(
+            authorize_first_pair(app_data.path(), &stranger, "iroh node", &dialog)
+                .await
+                .unwrap_err(),
+            SYNC_PAIR_DECLINED
+        );
+        let other_addr = peer_confirm_key("tcp", "10.0.0.24:4242");
+        assert_eq!(
+            authorize_first_pair(app_data.path(), &other_addr, "10.0.0.24:4242", &dialog)
+                .await
+                .unwrap_err(),
+            SYNC_PAIR_DECLINED
+        );
+        assert_eq!(dialog.times_asked(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_registry_outside_a_marked_index_dir_is_ignored() {
+        // A user folder under the legacy `vaults/` namespace is not an index
+        // dir and must never vouch for a peer.
+        let app_data = TempDir::new().unwrap();
+        let planted = node(25);
+        pair_in_registry(
+            app_data.path(),
+            "my-notes",
+            false,
+            Some(*planted.as_bytes()),
+            None,
+        );
+        let dialog = Scripted::deny();
+        let key = peer_confirm_key("iroh", &planted.to_string());
+        assert!(
+            authorize_first_pair(app_data.path(), &key, "iroh node", &dialog)
+                .await
+                .is_err()
+        );
+        assert_eq!(dialog.times_asked(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_failed_save_does_not_reprompt_in_this_run() {
+        let parent = TempDir::new().unwrap();
+        let unwritable = parent.path().join("missing"); // every save fails
+        let key = peer_confirm_key("tcp", "10.0.0.26:4242");
+
+        let first = Scripted::allow();
+        authorize_first_pair(&unwritable, &key, "10.0.0.26:4242", &first)
+            .await
+            .unwrap();
+        assert_eq!(first.times_asked(), 1);
+
+        let again = Scripted::deny();
+        authorize_first_pair(&unwritable, &key, "10.0.0.26:4242", &again)
+            .await
+            .unwrap();
+        assert_eq!(again.times_asked(), 0, "remembered for this run");
+        assert!(
+            !load_confirmed_peers(&unwritable).contains(&key),
+            "nothing persisted, so a restart asks again"
+        );
     }
 
     #[test]

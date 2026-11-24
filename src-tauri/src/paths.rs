@@ -251,6 +251,15 @@ fn is_legacy_hash_name(name: &str) -> bool {
     name.len() == 16 && name.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
+/// Does `name` have the shape of a directory [`roost_db_dir`] itself creates
+/// (`id-` + 32 hex, or the legacy 16-hex path hash)? Callers that TRUST the
+/// contents of a `vaults/` child must require this AND the marker: the marker
+/// is a plain file the webview can plant in any roost folder it can write
+/// (`write_file`), so the marker alone is not proof the backend wrote it.
+pub(crate) fn is_backend_index_dir_name(name: &str) -> bool {
+    is_id_dir_name(name) || is_legacy_hash_name(name)
+}
+
 /// Decide whether a `vaults/` child dir is an orphaned Corvux index dir safe to
 /// delete. Conservative by construction:
 ///   - Only `id-`-keyed and legacy path-hash dirs carrying the

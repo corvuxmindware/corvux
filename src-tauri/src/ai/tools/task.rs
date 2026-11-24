@@ -205,6 +205,9 @@ impl<R: tauri::Runtime + 'static> Tool<R> for TaskTool {
             parent_budget: None,
             parent_autonomy: None,
             cancel: Some(cancel.clone()),
+            // The child loop's own `dispatch_one` arms this per call from
+            // `child_autonomy` (the parent's blocklist snapshot).
+            write_gate: None,
         };
 
         // System prompt for the child: AGENT.md body + registry blurb

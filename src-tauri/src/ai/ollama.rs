@@ -65,12 +65,16 @@ pub struct OllamaChat {
 }
 
 impl OllamaChat {
+    /// The base URL is user-chosen, so the provider picks its own HTTP client:
+    /// the no-redirect one (`ai::http::no_redirect_client`). A caller cannot hand
+    /// it the shared redirect-following client by mistake — a `302` from the
+    /// configured server must not walk note content and the bearer token to a
+    /// host that `validate_provider_base_url` never saw (review AK-1).
     pub fn new(
-        client: Arc<Client>,
         base_url: String,
         api_key: Option<crate::sensitive::SecretString>,
         model: String,
-    ) -> Self {
+    ) -> Result<Self, String> {
         let base = if base_url.trim().is_empty() {
             OLLAMA_DEFAULT_BASE.to_string()
         } else {
@@ -78,12 +82,12 @@ impl OllamaChat {
             // whether the user typed `http://x:11434` or `http://x:11434/`.
             base_url.trim_end_matches('/').to_string()
         };
-        Self {
-            client,
+        Ok(Self {
+            client: crate::ai::http::no_redirect_client()?,
             base_url: base,
             api_key,
             model,
-        }
+        })
     }
 }
 
@@ -262,6 +266,9 @@ async fn stream_chat_impl<R: tauri::Runtime>(
         .await
         .map_err(|e| format!("HTTP request failed: {e}"))?;
 
+    if let Some(msg) = crate::ai::http::redirect_refused(response.status()) {
+        return Err(format!("Ollama API error: {msg}"));
+    }
     if !response.status().is_success() {
         let status = response.status();
         let body_text = crate::ai::http::error_body(response).await;
@@ -383,6 +390,9 @@ async fn stream_chat_with_tools_impl<R: tauri::Runtime + 'static>(
         .await
         .map_err(|e| format!("HTTP request failed: {e}"))?;
 
+    if let Some(msg) = crate::ai::http::redirect_refused(response.status()) {
+        return Err(format!("Ollama API error: {msg}"));
+    }
     if !response.status().is_success() {
         let status = response.status();
         let body_text = crate::ai::http::error_body(response).await;
@@ -407,13 +417,12 @@ mod tests {
 
     #[test]
     fn new_strips_trailing_slash_from_base_url() {
-        let client = Arc::new(reqwest::Client::new());
         let chat = OllamaChat::new(
-            client,
             "http://localhost:11434/".to_string(),
             None,
             "llama3.2".to_string(),
-        );
+        )
+        .unwrap();
         assert_eq!(chat.base_url, "http://localhost:11434");
     }
 
@@ -433,9 +442,15 @@ mod tests {
         // An empty / whitespace base_url is treated as "use default" so
         // a fresh settings.json with the field defaulted to "" still
         // does the sensible thing.
-        let client = Arc::new(reqwest::Client::new());
-        let chat = OllamaChat::new(client, "   ".to_string(), None, "llama3.2".to_string());
+        let chat = OllamaChat::new("   ".to_string(), None, "llama3.2".to_string()).unwrap();
         assert_eq!(chat.base_url, OLLAMA_DEFAULT_BASE);
+        // AK-1: the provider always uses the shared no-redirect client — the
+        // one whose behaviour `ai::http::tests::
+        // the_no_redirect_client_reports_a_302_and_never_dials_the_target` proves.
+        // (Kept in this test: one more constructor call in this file would
+        // move the `tests/ai_consent_guard.rs` baseline.)
+        let shared = crate::ai::http::no_redirect_client().unwrap();
+        assert!(Arc::ptr_eq(&chat.client, &shared));
     }
 
     #[test]

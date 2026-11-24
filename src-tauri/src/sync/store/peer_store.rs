@@ -991,6 +991,76 @@ fn purge_registry_secrets_with(state_dir: &std::path::Path, secrets: &dyn Secret
     }
 }
 
+/// The non-secret identity of one paired peer, as `peers.bin` records it.
+pub struct PairedIdentity {
+    /// The peer's iroh NodeId, once observed over iroh.
+    pub node_id: Option<[u8; 32]>,
+    /// Last address used to reach it: `ip:port` (TCP) or a `corvux1:` ticket.
+    /// Wrapped because a pre-v5 file may still carry a full pairing ticket.
+    pub addr: Option<crate::sensitive::SecretString>,
+}
+
+/// RF-3: the peers in the registry in `state_dir`, READ-ONLY — no keychain
+/// read, no migration, nothing written (unlike [`PeerStore::load`], which
+/// migrates and hydrates secrets). Used to recognise a peer the user already
+/// paired with before the R1 first-pair dialog existed. A missing file is an
+/// empty list; an unreadable or unknown-version file is an `Err` (the caller
+/// treats that as "not known", i.e. it asks).
+pub fn read_paired_identities(
+    state_dir: &std::path::Path,
+) -> Result<Vec<PairedIdentity>, StoreError> {
+    let bytes = match fs::read(peers_file(state_dir)) {
+        Ok(b) => zeroize::Zeroizing::new(b),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e.into()),
+    };
+    #[derive(Deserialize)]
+    struct VersionOnly {
+        version: u16,
+    }
+    let version = postcard::from_bytes::<VersionOnly>(&bytes)
+        .map_err(|e| StoreError::Decode(format!("peer file header: {e}")))?
+        .version;
+    let decode = |e: postcard::Error| StoreError::Decode(e.to_string());
+    let ids = |node_id: Option<[u8; 32]>, addr: Option<String>| PairedIdentity {
+        node_id,
+        addr: addr.map(Into::into),
+    };
+    Ok(match version {
+        5 => postcard::from_bytes::<Envelope>(&bytes)
+            .map_err(decode)?
+            .peers
+            .into_iter()
+            .map(|r| ids(r.peer_node_id, r.last_known_addr))
+            .collect(),
+        4 => postcard::from_bytes::<EnvelopeV4>(&bytes)
+            .map_err(decode)?
+            .peers
+            .into_iter()
+            .map(|r| ids(r.peer_node_id, r.last_known_addr))
+            .collect(),
+        3 => postcard::from_bytes::<EnvelopeV3>(&bytes)
+            .map_err(decode)?
+            .peers
+            .into_iter()
+            .map(|r| ids(r.peer_node_id, r.last_known_addr))
+            .collect(),
+        2 => postcard::from_bytes::<EnvelopeV2>(&bytes)
+            .map_err(decode)?
+            .peers
+            .into_iter()
+            .map(|r| ids(None, r.last_known_addr))
+            .collect(),
+        // v1 records carry no address or NodeId, so nothing to match against.
+        1 => Vec::new(),
+        other => {
+            return Err(StoreError::Decode(format!(
+                "peer file version {other} unsupported"
+            )))
+        }
+    })
+}
+
 fn now_millis() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)

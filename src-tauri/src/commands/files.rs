@@ -499,6 +499,13 @@ pub(crate) async fn create_roost_note_synced<R: tauri::Runtime>(
 /// Atomically read-modify-write one UTF-8 note under the same per-note lane
 /// used by editor saves and task/history commands. This is the only safe shape
 /// for agent tools whose output depends on the current note body.
+///
+/// AT-4 defense in depth: a NOTE mutation never targets a reserved path
+/// (`.corvux/`, `.attachments/`, any dotfile). Agent callers reach this only
+/// through `ai::tools::write_gate::mutate_note`, which also applies the
+/// user's `agent_blocked_paths`; this refusal holds even for a caller that
+/// skipped the gate. App-owned `.corvux/*.md` files use
+/// [`mutate_roost_text_synced`] instead.
 pub(crate) async fn mutate_roost_note_synced<R, T, F>(
     app: &AppHandle<R>,
     rel: &str,
@@ -508,6 +515,11 @@ where
     R: tauri::Runtime,
     F: FnOnce(&str) -> Result<(String, T), String>,
 {
+    if crate::ai::tools::write_gate::is_reserved_path(rel) {
+        return Err(format!(
+            "refusing to modify a reserved path '{rel}': Corvux's own folders and dotfiles are not notes"
+        ));
+    }
     mutate_roost_text_synced(app, rel, false, mutate).await
 }
 

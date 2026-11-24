@@ -45,9 +45,10 @@ async fn mutate_task_note<T, F>(
 where
     F: FnOnce(&str) -> Result<(String, T), String>,
 {
-    crate::commands::files::mutate_roost_note_synced(&ctx.app, rel, mutate)
-        .await
-        .map_err(ToolError::retryable)
+    // AT-1/AT-4: the write gate checks the RESOLVED `rel` against the
+    // reserved-path rule (a task line must never land in `.corvux/skills/*/
+    // SKILL.md` or `.corvux/*.json`) and the user's `agent_blocked_paths`.
+    super::write_gate::mutate_note(ctx, rel, mutate).await
 }
 
 /// Re-index a single note + record an `:edit_event` with `Actor::Agent`.
@@ -179,15 +180,20 @@ async fn resolve_target_path(
         .and_then(|v| v.as_str())
         .map(str::trim)
         .unwrap_or("");
-    // For `create_task` (allow_open_fallback = false) an empty `note_path`
-    // means "use today's daily note" — that's the documented default.
-    // Substitute the shorthand so the unified resolver picks it up.
-    let resolved_input = if !allow_open_fallback && raw.is_empty() {
+    let resolved_input = effective_note_input(raw, allow_open_fallback);
+    note_ref::resolve_rel(resolved_input, ctx, true, allow_open_fallback).await
+}
+
+/// For `create_task` (allow_open_fallback = false) an empty `note_path`
+/// means "use today's daily note" — that's the documented default.
+/// Substitute the shorthand so the unified resolver picks it up. (The write
+/// gate then checks the daily-folder path this resolves to — AT-1.)
+pub(crate) fn effective_note_input(raw: &str, allow_open_fallback: bool) -> &str {
+    if !allow_open_fallback && raw.is_empty() {
         "daily"
     } else {
         raw
-    };
-    note_ref::resolve_rel(resolved_input, ctx, true, allow_open_fallback).await
+    }
 }
 
 fn ensure_unique_anchor(content: &str, anchor: &str) -> Result<(), ToolError> {

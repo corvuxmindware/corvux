@@ -76,12 +76,38 @@ pub async fn resolve_rel<R: tauri::Runtime + 'static>(
         .current()
         .await
         .ok_or_else(|| ToolError::fatal("no roost open"))?;
+    let app = &ctx.app;
+    let title_lookup = |title: &str| try_title_lookup_rel(title, app);
+    resolve_rel_with(
+        input,
+        roost,
+        ctx.open_note_path.as_deref(),
+        backend.as_ref(),
+        allow_create_daily,
+        allow_open_fallback,
+        &title_lookup,
+    )
+    .await
+}
 
+/// The resolution steps of [`resolve_rel`], with the backend and the
+/// title lookup passed in so tests can drive the exact production logic over
+/// a real `NativeFs` roost without a Tauri app. NOTE: the returned path is
+/// only an identity; write tools must hand it to `write_gate`, which checks
+/// the user's blocklist and the reserved-path rule on this RESOLVED form
+/// (AT-1 — the raw string the model sent is not authoritative).
+pub(crate) async fn resolve_rel_with(
+    input: &str,
+    roost: &str,
+    open_note_path: Option<&str>,
+    backend: &dyn crate::roostfs::RoostFs,
+    allow_create_daily: bool,
+    allow_open_fallback: bool,
+    title_lookup: &(dyn Fn(&str) -> Option<String> + Send + Sync),
+) -> Result<String, ToolError> {
     let mut value = strip_wiki_markers(input.trim()).to_string();
     if value.is_empty() && allow_open_fallback {
-        value = ctx
-            .open_note_path
-            .as_deref()
+        value = open_note_path
             .map(strip_wiki_markers)
             .unwrap_or("")
             .to_string();
@@ -92,14 +118,7 @@ pub async fn resolve_rel<R: tauri::Runtime + 'static>(
         ));
     }
     if value.eq_ignore_ascii_case("daily") {
-        let folder = read_daily_note_folder_backend(backend.as_ref())
-            .await
-            .unwrap_or_else(|| "Daily Notes".to_string());
-        let rel = format!(
-            "{}/{}.md",
-            folder.trim_matches('/'),
-            chrono::Local::now().format("%Y-%m-%d")
-        );
+        let rel = daily_note_rel(backend).await;
         if !allow_create_daily && !backend.exists(&rel).await.unwrap_or(false) {
             return Err(ToolError::retryable("today's daily note does not exist"));
         }
@@ -141,7 +160,7 @@ pub async fn resolve_rel<R: tauri::Runtime + 'static>(
     if backend.exists(&rel).await.unwrap_or(false) {
         return Ok(rel);
     }
-    if let Some(title_rel) = try_title_lookup_rel(&value, &ctx.app) {
+    if let Some(title_rel) = title_lookup(&value) {
         if backend.exists(&title_rel).await.unwrap_or(false) {
             return Ok(title_rel);
         }
@@ -588,19 +607,36 @@ pub async fn ensure_daily_note<R: tauri::Runtime + 'static>(
         .current()
         .await
         .ok_or_else(|| ToolError::fatal("no roost open"))?;
-    let folder = read_daily_note_folder_backend(backend.as_ref())
-        .await
-        .unwrap_or_else(|| "Daily Notes".to_string());
-    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
-    let rel = format!("{}/{today}.md", folder.trim_end_matches('/'));
+    // Same rel `resolve_rel("daily")` returns (one helper, so the file this
+    // bootstraps is the file the task is then written to).
+    let rel = daily_note_rel(backend.as_ref()).await;
     if backend.exists(&rel).await.unwrap_or(false) {
         return Ok(rel);
     }
+    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
     let initial = format!("# {today}\n\n## Tasks\n\n");
-    crate::commands::files::create_roost_note_synced(&ctx.app, &rel, &initial)
+    // AT-1: the bootstrap is itself an agent write — it goes through the
+    // write gate, so a blocked daily folder is refused BEFORE the stub
+    // note is created, not only when the task line is appended.
+    super::write_gate::create_note(ctx, &rel, &initial)
         .await
-        .map_err(|e| ToolError::retryable(format!("create daily note: {e}")))?;
+        .map_err(|e| ToolError {
+            message: format!("create daily note: {}", e.message),
+            fatal: e.fatal,
+        })?;
     Ok(rel)
+}
+
+/// Roost-relative path of today's daily note in the configured folder.
+async fn daily_note_rel(backend: &dyn crate::roostfs::RoostFs) -> String {
+    let folder = read_daily_note_folder_backend(backend)
+        .await
+        .unwrap_or_else(|| "Daily Notes".to_string());
+    format!(
+        "{}/{}.md",
+        folder.trim_matches('/'),
+        chrono::Local::now().format("%Y-%m-%d")
+    )
 }
 
 #[cfg(test)]

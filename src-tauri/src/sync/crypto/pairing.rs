@@ -559,9 +559,12 @@ pub const ENROLLMENT_WINDOW: std::time::Duration = std::time::Duration::from_sec
 /// sources. The per-source [`KeyedPairingRateLimiter`] is defeated by an
 /// attacker who mints a fresh iroh NodeId per guess (each gets an always-empty
 /// per-key bucket); this counter is keyed on nothing, so fresh-NodeId spraying
-/// trips a hard lockout regardless. Scoped to the open window so it can never
-/// deny pairing permanently — closing/reopening the window (a fresh "Show
-/// code") resets it. 10 is generous for PIN typos from a legitimate device
+/// trips a hard lockout regardless. Scoped to ONE window lifetime so it can
+/// never deny pairing permanently: once the window has closed or expired, the
+/// next explicit pairing action starts a fresh window with a fresh budget.
+/// Re-opening a window that is STILL open only extends its deadline and keeps
+/// the count (SY-1, 2026-11-12) — otherwise every re-open call handed out a
+/// fresh guess budget. 10 is generous for PIN typos from a legitimate device
 /// (which hits the gentler per-key exponential backoff first).
 pub const GLOBAL_FIRST_PAIR_CAP: u32 = 10;
 
@@ -599,10 +602,49 @@ impl EnrollmentWindow {
         Self::default()
     }
 
-    /// Open (or extend) the window for `dur` and clear the global failure
-    /// counter. Called when the user takes an explicit pairing action.
+    /// Open the window for `dur`, or extend a window that is still open.
+    /// Called when the user takes an explicit pairing action (after the
+    /// native confirmation — see `commands/sync.rs`).
+    ///
+    /// Counter rule (SY-1): the global failure counter is reset ONLY when a
+    /// fresh window starts (the previous one was never opened, was closed, or
+    /// expired). Re-opening a window that is still open extends the deadline
+    /// and KEEPS the count, including a tripped lock — so repeating the
+    /// pairing action (or a hijacked renderer looping the command) cannot
+    /// hand out a fresh guess budget mid-window. Consequence for a locked
+    /// window: it stays locked until it has not been re-opened for `dur`.
+    ///
+    /// No extra cool-off after `close()`: `close()` is only called from
+    /// `SyncEngine::stop()`, and a stopped engine is never re-driven (the next
+    /// `sync_init` builds a new engine with a new window), so a close→open
+    /// sequence on the same window object does not happen in production.
     pub fn open(&mut self, dur: std::time::Duration) {
-        self.open_until = Some(std::time::Instant::now() + dur);
+        let new_deadline = std::time::Instant::now() + dur;
+        if self.is_open() {
+            // Extend only; never shorten an open window, never reset the count.
+            if let Some(current) = self.open_until {
+                if new_deadline > current {
+                    self.open_until = Some(new_deadline);
+                }
+            }
+        } else {
+            self.open_until = Some(new_deadline);
+            self.global_failures = 0;
+        }
+    }
+
+    /// Open (or extend) the window AFTER the user answered a native dialog
+    /// asking for exactly this pairing action, and start a fresh guess budget.
+    ///
+    /// [`Self::open`] deliberately never resets the failure count of a window
+    /// that is still open, so a looping unconfirmed caller cannot hand out
+    /// fresh guesses (SY-1). A real human "yes" is different: without a reset,
+    /// an attacker who burns the 10-guess cap would lock the legitimate user
+    /// out — every approved "Show code" would only extend a window that
+    /// rejects everyone (SA-4). Only code that has just received that answer
+    /// may call this (`tests/sync_invariants.rs` ratchets the call sites).
+    pub fn open_after_confirm(&mut self, dur: std::time::Duration) {
+        self.open(dur);
         self.global_failures = 0;
     }
 
@@ -876,10 +918,15 @@ mod tests {
         assert_eq!(with.as_slice(), first_pair_key(&pin, Some(&sec)).as_slice());
     }
 
+    // SY-1 (2026-11-12): this used to be `enrollment_window_reopen_resets_lockout`,
+    // which asserted that re-opening a STILL-OPEN window clears a tripped lock.
+    // That property was the bug: every re-open call handed out a fresh guess
+    // budget, so looping the pairing command defeated the global cap. The
+    // "never deny pairing permanently" goal it protected is kept by the two
+    // tests below: a fresh window after close/expiry gets a fresh budget.
+
     #[test]
-    fn enrollment_window_reopen_resets_lockout() {
-        // Re-opening (a fresh "Show code") must clear a tripped global lock, so
-        // the cap can never deny pairing permanently.
+    fn enrollment_window_reopen_while_open_keeps_lockout() {
         let mut win = EnrollmentWindow::new();
         win.open(std::time::Duration::from_secs(60));
         for _ in 0..GLOBAL_FIRST_PAIR_CAP {
@@ -887,6 +934,119 @@ mod tests {
         }
         assert_eq!(win.check_and_reserve_first_pair(), FirstPairGate::Locked);
         win.open(std::time::Duration::from_secs(60));
+        assert!(win.is_open(), "re-open still extends an open window");
+        assert_eq!(
+            win.check_and_reserve_first_pair(),
+            FirstPairGate::Locked,
+            "re-opening an open window must not hand out a fresh guess budget"
+        );
+        assert_eq!(win.failure_count(), GLOBAL_FIRST_PAIR_CAP);
+    }
+
+    #[test]
+    fn enrollment_window_reopen_while_open_keeps_partial_count() {
+        // Not just the tripped lock: a partial count also survives a re-open,
+        // so N re-opens cannot each grant CAP-1 more guesses.
+        let mut win = EnrollmentWindow::new();
+        win.open(std::time::Duration::from_secs(60));
+        for _ in 0..3 {
+            let _ = win.check_and_reserve_first_pair();
+        }
+        win.open(std::time::Duration::from_secs(60));
+        assert_eq!(win.failure_count(), 3);
+        let mut allowed = 0;
+        while win.check_and_reserve_first_pair() == FirstPairGate::Allow {
+            allowed += 1;
+        }
+        assert_eq!(
+            allowed,
+            GLOBAL_FIRST_PAIR_CAP - 3,
+            "budget is per window lifetime"
+        );
+    }
+
+    #[test]
+    fn enrollment_window_reopen_extends_but_never_shortens() {
+        let mut win = EnrollmentWindow::new();
+        win.open(std::time::Duration::from_secs(600));
+        let long_deadline = win.open_until;
+        win.open(std::time::Duration::from_secs(1));
+        assert_eq!(
+            win.open_until, long_deadline,
+            "a shorter re-open must not shorten"
+        );
+        win.open(std::time::Duration::from_secs(1200));
+        assert!(win.open_until > long_deadline, "a longer re-open extends");
+    }
+
+    #[test]
+    fn enrollment_window_fresh_open_after_expiry_resets_lockout() {
+        // The cap must never deny pairing permanently: once the window has
+        // expired, the next explicit pairing action starts a fresh budget.
+        let mut win = EnrollmentWindow::new();
+        win.open(std::time::Duration::from_secs(60));
+        for _ in 0..GLOBAL_FIRST_PAIR_CAP {
+            let _ = win.check_and_reserve_first_pair();
+        }
+        assert_eq!(win.check_and_reserve_first_pair(), FirstPairGate::Locked);
+        // Simulate expiry without sleeping: a deadline in the past.
+        // (`now` itself already counts as expired: `is_open` is `now < deadline`.)
+        let now = std::time::Instant::now();
+        win.open_until = Some(
+            now.checked_sub(std::time::Duration::from_secs(1))
+                .unwrap_or(now),
+        );
+        assert!(!win.is_open());
+        win.open(std::time::Duration::from_secs(60));
+        assert_eq!(
+            win.failure_count(),
+            0,
+            "a fresh window starts a fresh budget"
+        );
         assert_eq!(win.check_and_reserve_first_pair(), FirstPairGate::Allow);
+    }
+
+    #[test]
+    fn enrollment_window_fresh_open_after_close_resets_lockout() {
+        let mut win = EnrollmentWindow::new();
+        win.open(std::time::Duration::from_secs(60));
+        for _ in 0..GLOBAL_FIRST_PAIR_CAP {
+            let _ = win.check_and_reserve_first_pair();
+        }
+        win.close();
+        assert!(!win.is_open());
+        win.open(std::time::Duration::from_secs(60));
+        assert_eq!(win.check_and_reserve_first_pair(), FirstPairGate::Allow);
+    }
+
+    /// SA-4: `open_after_confirm` is for code that JUST got a human "yes". An
+    /// attacker who burned the cap on a still-open window must not be able to
+    /// lock the real user out: the user's approved pairing starts fresh.
+    #[test]
+    fn enrollment_window_open_after_confirm_clears_a_tripped_lock() {
+        let mut win = EnrollmentWindow::new();
+        win.open(std::time::Duration::from_secs(60));
+        for _ in 0..GLOBAL_FIRST_PAIR_CAP {
+            let _ = win.check_and_reserve_first_pair();
+        }
+        assert_eq!(win.check_and_reserve_first_pair(), FirstPairGate::Locked);
+        win.open_after_confirm(std::time::Duration::from_secs(60));
+        assert!(win.is_open());
+        assert_eq!(win.failure_count(), 0);
+        assert_eq!(win.check_and_reserve_first_pair(), FirstPairGate::Allow);
+    }
+
+    /// The plain `open` stays non-resetting even though `open_after_confirm`
+    /// exists — the two must not drift together (SY-1 vs SA-4).
+    #[test]
+    fn enrollment_window_open_after_confirm_never_shortens_an_open_window() {
+        let mut win = EnrollmentWindow::new();
+        win.open(std::time::Duration::from_secs(300));
+        win.open_after_confirm(std::time::Duration::from_secs(1));
+        assert!(win.is_open());
+        // Still open well beyond the 1 s the confirm asked for.
+        assert!(win.open_until.is_some_and(|d| {
+            d > std::time::Instant::now() + std::time::Duration::from_secs(200)
+        }));
     }
 }

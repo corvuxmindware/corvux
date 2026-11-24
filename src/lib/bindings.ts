@@ -616,6 +616,10 @@ export const commands = {
 	 * 
 	 *  `api_key` is optional — supplied only when the user fronts Ollama
 	 *  with an auth proxy. Localhost setups leave it `None`.
+	 * 
+	 *  Same policy as `list_ollama_models` (review AK-1): desktop only; the address
+	 *  is validated like `save_settings`; an internet host that is not the saved
+	 *  server needs the user's native confirmation; redirects are not followed.
 	 */
 	testOllamaConnection: (baseUrl: string, apiKey: string | null) => typedError<ConnectionTestResult, string>(__TAURI_INVOKE("test_ollama_connection", { baseUrl, apiKey })),
 	/**
@@ -798,6 +802,10 @@ export const commands = {
 	 *  Initialize the engine for an already-opened roost. Loads or generates
 	 *  the device identity + TLS cert, creates the stores, but does NOT start
 	 *  listening. Call `sync_start_listening` to accept inbound connections.
+	 * 
+	 *  RF-1: `roost_path` comes from the renderer, so `sync_init_inner` refuses
+	 *  it unless it is the roost `open_roost` (and its R2 first-open dialog)
+	 *  installed — see [`check_sync_roost_backend`].
 	 */
 	syncInit: (roostPath: string, deviceName: string) => typedError<SyncStatus, string>(__TAURI_INVOKE("sync_init", { roostPath, deviceName })),
 	/**

@@ -152,9 +152,35 @@ pub struct ToolContext<R: Runtime + 'static = Wry> {
     /// this Arc into the child loop's `cancel` argument so both
     /// loops poll the same atomic.
     pub cancel: Option<Arc<AtomicBool>>,
+    /// The `agent_blocked_paths` snapshot every agent write is checked
+    /// against (AT-1/AT-4, `super::write_gate`). Constructors set `None`;
+    /// only the agent loop's `dispatch_one` arms it, per tool call, from the
+    /// loop's autonomy snapshot. A write tool run on an unarmed context is
+    /// refused (fail closed), so no path can execute a write unchecked.
+    pub write_gate: Option<super::write_gate::WriteGate>,
 }
 
 impl<R: Runtime + 'static> ToolContext<R> {
+    /// A copy of this context with the write gate armed for one tool call.
+    /// (Field-by-field: `#[derive(Clone)]` would require `R: Clone`.)
+    pub fn with_write_gate(&self, gate: super::write_gate::WriteGate) -> Self {
+        Self {
+            app: self.app.clone(),
+            roost_path: self.roost_path.clone(),
+            roost_generation: self.roost_generation,
+            open_note_path: self.open_note_path.clone(),
+            skill_registry: self.skill_registry.clone(),
+            subagent_depth: self.subagent_depth,
+            parent_registry: self.parent_registry.clone(),
+            subagent_registry: self.subagent_registry.clone(),
+            parent_chat_provider: self.parent_chat_provider.clone(),
+            parent_budget: self.parent_budget,
+            parent_autonomy: self.parent_autonomy.clone(),
+            cancel: self.cancel.clone(),
+            write_gate: Some(gate),
+        }
+    }
+
     pub fn require_roost(&self, tool: &str) -> Result<&str, ToolError> {
         let roost = self
             .roost_path

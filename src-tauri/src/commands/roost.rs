@@ -73,14 +73,39 @@ enum ScopeResume {
 const ROOST_OPEN_DECLINED: &str = "ROOST_OPEN_DECLINED";
 
 /// Cap on the confirmed-roots record. Every entry past the first required a
-/// human click in a native dialog, so the list cannot be flooded silently;
-/// the cap just keeps the file bounded.
+/// human click in a native dialog (or was created by the backend itself, or
+/// seeded once from the pre-upgrade manifest), so the list cannot be flooded
+/// silently; the cap just keeps the file bounded. Removing a roost in Manage
+/// Roosts revokes its entry ([`revoke_confirmed_roots`]), which frees a slot.
 const MAX_CONFIRMED_ROOTS: usize = 256;
 
-/// Serializes the confirmed-roots read-modify-write (R2). The dialog is
-/// deliberately NOT held under this lane — a dialog left open must not
-/// block other roost work.
-static CONFIRMED_ROOTS_WRITE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+/// Serializes every confirmed-roots read-modify-write (R2): record, revoke and
+/// the one-time seed. A plain `std` mutex, held only around synchronous file
+/// work and NEVER across an `.await` — the dialog is deliberately not held
+/// under this lane (a dialog left open must not block other roost work), and
+/// the sync commands that create app-owned roots can take it too.
+static CONFIRMED_ROOTS_WRITE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Roots confirmed in THIS run whose record could not be written (disk full,
+/// read-only app-data, cap reached for an app-created root). Without this, a
+/// failed save made every later `open_roost` — which also runs on every focus
+/// and tree refresh — ask again. Memory only, on purpose: across a restart the
+/// root is unconfirmed again (fail closed), never trusted from a record that
+/// was never written.
+static SESSION_CONFIRMED_ROOTS: std::sync::Mutex<std::collections::BTreeSet<String>> =
+    std::sync::Mutex::new(std::collections::BTreeSet::new());
+
+/// RF-3: written once, the first time this build starts, BEFORE the seed below
+/// copies anything — so the seed can never run a second time, even if writing
+/// `confirmed_roost_roots.json` fails or the file is later deleted.
+const CONFIRMED_ROOTS_SEED_MARKER: &str = "confirmed_roost_roots.seeded";
+
+/// Poison-tolerant lock: both mutexes guard plain data whose file side is
+/// written atomically (tmp + rename), so a panic elsewhere cannot leave it
+/// half-updated, and a poisoned lock must not brick every roost open.
+fn lock_or_recover<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 
 /// Backend-owned record of roost roots the user confirmed in a native
 /// dialog (`app_data_dir/confirmed_roost_roots.json`) — sharp-edges R2.
@@ -109,9 +134,147 @@ fn save_confirmed_roots(
     roots: &std::collections::BTreeSet<String>,
 ) -> Result<(), String> {
     let json = serde_json::to_string_pretty(roots).map_err(|e| e.to_string())?;
-    let tmp = dir.join("confirmed_roost_roots.json.tmp");
-    fs::write(&tmp, json.as_bytes()).map_err(|e| format!("write confirmed roots: {e}"))?;
-    fs::rename(&tmp, confirmed_roots_file(dir)).map_err(|e| format!("rename confirmed roots: {e}"))
+    write_app_data_atomic(dir, "confirmed_roost_roots.json", json.as_bytes())
+}
+
+/// tmp + rename write of a small backend-owned record in app-data (never a
+/// roost path). Shared by the confirmed-roots record and its seed marker.
+fn write_app_data_atomic(dir: &Path, name: &str, bytes: &[u8]) -> Result<(), String> {
+    let tmp = dir.join(format!("{name}.tmp"));
+    fs::write(&tmp, bytes).map_err(|e| format!("write {name}: {e}"))?;
+    fs::rename(&tmp, dir.join(name)).map_err(|e| format!("rename {name}: {e}"))
+}
+
+/// Every root confirmed so far: the persisted record plus this run's
+/// confirmations that could not be persisted ([`SESSION_CONFIRMED_ROOTS`]).
+pub(crate) fn confirmed_roots_now(dir: &Path) -> std::collections::BTreeSet<String> {
+    let mut roots = load_confirmed_roots(dir);
+    roots.extend(lock_or_recover(&SESSION_CONFIRMED_ROOTS).iter().cloned());
+    roots
+}
+
+/// Add `root` to the confirmed record. The caller MUST hold
+/// [`CONFIRMED_ROOTS_WRITE`]. A failed write is remembered for this run only
+/// (see [`SESSION_CONFIRMED_ROOTS`]) and is not an error. `Err` only when the
+/// record is full.
+fn record_confirmed_root_locked(dir: &Path, root: &str) -> Result<(), String> {
+    let key = crate::paths::normalize_key(root);
+    let mut roots = load_confirmed_roots(dir);
+    if roots.contains(&key) {
+        return Ok(());
+    }
+    if roots.len() >= MAX_CONFIRMED_ROOTS {
+        return Err(format!(
+            "Corvux already remembers {MAX_CONFIRMED_ROOTS} roost folders, the most it keeps. \
+             Remove a roost you no longer use in Manage Roosts, then open this folder again."
+        ));
+    }
+    roots.insert(key.clone());
+    if let Err(e) = save_confirmed_roots(dir, &roots) {
+        tracing::warn!(error = %e, "roost: saving the confirmed-roots record failed — remembered for this run only; the next app start asks again");
+        lock_or_recover(&SESSION_CONFIRMED_ROOTS).insert(key);
+    }
+    Ok(())
+}
+
+/// RF-3: a root the BACKEND itself just created under app-data
+/// (`init_default_roost`, `create_named_roost`, both with a sanitized name) is
+/// confirmed without a dialog — the user asked for a new, empty Corvux folder,
+/// not access to an existing one. Never fails the creation: if the record is
+/// full it is remembered for this run only.
+fn confirm_app_created_root(dir: &Path, root: &Path) {
+    let root = root.to_string_lossy();
+    let _lane = lock_or_recover(&CONFIRMED_ROOTS_WRITE);
+    if let Err(e) = record_confirmed_root_locked(dir, &root) {
+        tracing::warn!(error = %e, "roost: app-created root not recorded — remembered for this run only");
+        lock_or_recover(&SESSION_CONFIRMED_ROOTS).insert(crate::paths::normalize_key(&root));
+    }
+}
+
+/// RF-3: forget roots the user removed from the roost list through the
+/// confirmed removal flow (F10). Opening such a folder again asks again, and
+/// the slot in the capped record is freed. Best effort: if the record cannot
+/// be rewritten, the entry stays in the file (it was already trusted) and a
+/// warning is logged.
+fn revoke_confirmed_roots(dir: &Path, removed: &[String]) {
+    if removed.is_empty() {
+        return;
+    }
+    let keys: std::collections::BTreeSet<String> = removed
+        .iter()
+        .map(|p| crate::paths::normalize_key(p))
+        .collect();
+    let _lane = lock_or_recover(&CONFIRMED_ROOTS_WRITE);
+    lock_or_recover(&SESSION_CONFIRMED_ROOTS).retain(|k| !keys.contains(k));
+    let mut roots = load_confirmed_roots(dir);
+    let before = roots.len();
+    roots.retain(|k| !keys.contains(k));
+    if roots.len() != before {
+        if let Err(e) = save_confirmed_roots(dir, &roots) {
+            tracing::warn!(error = %e, "roost: revoking a removed roost's first-open confirmation failed");
+        }
+    }
+}
+
+/// What the one-time upgrade seed did.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum RootSeed {
+    /// The record or the marker already existed: nothing was read or written.
+    AlreadyDone,
+    /// First run of this build: the marker was written and this many roots
+    /// from the pre-upgrade manifest were recorded as confirmed.
+    Seeded(usize),
+}
+
+/// RF-3 (migration): on the FIRST start of a build that has the R2 first-open
+/// gate, treat the roosts the user already had as confirmed, so upgrading does
+/// not ask "Open this folder as a roost?" for every roost they already use.
+///
+/// MUST run from trusted startup code before the main window (and so the
+/// webview) exists — `lib.rs` setup does — so `roosts.json` here can only hold
+/// what earlier runs wrote. Runs only when neither `confirmed_roost_roots.json`
+/// nor the seed marker exists, and writes the marker FIRST: if the marker
+/// cannot be written nothing is seeded (the gate then asks — fail closed), and
+/// once it exists no later start ever seeds again, so a path a hijacked
+/// webview adds to `roosts.json` afterwards still needs the native dialog.
+///
+/// Accepted trust-on-first-use limit: older builds had no first-open gate, so
+/// whatever `roosts.json` listed before this upgrade is trusted as-is. A
+/// renderer compromised under an OLD build could have listed any folder
+/// there; nothing at upgrade time can tell that apart from a real roost.
+/// There is no backend-side active-roost record to seed from (the active roost
+/// lives in the webview's localStorage); every roost the app opened is in
+/// `roosts.json`, because the registry mirrors there on every open (MR-B1).
+pub(crate) fn seed_confirmed_roots_once(dir: &Path) -> Result<RootSeed, String> {
+    let _lane = lock_or_recover(&CONFIRMED_ROOTS_WRITE);
+    if confirmed_roots_file(dir).exists() || dir.join(CONFIRMED_ROOTS_SEED_MARKER).exists() {
+        return Ok(RootSeed::AlreadyDone);
+    }
+    write_app_data_atomic(
+        dir,
+        CONFIRMED_ROOTS_SEED_MARKER,
+        b"confirmed_roost_roots seeded from the pre-upgrade roosts.json\n",
+    )?;
+    let listed = match read_manifest_file(dir.join("roosts.json")) {
+        Ok(Some(text)) => manifest_paths_checked(&text).unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "roost: pre-upgrade manifest invalid — nothing seeded");
+            Vec::new()
+        }),
+        Ok(None) => Vec::new(),
+        Err(e) => {
+            tracing::warn!(error = %e, "roost: pre-upgrade manifest unreadable — nothing seeded");
+            Vec::new()
+        }
+    };
+    let mut roots = std::collections::BTreeSet::new();
+    for p in &listed {
+        if roots.len() >= MAX_CONFIRMED_ROOTS {
+            break;
+        }
+        roots.insert(crate::paths::normalize_key(p));
+    }
+    save_confirmed_roots(dir, &roots)?;
+    Ok(RootSeed::Seeded(roots.len()))
 }
 
 /// The R2 gate decision, without I/O or dialog: does opening this path need
@@ -128,20 +291,73 @@ fn roost_open_needs_confirm(
 /// Ask the human (R2): opening `effective_path` as a roost hands Corvux
 /// read/write access to everything inside it. `true` = allow and the caller
 /// persists the root as confirmed.
+///
+/// Worded for the case the user did not start (a hijacked webview): it names
+/// the folder, says plainly what "Open roost" grants, and tells them what to
+/// do if the folder is unexpected — without blaming a normal user.
 async fn authorize_roost_open(
     effective_path: &str,
     confirm: &(impl super::native_confirm::NativeConfirm + ?Sized),
 ) -> bool {
     let shown = super::native_confirm::dialog_safe(effective_path, 200);
     let body = format!(
-        "Corvux will read and write every file inside this folder:\n\n{shown}\n\n\
-         Notes, search, sync, and the AI agent will be able to see and change \
-         its contents.\n\nIf you did not just choose this folder in Corvux, \
-         choose Cancel."
+        "Corvux wants to open this folder as a roost:\n\n{shown}\n\n\
+         If you choose Open roost, Corvux can read and change every file in \
+         this folder, including through search, sync and the AI assistant. \
+         Corvux asks only once for each folder.\n\n\
+         If you don't recognize this folder, choose Cancel. Nothing is opened \
+         or changed."
     );
     confirm
-        .confirm("Open this folder as a roost?", &body, "Open roost")
+        .confirm("Open this folder in Corvux?", &body, "Open roost")
         .await
+}
+
+/// The whole R2 gate for one `open_roost`. `Ok(())` = may open. A root not yet
+/// confirmed (record or this run's memory) is first checked to be an existing
+/// directory — so a typo or a missing drive is reported plainly instead of
+/// asking a question about a folder that is not there — then needs a "yes" in
+/// the native dialog, after which it is recorded under the lane.
+async fn gate_roost_open(
+    dir: &Path,
+    effective_path: &str,
+    confirm: &(impl super::native_confirm::NativeConfirm + ?Sized),
+) -> Result<(), String> {
+    if !roost_open_needs_confirm(effective_path, &confirmed_roots_now(dir)) {
+        return Ok(());
+    }
+    // (Own line on purpose: the raw-fs ratchet strips `//` as a comment even
+    // inside a string, so a `{` after it on the same line would skew its
+    // brace-depth count and make it miscount test code as production.)
+    let is_saf_uri = effective_path.starts_with("content://");
+    if !is_saf_uri {
+        check_native_root_is_dir(effective_path)?;
+    }
+    if !authorize_roost_open(effective_path, confirm).await {
+        tracing::warn!(target_path = %effective_path, "roost_open: first-open declined");
+        return Err(ROOST_OPEN_DECLINED.to_string());
+    }
+    let _lane = lock_or_recover(&CONFIRMED_ROOTS_WRITE);
+    record_confirmed_root_locked(dir, effective_path)
+}
+
+/// A native roost root must be an existing directory. Shared by the R2 gate
+/// (checked before the dialog) and `open_roost_impl` (checked again before
+/// anything is installed).
+fn check_native_root_is_dir(path: &str) -> Result<(), String> {
+    let dir = Path::new(path);
+    if dir.is_dir() {
+        return Ok(());
+    }
+    let meta = std::fs::symlink_metadata(dir);
+    let detail = match meta {
+        Ok(m) if m.file_type().is_file() => "exists as a file, not a directory",
+        Ok(m) if m.file_type().is_symlink() => "is a symlink",
+        Ok(_) => "exists but is not a directory",
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => "does not exist",
+        Err(e) => return Err(format!("stat failed for {}: {}", path, e)),
+    };
+    Err(format!("Roost path {}: {}", detail, path))
 }
 
 #[tauri::command]
@@ -188,35 +404,20 @@ pub async fn open_roost(
     // dialog the webview cannot click; confirmed roots open silently. The
     // confirmed set lives backend-side (`confirmed_roost_roots.json`),
     // because the webview-writable `roosts.json` cannot be the trust
-    // anchor (F10 confirms removals only).
+    // anchor (F10 confirms removals only). Roosts that existed before the
+    // upgrade were seeded once at startup, and app-created roots were
+    // recorded when the backend made them (RF-3) — see `gate_roost_open`.
     {
         let dir = app
             .path()
             .app_data_dir()
             .map_err(|e| format!("app_data_dir: {e}"))?;
-        if roost_open_needs_confirm(&effective_path, &load_confirmed_roots(&dir)) {
-            if !authorize_roost_open(
-                &effective_path,
-                &super::native_confirm::OsDialog(app.clone()),
-            )
-            .await
-            {
-                tracing::warn!(target_path = %effective_path, "roost_open: first-open declined");
-                return Err(ROOST_OPEN_DECLINED.to_string());
-            }
-            let key = crate::paths::normalize_key(&effective_path);
-            let _lane = CONFIRMED_ROOTS_WRITE.lock().await;
-            let mut roots = load_confirmed_roots(&dir);
-            if roots.len() >= MAX_CONFIRMED_ROOTS && !roots.contains(&key) {
-                return Err(format!(
-                    "Too many confirmed roost roots (limit {MAX_CONFIRMED_ROOTS}); remove a roost first."
-                ));
-            }
-            roots.insert(key);
-            if let Err(e) = save_confirmed_roots(&dir, &roots) {
-                tracing::warn!(error = %e, "roost_open: persisting confirmed root failed — the open proceeds but the next open will confirm again");
-            }
-        }
+        gate_roost_open(
+            &dir,
+            &effective_path,
+            &super::native_confirm::OsDialog(app.clone()),
+        )
+        .await?;
     }
 
     let result = open_roost_impl(effective_path.clone(), display_name, app, &state).await;
@@ -402,18 +603,8 @@ async fn open_roost_impl(
         }
     }
 
+    check_native_root_is_dir(&path)?;
     let dir = PathBuf::from(&path);
-    if !dir.is_dir() {
-        let meta = std::fs::symlink_metadata(&dir);
-        let detail = match meta {
-            Ok(m) if m.file_type().is_file() => "exists as a file, not a directory",
-            Ok(m) if m.file_type().is_symlink() => "is a symlink",
-            Ok(_) => "exists but is not a directory",
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => "does not exist",
-            Err(e) => return Err(format!("stat failed for {}: {}", path, e)),
-        };
-        return Err(format!("Roost path {}: {}", detail, path));
-    }
     // Best-effort: ensure a Syncthing ignore file exists so device-local
     // DB/index files under `.corvux/` never propagate via folder sync.
     // Silent on failure — a read-only roost is still openable.
@@ -771,6 +962,10 @@ pub fn init_default_roost(app: tauri::AppHandle) -> Result<String, String> {
         fs::write(&welcome, body).map_err(|e| format!("Failed to create welcome note: {e}"))?;
     }
 
+    // RF-3: the backend chose this folder (fixed name under app-data), so
+    // opening it must not ask "Open this folder as a roost?".
+    confirm_app_created_root(&data_dir, &roost);
+
     Ok(roost.to_string_lossy().to_string())
 }
 
@@ -815,6 +1010,10 @@ pub fn create_named_roost(name: String, app: tauri::AppHandle) -> Result<String,
         return Err(format!("A roost named '{}' already exists", slug));
     }
     fs::create_dir_all(&roost).map_err(|e| format!("Failed to create roost directory: {e}"))?;
+
+    // RF-3: the backend just created this empty folder under app-data from a
+    // sanitized slug, so opening it must not ask "Open this folder as a roost?".
+    confirm_app_created_root(&data_dir, &roost);
 
     Ok(roost.to_string_lossy().to_string())
 }
@@ -879,6 +1078,16 @@ pub async fn write_roost_manifest(app: tauri::AppHandle, json: String) -> Result
     let tmp = dir.join("roosts.json.tmp");
     fs::write(&tmp, json.as_bytes()).map_err(|e| format!("write manifest tmp: {e}"))?;
     fs::rename(&tmp, &path).map_err(|e| format!("rename manifest: {e}"))?;
+
+    // RF-3: a roost the user removed (the removal was authorized above) loses
+    // its first-open confirmation too — re-adding that folder later asks again,
+    // and its slot in the capped confirmed-roots record is freed.
+    if let PrevManifest::Listed(prev_paths) = &prev {
+        revoke_confirmed_roots(
+            &dir,
+            &unconfirmed_removals(prev_paths, &next, &Default::default()),
+        );
+    }
 
     // A confirmed removal is single-use: once the manifest no longer lists the
     // roost, the confirmation is spent, so removing it again after a later
@@ -1869,5 +2078,317 @@ mod roost_root_gate_tests {
         let denied = Scripted::deny();
         assert!(!authorize_roost_open("/home/me/notes", &denied).await);
         assert_eq!(denied.times_asked(), 1);
+    }
+}
+
+/// RF-3: the R2 first-open gate must not ask upgraders about roosts they
+/// already use, nor about folders the app itself created — while a folder
+/// added to the webview-writable manifest AFTER the one-time seed still asks.
+/// Each test uses its own temp dirs as roots, so the process-wide session
+/// memory cannot leak between tests.
+#[cfg(test)]
+mod rf3_migration_tests {
+    use super::super::native_confirm::test_support::Scripted;
+    use super::super::native_confirm::NativeConfirm;
+    use super::*;
+    use tempfile::TempDir;
+
+    fn s(p: &Path) -> String {
+        p.to_string_lossy().to_string()
+    }
+
+    fn write_manifest(app_data: &Path, roots: &[String]) {
+        let entries: Vec<serde_json::Value> = roots
+            .iter()
+            .map(|p| serde_json::json!({ "id": "v_x", "path": p, "displayName": "x" }))
+            .collect();
+        std::fs::write(
+            app_data.join("roosts.json"),
+            serde_json::to_string(&entries).unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn seeding_happens_once_and_only_when_the_record_is_absent() {
+        let app_data = TempDir::new().unwrap();
+        let (a, b, later) = (
+            TempDir::new().unwrap(),
+            TempDir::new().unwrap(),
+            TempDir::new().unwrap(),
+        );
+        write_manifest(app_data.path(), &[s(a.path()), s(b.path())]);
+
+        assert_eq!(
+            seed_confirmed_roots_once(app_data.path()).unwrap(),
+            RootSeed::Seeded(2)
+        );
+        let seeded = load_confirmed_roots(app_data.path());
+        assert!(!roost_open_needs_confirm(&s(a.path()), &seeded));
+        assert!(!roost_open_needs_confirm(&s(b.path()), &seeded));
+        assert!(app_data.path().join(CONFIRMED_ROOTS_SEED_MARKER).exists());
+
+        // A path a (hijacked) webview lists afterwards is never seeded.
+        write_manifest(
+            app_data.path(),
+            &[s(a.path()), s(b.path()), s(later.path())],
+        );
+        assert_eq!(
+            seed_confirmed_roots_once(app_data.path()).unwrap(),
+            RootSeed::AlreadyDone
+        );
+        // …not even if the record itself is deleted: the marker blocks it.
+        std::fs::remove_file(confirmed_roots_file(app_data.path())).unwrap();
+        assert_eq!(
+            seed_confirmed_roots_once(app_data.path()).unwrap(),
+            RootSeed::AlreadyDone
+        );
+        assert!(roost_open_needs_confirm(
+            &s(later.path()),
+            &load_confirmed_roots(app_data.path())
+        ));
+    }
+
+    #[test]
+    fn an_existing_record_without_a_marker_is_left_alone() {
+        // A user who already answered dialogs on a build with the gate.
+        let app_data = TempDir::new().unwrap();
+        let (kept, listed) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+        let mut roots = std::collections::BTreeSet::new();
+        roots.insert(crate::paths::normalize_key(&s(kept.path())));
+        save_confirmed_roots(app_data.path(), &roots).unwrap();
+        write_manifest(app_data.path(), &[s(listed.path())]);
+
+        assert_eq!(
+            seed_confirmed_roots_once(app_data.path()).unwrap(),
+            RootSeed::AlreadyDone
+        );
+        assert_eq!(load_confirmed_roots(app_data.path()), roots);
+    }
+
+    #[test]
+    fn a_fresh_install_seeds_nothing_but_still_writes_the_marker() {
+        let app_data = TempDir::new().unwrap();
+        assert_eq!(
+            seed_confirmed_roots_once(app_data.path()).unwrap(),
+            RootSeed::Seeded(0)
+        );
+        // The webview writes roosts.json during this first run; the next
+        // start must not seed it.
+        let r = TempDir::new().unwrap();
+        write_manifest(app_data.path(), &[s(r.path())]);
+        assert_eq!(
+            seed_confirmed_roots_once(app_data.path()).unwrap(),
+            RootSeed::AlreadyDone
+        );
+        assert!(roost_open_needs_confirm(
+            &s(r.path()),
+            &load_confirmed_roots(app_data.path())
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_seeded_root_opens_without_the_dialog() {
+        let app_data = TempDir::new().unwrap();
+        let root = TempDir::new().unwrap();
+        write_manifest(app_data.path(), &[s(root.path())]);
+        seed_confirmed_roots_once(app_data.path()).unwrap();
+
+        let dialog = Scripted::deny(); // would refuse if asked — it must not be
+        gate_roost_open(app_data.path(), &s(root.path()), &dialog)
+            .await
+            .unwrap();
+        assert_eq!(dialog.times_asked(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_root_added_to_the_manifest_after_seeding_still_asks() {
+        let app_data = TempDir::new().unwrap();
+        let (old, added) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+        write_manifest(app_data.path(), &[s(old.path())]);
+        seed_confirmed_roots_once(app_data.path()).unwrap();
+        write_manifest(app_data.path(), &[s(old.path()), s(added.path())]);
+
+        let denied = Scripted::deny();
+        let err = gate_roost_open(app_data.path(), &s(added.path()), &denied)
+            .await
+            .unwrap_err();
+        assert_eq!(err, ROOST_OPEN_DECLINED);
+        assert_eq!(denied.times_asked(), 1);
+
+        let allowed = Scripted::allow();
+        gate_roost_open(app_data.path(), &s(added.path()), &allowed)
+            .await
+            .unwrap();
+        assert_eq!(allowed.times_asked(), 1);
+        assert!(!roost_open_needs_confirm(
+            &s(added.path()),
+            &load_confirmed_roots(app_data.path())
+        ));
+    }
+
+    #[tokio::test]
+    async fn an_app_created_root_is_not_asked_about() {
+        let app_data = TempDir::new().unwrap();
+        let created = app_data.path().join("roosts").join("Work");
+        std::fs::create_dir_all(&created).unwrap();
+        confirm_app_created_root(app_data.path(), &created);
+
+        let dialog = Scripted::deny();
+        gate_roost_open(app_data.path(), &s(&created), &dialog)
+            .await
+            .unwrap();
+        assert_eq!(dialog.times_asked(), 0);
+        assert!(!roost_open_needs_confirm(
+            &s(&created),
+            &load_confirmed_roots(app_data.path())
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_failed_save_does_not_reprompt_in_this_run_but_does_after_a_restart() {
+        // An app-data dir that does not exist: every save fails.
+        let parent = TempDir::new().unwrap();
+        let unwritable = parent.path().join("missing");
+        let root = TempDir::new().unwrap();
+
+        let first = Scripted::allow();
+        gate_roost_open(&unwritable, &s(root.path()), &first)
+            .await
+            .unwrap();
+        assert_eq!(first.times_asked(), 1);
+
+        let again = Scripted::deny();
+        gate_roost_open(&unwritable, &s(root.path()), &again)
+            .await
+            .unwrap();
+        assert_eq!(again.times_asked(), 0, "remembered for this run");
+
+        // Nothing was persisted, so a restart (no session memory) asks again.
+        assert!(roost_open_needs_confirm(
+            &s(root.path()),
+            &load_confirmed_roots(&unwritable)
+        ));
+    }
+
+    #[tokio::test]
+    async fn revoking_a_removed_roost_removes_the_entry_and_asks_again() {
+        let app_data = TempDir::new().unwrap();
+        let (gone, kept) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+        {
+            let _lane = lock_or_recover(&CONFIRMED_ROOTS_WRITE);
+            record_confirmed_root_locked(app_data.path(), &s(gone.path())).unwrap();
+            record_confirmed_root_locked(app_data.path(), &s(kept.path())).unwrap();
+        }
+        revoke_confirmed_roots(app_data.path(), &[s(gone.path())]);
+
+        let roots = load_confirmed_roots(app_data.path());
+        assert!(roost_open_needs_confirm(&s(gone.path()), &roots));
+        assert!(!roost_open_needs_confirm(&s(kept.path()), &roots));
+
+        let dialog = Scripted::deny();
+        assert!(gate_roost_open(app_data.path(), &s(gone.path()), &dialog)
+            .await
+            .is_err());
+        assert_eq!(dialog.times_asked(), 1);
+    }
+
+    #[test]
+    fn a_full_record_says_how_to_free_a_slot() {
+        let app_data = TempDir::new().unwrap();
+        let full: std::collections::BTreeSet<String> = (0..MAX_CONFIRMED_ROOTS)
+            .map(|i| format!("/r/{i}"))
+            .collect();
+        save_confirmed_roots(app_data.path(), &full).unwrap();
+        let _lane = lock_or_recover(&CONFIRMED_ROOTS_WRITE);
+        let err = record_confirmed_root_locked(app_data.path(), "/r/new").unwrap_err();
+        assert!(err.contains("Manage Roosts"), "{err}");
+        // An already-recorded root is not refused by the cap.
+        record_confirmed_root_locked(app_data.path(), "/r/0").unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_missing_folder_is_reported_before_any_dialog() {
+        let parent = TempDir::new().unwrap();
+        let missing = parent.path().join("not-here");
+        let dialog = Scripted::allow();
+        let err = gate_roost_open(parent.path(), &s(&missing), &dialog)
+            .await
+            .unwrap_err();
+        assert!(err.contains("does not exist"), "{err}");
+        assert_eq!(dialog.times_asked(), 0);
+
+        let file = parent.path().join("note.md");
+        std::fs::write(&file, "x").unwrap();
+        let err = gate_roost_open(parent.path(), &s(&file), &dialog)
+            .await
+            .unwrap_err();
+        assert!(err.contains("not a directory"), "{err}");
+        assert_eq!(dialog.times_asked(), 0);
+    }
+
+    /// Wiring the unit tests above cannot reach (they need an AppHandle): the
+    /// seed must run in startup code BEFORE the main window (and so the
+    /// webview) exists, and both app-root creators must record their root.
+    #[test]
+    fn startup_seed_and_app_created_roots_stay_wired() {
+        let src = |rel: &str| {
+            std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join(rel))
+                .unwrap()
+                .replace("\r\n", "\n")
+        };
+        let lib = src("src/lib.rs");
+        let seed = lib
+            .find("seed_confirmed_roots_once(")
+            .expect("lib.rs setup must call seed_confirmed_roots_once");
+        let window = lib
+            .find("WebviewWindowBuilder::new(app, \"main\"")
+            .expect("main window builder");
+        assert!(
+            seed < window,
+            "the RF-3 seed must run before the webview exists"
+        );
+
+        let roost = src("src/commands/roost.rs");
+        for f in ["fn init_default_roost(", "fn create_named_roost("] {
+            let start = roost.find(f).expect(f);
+            // `\u{7d}` is the closing brace, spelled so the source-scanning
+            // guards' brace counters stay balanced on this line.
+            let end = roost[start..].find("\n\u{7d}\n").expect("fn end");
+            let body = &roost[start..start + end];
+            assert!(
+                body.contains("confirm_app_created_root("),
+                "{f} must confirm the root it creates (RF-3)"
+            );
+        }
+    }
+
+    /// Records the dialog text so its wording can be checked.
+    struct Recording(std::sync::Mutex<Vec<(String, String)>>);
+
+    #[async_trait::async_trait]
+    impl NativeConfirm for Recording {
+        async fn confirm(&self, title: &str, body: &str, _allow_label: &str) -> bool {
+            self.0
+                .lock()
+                .unwrap()
+                .push((title.to_string(), body.to_string()));
+            false
+        }
+    }
+
+    #[tokio::test]
+    async fn the_dialog_names_the_folder_and_says_what_allow_means() {
+        let dialog = Recording(std::sync::Mutex::new(Vec::new()));
+        assert!(!authorize_roost_open("/home/me/Notes", &dialog).await);
+        let asked = dialog.0.lock().unwrap();
+        let (title, body) = &asked[0];
+        assert!(title.contains("Open this folder"), "{title}");
+        assert!(body.contains("/home/me/Notes"), "{body}");
+        assert!(body.contains("read and change every file"), "{body}");
+        assert!(
+            !body.contains("did not just choose"),
+            "must not tell a normal user to cancel a flow they did not start: {body}"
+        );
     }
 }

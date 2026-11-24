@@ -111,21 +111,12 @@ impl Tool for RoostEditTool {
             }
         }
 
-        // Reserved-path guard (parity with roost_write + the MCP): the agent
-        // must not edit Corvux's own internal files even though the note
-        // "exists" — .corvux/ sync identity + settings, dotfiles, etc.
-        if super::roost_write::is_reserved_path(&rel) {
-            return Err(ToolError::fatal(format!(
-                "refusing to edit a reserved path '{rel}'. Corvux's own folders (.corvux, .attachments) and dotfiles are off-limits to the agent."
-            )));
-        }
-
+        // Reserved-path guard + the user's blocklist (AT-1/AT-4): both run in
+        // the write gate on the RESOLVED `rel`, so title / `[[wiki]]` /
+        // extension-less / "daily" spellings are checked as what they become.
         let (before, _, ()) =
-            crate::commands::files::mutate_roost_note_synced(&ctx.app, &rel, |_| {
-                Ok((new_content.to_string(), ()))
-            })
-            .await
-            .map_err(ToolError::retryable)?;
+            super::write_gate::mutate_note(ctx, &rel, |_| Ok((new_content.to_string(), ())))
+                .await?;
         if before == new_content {
             return Ok(json!({
                 "summary": "no changes — new content matches existing content",

@@ -180,10 +180,12 @@ impl Tool for RememberTool {
 
         let fact_for_mutation = fact.clone();
         let category_for_mutation = category.clone();
-        let (_, _, added) = crate::commands::files::mutate_roost_text_synced(
-            &ctx.app,
+        // Through the write gate: `.corvux/memory.md` is one of the two
+        // agent-owned internal files, and the user's blocklist still applies.
+        let (_, _, added) = super::write_gate::mutate_internal(
+            ctx,
             ".corvux/memory.md",
-            true,
+            ToolError::retryable,
             move |existing| {
                 let mut sections = parse_memory(existing);
                 let fact_key = fact_for_mutation.to_lowercase();
@@ -211,8 +213,7 @@ impl Tool for RememberTool {
                 Ok((next, added))
             },
         )
-        .await
-        .map_err(ToolError::retryable)?;
+        .await?;
 
         Ok(json!({
             "summary": if added {
@@ -280,10 +281,10 @@ impl Tool for ForgetTool {
             .to_lowercase();
 
         let pattern_for_mutation = pattern.clone();
-        let (_, _, removed) = crate::commands::files::mutate_roost_text_synced(
-            &ctx.app,
+        let (_, _, removed) = super::write_gate::mutate_internal(
+            ctx,
             ".corvux/memory.md",
-            true,
+            ToolError::retryable,
             move |existing| {
                 let mut sections = parse_memory(existing);
                 let mut removed: Vec<String> = Vec::new();
@@ -306,8 +307,7 @@ impl Tool for ForgetTool {
                 Ok((next, removed))
             },
         )
-        .await
-        .map_err(ToolError::retryable)?;
+        .await?;
 
         if removed.is_empty() {
             return Ok(json!({

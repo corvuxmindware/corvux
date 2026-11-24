@@ -140,26 +140,8 @@ impl Tool for RoostWriteTool {
             }
         }
 
-        let safe_title: String = title
-            .chars()
-            .map(|c| {
-                if matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|') {
-                    '-'
-                } else {
-                    c
-                }
-            })
-            .collect();
-
+        let rel = planned_rel(&args)?;
         let folder = folder.as_deref().unwrap_or("");
-        if folder.contains("..") {
-            return Err(ToolError::fatal("folder cannot contain '..'"));
-        }
-        let rel = if folder.is_empty() {
-            format!("{safe_title}.md")
-        } else {
-            format!("{}/{safe_title}.md", folder.trim_matches('/'))
-        };
         let mut content = String::new();
         let now = chrono_date_iso();
         content.push_str("---\n");
@@ -182,14 +164,10 @@ impl Tool for RoostWriteTool {
         // AUDIT-033 / PR-C: route through the single write+notify funnel so the
         // new note is announced to sync (and refreshes the tree) even on
         // Android SAF, where there is no file watcher to catch the write.
-        if is_reserved_path(&rel) {
-            return Err(ToolError::fatal(format!(
-                "refusing to write to a reserved path '{rel}'. Corvux's own folders (.corvux, .attachments) and dotfiles are off-limits to the agent."
-            )));
-        }
-        let created = crate::commands::files::create_roost_note_synced(&ctx.app, &rel, &content)
-            .await
-            .map_err(|e| ToolError::retryable(format!("write: {e}")))?;
+        // AT-1/AT-4: the write gate checks THIS folder+title target (the
+        // reserved-path rule and the user's blocklist) — `roost_write` has no
+        // path argument, so the agent loop's early raw check never saw it.
+        let created = super::write_gate::create_note(ctx, &rel, &content).await?;
         if !created {
             return Err(ToolError::retryable(format!(
                 "note already exists at '{}'. Pick a different title or open the existing note.",
@@ -218,16 +196,39 @@ impl Tool for RoostWriteTool {
     }
 }
 
-/// True if a roost-relative path targets one of Corvux's reserved hidden
-/// areas (`.corvux/`, `.attachments/`, `.corvux-trash/`) or any dotfile /
-/// dot-directory. Agent writes must not mutate Corvux's own internal state
-/// (sync identity, settings, trash) — this mirrors the MCP server's refusal
-/// (`corvux-mcp/src/roost.rs`). Reads are intentionally unaffected. `.`/`..`
-/// are already rejected upstream by the path-escape guards; excluded here so
-/// the predicate reads as "a dot-segment that isn't a traversal token".
-pub(super) fn is_reserved_path(rel: &str) -> bool {
-    rel.split('/')
-        .any(|seg| seg.starts_with('.') && seg != "." && seg != "..")
+/// The roost-relative path `roost_write` creates for these args:
+/// `<folder>/<title with path-unsafe chars replaced>.md`. Pure, so the write
+/// gate's registry test can check the exact target `execute` writes.
+pub(crate) fn planned_rel(args: &Value) -> Result<String, ToolError> {
+    let title = args
+        .get("title")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| ToolError::retryable("missing 'title'"))?;
+    let safe_title: String = title
+        .chars()
+        .map(|c| {
+            if matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|') {
+                '-'
+            } else {
+                c
+            }
+        })
+        .collect();
+    let folder = args
+        .get("folder")
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().trim_matches('/'))
+        .unwrap_or("");
+    if folder.contains("..") {
+        return Err(ToolError::fatal("folder cannot contain '..'"));
+    }
+    Ok(if folder.is_empty() {
+        format!("{safe_title}.md")
+    } else {
+        format!("{folder}/{safe_title}.md")
+    })
 }
 
 /// Build the link resolver from the graph DB and return a `link_warnings`
@@ -340,7 +341,7 @@ impl Tool for CreateNoteAliasTool {
 
 #[cfg(test)]
 mod reserved_path_tests {
-    use super::is_reserved_path;
+    use super::super::write_gate::is_reserved_path;
 
     #[test]
     fn rejects_corvux_internal_folders_and_dotfiles() {

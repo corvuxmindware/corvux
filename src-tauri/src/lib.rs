@@ -453,6 +453,25 @@ pub fn run() {
                         tracing::warn!(error = %e, "paths::gc: per-dir error");
                     }
                 }
+
+                // RF-3: one-time upgrade seed of the R2 first-open record from
+                // the roost list earlier runs saved. MUST stay before the main
+                // window is built below — no webview exists yet, so nothing in
+                // THIS run can have written `roosts.json` (see
+                // `seed_confirmed_roots_once` for the trust-on-first-use limit).
+                if let Some(dir) = crate::paths::app_data_dir() {
+                    match crate::commands::roost::seed_confirmed_roots_once(dir) {
+                        Ok(crate::commands::roost::RootSeed::Seeded(n)) => tracing::info!(
+                            roots = n,
+                            "roost: seeded first-open confirmations from the pre-upgrade roost list"
+                        ),
+                        Ok(crate::commands::roost::RootSeed::AlreadyDone) => {}
+                        Err(e) => tracing::warn!(
+                            error = %e,
+                            "roost: first-open seed failed — existing roosts will ask once"
+                        ),
+                    }
+                }
             }
 
             // iOS: exclude the secret + sync-identity dirs from the device's
@@ -824,9 +843,13 @@ pub fn run() {
                 std::sync::Mutex::new(initial_subagent_watcher),
             ));
 
-            // Shared HTTP client — one connection pool for all cloud providers.
-            // `User-Agent` is useful for HuggingFace rate-limit friendliness when
-            // we start downloading ONNX models.
+            // Shared HTTP client — one connection pool for the fixed-host cloud
+            // chat providers and the model download. It keeps reqwest's default
+            // redirect policy on purpose: the HuggingFace download redirects to
+            // its CDN. Requests to a user-chosen address (Ollama chat, every
+            // connection / model-list probe) use `ai::http::no_redirect_client`
+            // instead (review AK-1). `User-Agent` is useful for HuggingFace
+            // rate-limit friendliness.
             let http = reqwest::Client::builder()
                 .user_agent(concat!("Corvux/", env!("CARGO_PKG_VERSION")))
                 .build()

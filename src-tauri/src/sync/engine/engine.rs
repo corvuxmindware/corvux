@@ -580,9 +580,21 @@ impl SyncEngine {
     /// standard duration. Called by the IPC pairing commands when the user takes
     /// an explicit pairing action ("Show code" / scan+PIN) so inbound first-pair
     /// handshakes are only admitted while the user is actually pairing.
+    ///
+    /// SY-1: callers must invoke this only AFTER their native-dialog gate
+    /// (`authorize_pairing_reveal` / `authorize_first_pair`) returned Ok and
+    /// after their inputs parsed — every IPC argument comes from the webview.
+    /// `tests/sync_invariants.rs::sy1_enrollment_window_opens_only_after_native_gate`
+    /// enforces that ordering in `commands/sync.rs`. Because every caller has
+    /// just received a real human "yes", this is a fresh pairing attempt: the
+    /// failure count is cleared even if the window was already open
+    /// (`EnrollmentWindow::open_after_confirm`) — otherwise wrong-PIN guesses
+    /// from an attacker would lock the legitimate user out of pairing until
+    /// the engine restarted (SA-4). An UNconfirmed re-open must never reach
+    /// this function; `EnrollmentWindow::open` is the non-resetting primitive.
     pub fn open_enrollment_window(&self) {
         if let Ok(mut w) = self.inner.enrollment_window.lock() {
-            w.open(crate::sync::crypto::pairing::ENROLLMENT_WINDOW);
+            w.open_after_confirm(crate::sync::crypto::pairing::ENROLLMENT_WINDOW);
         }
     }
 

@@ -705,6 +705,22 @@ async fn dispatch_one<R: Runtime + 'static>(
     }
 
     let tier = tool.safety_tier();
+    let is_write = matches!(tier, SafetyTier::Write | SafetyTier::Destructive);
+
+    // AT-1 call shape (write tiers only): no argument the schema doesn't
+    // declare, and at most one path-like argument. Without this a decoy
+    // `path` next to the real `note_path` steered the early check below
+    // and the approval card title while the tool wrote `note_path`.
+    if is_write {
+        if let Err(problem) =
+            super::write_gate::check_write_call_shape(&call.args, &tool.input_schema())
+        {
+            let msg = format!("Invalid args for `{}`: {problem}", tool.name());
+            let json = json!({ "error": &msg, "fatal": false });
+            return (json, ToolResult::err(tool.name(), msg));
+        }
+    }
+
     let file_path = call
         .args
         .get("path")
@@ -713,26 +729,24 @@ async fn dispatch_one<R: Runtime + 'static>(
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
 
-    // Path-level guardrails — hard reject Write/Destructive tools that
-    // touch a path matching the user's `agent_blocked_paths` glob list,
-    // BEFORE the approval card is shown. The user can't even click
-    // Approve, which is the point: this is the "permanently off-limits"
-    // surface, separate from the approval-per-call gate. Read tools are
-    // unaffected (reading isn't destructive). The roost path is
-    // stripped to a relative form first so users can write patterns
-    // like `Journal/` without knowing the absolute roost root.
-    if matches!(tier, SafetyTier::Write | SafetyTier::Destructive) {
-        if let Some(target) = file_path.as_deref() {
-            let relative = to_roost_relative(target, ctx.roost_path.as_deref());
-            if super::glob::path_is_blocked(&relative, &autonomy.agent_blocked_paths) {
-                let msg = format!(
-                    "Path `{relative}` is on your blocked list — the agent can't write here. \
-                     Adjust the request to use a different path, or remove the pattern \
-                     in Settings → AI → Agent Autonomy if you intended to allow this."
-                );
-                let json = json!({ "error": &msg, "fatal": false, "blocked_path": relative });
-                return (json, ToolResult::err(tool.name(), msg));
-            }
+    // Path-level guardrails, early pass — refuse a Write/Destructive call
+    // whose named path matches the user's `agent_blocked_paths` BEFORE the
+    // approval card is shown, so the user can't even click Approve. This
+    // pass only sees the raw argument (plus the `.md` / `[[wiki]]`
+    // spellings the resolver would add); it is the friendly fast path. The
+    // AUTHORITATIVE check runs inside the tool, on the resolved target,
+    // through `write_gate` (armed below) — that one also covers
+    // `roost_write`'s folder+title, "daily", bare titles and the open note.
+    // Read tools are unaffected (reading isn't destructive).
+    if is_write {
+        if let Some(relative) = early_blocked_target(
+            file_path.as_deref(),
+            ctx.roost_path.as_deref(),
+            &autonomy.agent_blocked_paths,
+        ) {
+            let msg = super::write_gate::blocked_message(&relative);
+            let json = json!({ "error": &msg, "fatal": false, "blocked_path": relative });
+            return (json, ToolResult::err(tool.name(), msg));
         }
     }
 
@@ -760,7 +774,14 @@ async fn dispatch_one<R: Runtime + 'static>(
         }
     }
 
-    let exec = tool.execute(ctx, call.args.clone());
+    // Arm the write gate for this one call from the loop's autonomy (the
+    // snapshot `chat_send` took — the same list the early check above used).
+    // Every agent write checks its resolved target against it; a context
+    // that was never armed refuses to write (fail closed).
+    let call_ctx = ctx.with_write_gate(super::write_gate::WriteGate::new(
+        &autonomy.agent_blocked_paths,
+    ));
+    let exec = tool.execute(&call_ctx, call.args.clone());
     let timed = timeout(tool.timeout(), exec).await;
 
     match timed {
@@ -829,7 +850,36 @@ async fn dispatch_one<R: Runtime + 'static>(
     }
 }
 
-/// Best-effort resolve `note_path` to an absolute path for preview reads.
+/// Early (pre-approval) blocklist pass over the raw path argument. Tries the
+/// spellings the resolver would produce without touching the roost: the
+/// argument as given, without `[[...]]` markers, and with `.md` added when
+/// the last segment has no extension (so a pattern ending `.md` matches
+/// `Finance/Q1`). Returns the roost-relative spelling that matched. Not
+/// authoritative — `write_gate` re-checks the resolved target.
+fn early_blocked_target(
+    target: Option<&str>,
+    roost: Option<&str>,
+    blocked: &[String],
+) -> Option<String> {
+    let target = target?.trim();
+    let unwrapped = target
+        .trim_start_matches("[[")
+        .trim_end_matches("]]")
+        .trim();
+    let relative = to_roost_relative(unwrapped, roost);
+    let has_extension = relative
+        .rsplit('/')
+        .next()
+        .is_some_and(|name| name.contains('.'));
+    let mut candidates = vec![to_roost_relative(target, roost), relative.clone()];
+    if !has_extension {
+        candidates.push(format!("{relative}.md"));
+    }
+    candidates
+        .into_iter()
+        .find(|c| super::glob::path_is_blocked(c, blocked))
+}
+
 /// Strip a roost prefix from a path and normalize separators, so the
 /// path can be matched against the user's `agent_blocked_paths` glob
 /// patterns. Preserves case + extension (unlike `roost_relative_id`)
@@ -986,6 +1036,40 @@ mod roost_relative_tests {
         // return SOMETHING the matcher can chew on rather than panic.
         let r = to_roost_relative("/elsewhere/notes/x.md", Some("/v"));
         assert_eq!(r, "elsewhere/notes/x.md");
+    }
+}
+
+/// AT-1: the early (pre-card) blocklist pass sees the spellings the resolver
+/// would produce. The resolved-target check itself is `write_gate::tests`.
+#[cfg(test)]
+mod early_blocked_target_tests {
+    use super::early_blocked_target;
+
+    fn pats(s: &[&str]) -> Vec<String> {
+        s.iter().map(|x| x.to_string()).collect()
+    }
+
+    #[test]
+    fn extension_less_and_wiki_spellings_hit_a_pattern_ending_in_md() {
+        let p = pats(&["Finance/Q1.md"]);
+        for raw in [
+            "Finance/Q1",
+            "[[Finance/Q1]]",
+            "Finance/Q1.md",
+            "finance/q1",
+        ] {
+            let hit = early_blocked_target(Some(raw), Some("/v"), &p)
+                .unwrap_or_else(|| panic!("{raw} must be refused before the card"));
+            assert_eq!(hit.to_lowercase(), "finance/q1.md", "{raw}");
+        }
+    }
+
+    #[test]
+    fn absolute_path_is_stripped_and_unblocked_paths_pass() {
+        let p = pats(&["Journal/"]);
+        assert!(early_blocked_target(Some("/v/Journal/x.md"), Some("/v"), &p).is_some());
+        assert!(early_blocked_target(Some("Notes/x"), Some("/v"), &p).is_none());
+        assert!(early_blocked_target(None, Some("/v"), &p).is_none());
     }
 }
 

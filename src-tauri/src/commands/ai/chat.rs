@@ -436,6 +436,8 @@ pub async fn chat_send(
         parent_budget: Some(cfg.budget),
         parent_autonomy: Some(autonomy.clone()),
         cancel: Some(cancel.clone()),
+        // Armed per tool call by the agent loop's dispatcher (AT-1/AT-4).
+        write_gate: None,
     };
     // Branch on the runtime feature flag. Both loops have identical
     // signatures; the v2 path streams typed `StreamEvent`s through
@@ -748,12 +750,13 @@ fn build_chat_provider(
                          Open Settings \u{2192} AI and correct it."
                     )
                 })?;
+            // No shared client here: OllamaChat uses the no-redirect client so a
+            // 302 cannot walk note content to an unvalidated host (AK-1).
             Ok(Box::new(OllamaChat::new(
-                http_state.0.clone(),
                 target.url,
                 ollama_key,
                 ollama_model,
-            )))
+            )?))
         }
         LlmProvider::Openai => {
             let key = openai_key.ok_or(

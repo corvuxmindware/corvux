@@ -22,13 +22,34 @@
 //! the saved server address. No persistence, no logging —
 //! `tracing::debug!` only logs the latency + status, never the key or
 //! response body.
+//!
+//! Every probe here uses the no-redirect client (`ai::http::no_redirect_client`,
+//! review AK-1/AK-6): reqwest strips `Authorization` on a cross-host redirect
+//! but NOT the `x-goog-api-key` / `x-api-key` headers, and for Ollama the
+//! address itself is renderer-supplied. Every probe has a total timeout, and
+//! every body — success or error — is read with a size cap.
 
-use serde::Serialize;
-use std::time::Instant;
+use std::time::{Duration, Instant};
+
+use serde::de::IgnoredAny;
+use serde::{Deserialize, Serialize};
 use tauri::State;
 
+use super::ollama_models::{
+    authorize_ollama_probe, resolve_ollama_probe, saved_settings, OLLAMA_MOBILE_UNSUPPORTED,
+    OLLAMA_PROBE_TIMEOUT, PROBE_APPROVALS,
+};
 use super::settings::effective_probe_key;
-use super::types::{HttpClient, SettingsState};
+use super::types::SettingsState;
+use crate::ai::http::{
+    bounded_json, error_body, no_redirect_client, redirect_refused, MAX_MODEL_LIST_BYTES,
+    MAX_SMALL_JSON_BYTES,
+};
+use crate::commands::native_confirm::OsDialog;
+
+/// Total budget for a cloud-provider key probe (connect to last body byte).
+/// Generous enough for OpenRouter's full catalogue on a slow mobile link.
+const CLOUD_PROBE_TIMEOUT: Duration = Duration::from_secs(20);
 
 #[derive(Debug, Clone, Serialize, specta::Type)]
 pub struct ConnectionTestResult {
@@ -69,6 +90,86 @@ impl ConnectionTestResult {
     }
 }
 
+/// The model-catalogue shapes the cloud probes count. Entries are skipped, not
+/// materialized: only the length matters.
+#[derive(Debug, Default, Deserialize)]
+struct ModelCatalogue {
+    /// Gemini: `{"models": [...]}`.
+    #[serde(default)]
+    models: Vec<IgnoredAny>,
+    /// OpenRouter / OpenAI / Anthropic: `{"data": [...]}`.
+    #[serde(default)]
+    data: Vec<IgnoredAny>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum CatalogueField {
+    Models,
+    Data,
+}
+
+/// Send one fixed-host key probe and turn the answer into a result. Shared by
+/// the four cloud probes so the timeout, redirect refusal and body caps cannot
+/// drift between them.
+async fn run_catalogue_probe(
+    name: &'static str,
+    req: reqwest::RequestBuilder,
+    field: CatalogueField,
+) -> ConnectionTestResult {
+    let started = Instant::now();
+    match req.timeout(CLOUD_PROBE_TIMEOUT).send().await {
+        Ok(resp) => {
+            let latency_ms = started.elapsed().as_millis() as u64;
+            let status = resp.status();
+            if let Some(msg) = redirect_refused(status) {
+                tracing::warn!(latency_ms, status = %status, probe = name, "connection probe: redirect refused");
+                return ConnectionTestResult::fail(
+                    latency_ms,
+                    "Redirected — not followed".into(),
+                    msg,
+                );
+            }
+            if status.is_success() {
+                // An unreadable or oversized list still proves the key works.
+                let catalogue: ModelCatalogue =
+                    bounded_json(resp, MAX_MODEL_LIST_BYTES, CLOUD_PROBE_TIMEOUT)
+                        .await
+                        .unwrap_or_default();
+                let count = match field {
+                    CatalogueField::Models => catalogue.models.len(),
+                    CatalogueField::Data => catalogue.data.len(),
+                };
+                tracing::debug!(
+                    latency_ms,
+                    models = count,
+                    probe = name,
+                    "connection probe: ok"
+                );
+                ConnectionTestResult::ok_with(
+                    latency_ms,
+                    format!(
+                        "{count} model{} reachable",
+                        if count == 1 { "" } else { "s" }
+                    ),
+                )
+            } else {
+                let body_excerpt = error_body(resp).await;
+                tracing::warn!(latency_ms, status = %status, probe = name, "connection probe: rejected");
+                ConnectionTestResult::fail(
+                    latency_ms,
+                    explain_status(status.as_u16()),
+                    truncate(body_excerpt, 240),
+                )
+            }
+        }
+        Err(e) => {
+            let latency_ms = started.elapsed().as_millis() as u64;
+            tracing::warn!(latency_ms, error = %e, probe = name, "connection probe: network error");
+            ConnectionTestResult::fail(latency_ms, "Network error".into(), e.to_string())
+        }
+    }
+}
+
 /// Probe the Gemini API key against `models.list`. Hits
 /// `GET https://generativelanguage.googleapis.com/v1beta/models` with
 /// the key in the `x-goog-api-key` header — same auth pattern the
@@ -78,7 +179,6 @@ impl ConnectionTestResult {
 #[specta::specta]
 pub async fn test_gemini_connection(
     api_key: String,
-    http_state: State<'_, HttpClient>,
     settings_state: State<'_, SettingsState>,
 ) -> Result<ConnectionTestResult, String> {
     let saved = settings_state
@@ -96,52 +196,9 @@ pub async fn test_gemini_connection(
         ));
     }
     let url = "https://generativelanguage.googleapis.com/v1beta/models";
-    let started = Instant::now();
-    match http_state
-        .0
-        .get(url)
-        .header("x-goog-api-key", key)
-        .send()
-        .await
-    {
-        Ok(resp) => {
-            let latency_ms = started.elapsed().as_millis() as u64;
-            let status = resp.status();
-            if status.is_success() {
-                let body: serde_json::Value = resp.json().await.unwrap_or(serde_json::Value::Null);
-                let count = body
-                    .get("models")
-                    .and_then(|v| v.as_array())
-                    .map(|a| a.len())
-                    .unwrap_or(0);
-                tracing::debug!(latency_ms, models = count, "test_gemini: ok");
-                Ok(ConnectionTestResult::ok_with(
-                    latency_ms,
-                    format!(
-                        "{count} model{} reachable",
-                        if count == 1 { "" } else { "s" }
-                    ),
-                ))
-            } else {
-                let body_excerpt = crate::ai::http::error_body(resp).await;
-                tracing::warn!(latency_ms, status = %status, "test_gemini: rejected");
-                Ok(ConnectionTestResult::fail(
-                    latency_ms,
-                    explain_status(status.as_u16()),
-                    truncate(body_excerpt, 240),
-                ))
-            }
-        }
-        Err(e) => {
-            let latency_ms = started.elapsed().as_millis() as u64;
-            tracing::warn!(latency_ms, error = %e, "test_gemini: network error");
-            Ok(ConnectionTestResult::fail(
-                latency_ms,
-                "Network error".into(),
-                e.to_string(),
-            ))
-        }
-    }
+    let client = no_redirect_client()?;
+    let req = client.get(url).header("x-goog-api-key", key);
+    Ok(run_catalogue_probe("gemini", req, CatalogueField::Models).await)
 }
 
 /// Probe the OpenRouter key against `GET /api/v1/models` with
@@ -151,7 +208,6 @@ pub async fn test_gemini_connection(
 #[specta::specta]
 pub async fn test_openrouter_connection(
     api_key: String,
-    http_state: State<'_, HttpClient>,
     settings_state: State<'_, SettingsState>,
 ) -> Result<ConnectionTestResult, String> {
     let saved = settings_state
@@ -179,96 +235,32 @@ pub async fn test_openrouter_connection(
         ));
     }
 
-    let started = Instant::now();
-    let resp = http_state
-        .0
+    let client = no_redirect_client()?;
+    let req = client
         .get(format!("{}/models", crate::ai::openrouter::OPENROUTER_BASE))
-        .bearer_auth(key)
-        .send()
-        .await;
-
-    match resp {
-        Ok(resp) => {
-            let latency_ms = started.elapsed().as_millis() as u64;
-            let status = resp.status();
-            if status.is_success() {
-                let body: serde_json::Value = resp.json().await.unwrap_or(serde_json::Value::Null);
-                let count = body
-                    .get("data")
-                    .and_then(|v| v.as_array())
-                    .map(|a| a.len())
-                    .unwrap_or(0);
-                tracing::debug!(latency_ms, models = count, "test_openrouter: ok");
-                Ok(ConnectionTestResult::ok_with(
-                    latency_ms,
-                    format!(
-                        "{count} model{} reachable",
-                        if count == 1 { "" } else { "s" }
-                    ),
-                ))
-            } else {
-                let body_excerpt = crate::ai::http::error_body(resp).await;
-                tracing::warn!(latency_ms, status = %status, "test_openrouter: rejected");
-                Ok(ConnectionTestResult::fail(
-                    latency_ms,
-                    explain_status(status.as_u16()),
-                    truncate(body_excerpt, 240),
-                ))
-            }
-        }
-        Err(e) => {
-            let latency_ms = started.elapsed().as_millis() as u64;
-            tracing::warn!(latency_ms, error = %e, "test_openrouter: network error");
-            Ok(ConnectionTestResult::fail(
-                latency_ms,
-                "Network error".into(),
-                e.to_string(),
-            ))
-        }
-    }
+        .bearer_auth(key);
+    Ok(run_catalogue_probe("openrouter", req, CatalogueField::Data).await)
 }
 
-/// Probe a user's Ollama server. Hits `GET {base}/api/version` —
-/// the cheapest reachability check, doesn't require any model to be
-/// loaded, and returns `{"version": "0.x.y"}` on success. A 3s timeout
-/// keeps the UI snappy when Ollama is down (default reqwest timeout
-/// would hang ~30s).
-///
-/// `api_key` is optional — supplied only when the user fronts Ollama
-/// with an auth proxy. Localhost setups leave it `None`.
-#[tauri::command]
-#[specta::specta]
-pub async fn test_ollama_connection(
-    base_url: String,
-    api_key: Option<String>,
-    http_state: State<'_, HttpClient>,
-    settings_state: State<'_, SettingsState>,
-) -> Result<ConnectionTestResult, String> {
-    // Same address policy as save_settings; the saved token only ever goes to
-    // the saved server (see `resolve_ollama_probe`).
-    let (base, key) = match super::ollama_models::resolve_ollama_probe(
-        &base_url,
-        api_key.as_deref(),
-        &super::ollama_models::saved_settings(&settings_state),
-    ) {
-        Ok(v) => v,
-        Err(e) => {
-            return Ok(ConnectionTestResult::fail(
-                0,
-                "Server address can't be used".into(),
-                e,
-            ))
-        }
-    };
-    let base = base.as_str();
-    let url = format!("{}/api/version", base);
+/// Ollama's `/api/version` answer. Only the version string is read.
+#[derive(Debug, Deserialize)]
+struct OllamaVersion {
+    #[serde(default)]
+    version: Option<String>,
+}
 
+/// GET `{base}/api/version` with the no-redirect client, a total timeout and
+/// bounded reads. `base` has already been validated and, where needed,
+/// confirmed by the user.
+async fn probe_ollama_version(
+    client: &reqwest::Client,
+    base: &str,
+    key: Option<&str>,
+) -> ConnectionTestResult {
+    let url = format!("{}/api/version", base);
     let started = Instant::now();
-    let mut req = http_state
-        .0
-        .get(&url)
-        .timeout(std::time::Duration::from_secs(3));
-    if let Some(key) = key.as_deref() {
+    let mut req = client.get(&url).timeout(OLLAMA_PROBE_TIMEOUT);
+    if let Some(key) = key {
         req = req.bearer_auth(key);
     }
 
@@ -276,25 +268,32 @@ pub async fn test_ollama_connection(
         Ok(resp) => {
             let latency_ms = started.elapsed().as_millis() as u64;
             let status = resp.status();
-            if status.is_success() {
-                let body: serde_json::Value = resp.json().await.unwrap_or(serde_json::Value::Null);
-                let version = body
-                    .get("version")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("unknown");
-                tracing::debug!(latency_ms, version, "test_ollama: ok");
-                Ok(ConnectionTestResult::ok_with(
+            if let Some(msg) = redirect_refused(status) {
+                tracing::warn!(latency_ms, status = %status, "test_ollama: redirect refused");
+                return ConnectionTestResult::fail(
                     latency_ms,
-                    format!("Ollama {} reachable", version),
-                ))
+                    "Redirected — not followed".into(),
+                    msg,
+                );
+            }
+            if status.is_success() {
+                let version =
+                    bounded_json::<OllamaVersion>(resp, MAX_SMALL_JSON_BYTES, OLLAMA_PROBE_TIMEOUT)
+                        .await
+                        .ok()
+                        .and_then(|v| v.version)
+                        .unwrap_or_else(|| "unknown".to_string());
+                let version = truncate(version, 64);
+                tracing::debug!(latency_ms, "test_ollama: ok");
+                ConnectionTestResult::ok_with(latency_ms, format!("Ollama {} reachable", version))
             } else {
-                let body_excerpt = crate::ai::http::error_body(resp).await;
+                let body_excerpt = error_body(resp).await;
                 tracing::warn!(latency_ms, status = %status, "test_ollama: rejected");
-                Ok(ConnectionTestResult::fail(
+                ConnectionTestResult::fail(
                     latency_ms,
                     explain_status(status.as_u16()),
                     truncate(body_excerpt, 240),
-                ))
+                )
             }
         }
         Err(e) => {
@@ -308,9 +307,55 @@ pub async fn test_ollama_connection(
             } else {
                 "Network error".to_string()
             };
-            Ok(ConnectionTestResult::fail(latency_ms, hint, e.to_string()))
+            ConnectionTestResult::fail(latency_ms, hint, e.to_string())
         }
     }
+}
+
+/// Probe a user's Ollama server. Hits `GET {base}/api/version` —
+/// the cheapest reachability check, doesn't require any model to be
+/// loaded, and returns `{"version": "0.x.y"}` on success. A 3s timeout
+/// keeps the UI snappy when Ollama is down (default reqwest timeout
+/// would hang ~30s).
+///
+/// `api_key` is optional — supplied only when the user fronts Ollama
+/// with an auth proxy. Localhost setups leave it `None`.
+///
+/// Same policy as `list_ollama_models` (review AK-1): desktop only; the address
+/// is validated like `save_settings`; an internet host that is not the saved
+/// server needs the user's native confirmation; redirects are not followed.
+#[tauri::command]
+#[specta::specta]
+pub async fn test_ollama_connection(
+    app: tauri::AppHandle,
+    base_url: String,
+    api_key: Option<String>,
+    settings_state: State<'_, SettingsState>,
+) -> Result<ConnectionTestResult, String> {
+    // Desktop-only, like `list_ollama_models` and chat (Audit 2026-06-08,
+    // LOW-9): a phone must not dial a plaintext LAN address from Rust.
+    if !crate::ai::ollama::ollama_supported() {
+        return Err(OLLAMA_MOBILE_UNSUPPORTED.into());
+    }
+    // Same address policy as save_settings; the saved token only ever goes to
+    // the saved server (see `resolve_ollama_probe`).
+    let probe = match resolve_ollama_probe(
+        &base_url,
+        api_key.as_deref(),
+        &saved_settings(&settings_state),
+    ) {
+        Ok(v) => v,
+        Err(e) => {
+            return Ok(ConnectionTestResult::fail(
+                0,
+                "Server address can't be used".into(),
+                e,
+            ))
+        }
+    };
+    authorize_ollama_probe(&probe, &OsDialog(app), &PROBE_APPROVALS).await?;
+    let client = no_redirect_client()?;
+    Ok(probe_ollama_version(&client, &probe.url, probe.key.as_deref()).await)
 }
 
 /// Probe an OpenAI key against `GET /v1/models` with `Authorization:
@@ -321,7 +366,6 @@ pub async fn test_ollama_connection(
 #[specta::specta]
 pub async fn test_openai_connection(
     api_key: String,
-    http_state: State<'_, HttpClient>,
     settings_state: State<'_, SettingsState>,
 ) -> Result<ConnectionTestResult, String> {
     let saved = settings_state
@@ -338,53 +382,11 @@ pub async fn test_openai_connection(
             "API key field is empty",
         ));
     }
-    let started = Instant::now();
-    let resp = http_state
-        .0
+    let client = no_redirect_client()?;
+    let req = client
         .get(format!("{}/models", crate::ai::openai::OPENAI_BASE))
-        .bearer_auth(key)
-        .send()
-        .await;
-
-    match resp {
-        Ok(resp) => {
-            let latency_ms = started.elapsed().as_millis() as u64;
-            let status = resp.status();
-            if status.is_success() {
-                let body: serde_json::Value = resp.json().await.unwrap_or(serde_json::Value::Null);
-                let count = body
-                    .get("data")
-                    .and_then(|v| v.as_array())
-                    .map(|a| a.len())
-                    .unwrap_or(0);
-                tracing::debug!(latency_ms, models = count, "test_openai: ok");
-                Ok(ConnectionTestResult::ok_with(
-                    latency_ms,
-                    format!(
-                        "{count} model{} reachable",
-                        if count == 1 { "" } else { "s" }
-                    ),
-                ))
-            } else {
-                let body_excerpt = crate::ai::http::error_body(resp).await;
-                tracing::warn!(latency_ms, status = %status, "test_openai: rejected");
-                Ok(ConnectionTestResult::fail(
-                    latency_ms,
-                    explain_status(status.as_u16()),
-                    truncate(body_excerpt, 240),
-                ))
-            }
-        }
-        Err(e) => {
-            let latency_ms = started.elapsed().as_millis() as u64;
-            tracing::warn!(latency_ms, error = %e, "test_openai: network error");
-            Ok(ConnectionTestResult::fail(
-                latency_ms,
-                "Network error".into(),
-                e.to_string(),
-            ))
-        }
-    }
+        .bearer_auth(key);
+    Ok(run_catalogue_probe("openai", req, CatalogueField::Data).await)
 }
 
 /// Probe an Anthropic (Claude) key against `GET /v1/models` with the
@@ -394,7 +396,6 @@ pub async fn test_openai_connection(
 #[specta::specta]
 pub async fn test_anthropic_connection(
     api_key: String,
-    http_state: State<'_, HttpClient>,
     settings_state: State<'_, SettingsState>,
 ) -> Result<ConnectionTestResult, String> {
     let saved = settings_state
@@ -411,57 +412,15 @@ pub async fn test_anthropic_connection(
             "API key field is empty",
         ));
     }
-    let started = Instant::now();
-    let resp = http_state
-        .0
+    let client = no_redirect_client()?;
+    let req = client
         .get(format!("{}/models", crate::ai::anthropic::ANTHROPIC_BASE))
         .header("x-api-key", key)
         .header(
             "anthropic-version",
             crate::ai::tool_translator::anthropic::ANTHROPIC_VERSION,
-        )
-        .send()
-        .await;
-
-    match resp {
-        Ok(resp) => {
-            let latency_ms = started.elapsed().as_millis() as u64;
-            let status = resp.status();
-            if status.is_success() {
-                let body: serde_json::Value = resp.json().await.unwrap_or(serde_json::Value::Null);
-                let count = body
-                    .get("data")
-                    .and_then(|v| v.as_array())
-                    .map(|a| a.len())
-                    .unwrap_or(0);
-                tracing::debug!(latency_ms, models = count, "test_anthropic: ok");
-                Ok(ConnectionTestResult::ok_with(
-                    latency_ms,
-                    format!(
-                        "{count} model{} reachable",
-                        if count == 1 { "" } else { "s" }
-                    ),
-                ))
-            } else {
-                let body_excerpt = crate::ai::http::error_body(resp).await;
-                tracing::warn!(latency_ms, status = %status, "test_anthropic: rejected");
-                Ok(ConnectionTestResult::fail(
-                    latency_ms,
-                    explain_status(status.as_u16()),
-                    truncate(body_excerpt, 240),
-                ))
-            }
-        }
-        Err(e) => {
-            let latency_ms = started.elapsed().as_millis() as u64;
-            tracing::warn!(latency_ms, error = %e, "test_anthropic: network error");
-            Ok(ConnectionTestResult::fail(
-                latency_ms,
-                "Network error".into(),
-                e.to_string(),
-            ))
-        }
-    }
+        );
+    Ok(run_catalogue_probe("anthropic", req, CatalogueField::Data).await)
 }
 
 /// Translate the HTTP status into a one-line summary the user can act on.
@@ -488,6 +447,102 @@ fn truncate(mut s: String, max: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use crate::ai::http::test_server::{assert_never_dialed, redirect_trap, serve_once, wire};
+
+    #[tokio::test]
+    async fn the_ollama_probe_reports_a_redirect_and_never_follows_it() {
+        let (first, target, hits) = redirect_trap().await;
+        let client = no_redirect_client().unwrap();
+        let r = probe_ollama_version(&client, &format!("http://{first}"), None).await;
+        assert!(!r.ok);
+        let err = r.error_message.unwrap_or_default();
+        assert!(err.contains("redirect") && err.contains("302"), "{err}");
+        assert!(!err.contains(&target.to_string()), "{err}");
+        assert_never_dialed(&hits).await;
+    }
+
+    #[tokio::test]
+    async fn a_key_probe_never_carries_its_header_through_a_redirect() {
+        // reqwest strips `Authorization` on a cross-host hop but not
+        // `x-api-key` / `x-goog-api-key` — with no redirect there is no hop.
+        let (first, _target, hits) = redirect_trap().await;
+        let client = no_redirect_client().unwrap();
+        let req = client
+            .get(format!("http://{first}/v1/models"))
+            .header("x-api-key", "sk-ant-secret");
+        let r = run_catalogue_probe("test", req, CatalogueField::Data).await;
+        assert!(!r.ok);
+        assert_eq!(r.summary, "Redirected — not followed");
+        assert_never_dialed(&hits).await;
+    }
+
+    #[tokio::test]
+    async fn probe_bodies_are_bounded() {
+        let client = no_redirect_client().unwrap();
+
+        // Error body: capped, then cut to one line for the panel.
+        let addr = serve_once(wire("401 Unauthorized", &[b'x'; 100_000], true)).await;
+        let r = run_catalogue_probe(
+            "test",
+            client.get(format!("http://{addr}/models")),
+            CatalogueField::Data,
+        )
+        .await;
+        assert!(!r.ok);
+        assert!(r.error_message.unwrap_or_default().len() <= 240 + 3);
+
+        // Success body over the cap: refused (counted as 0), never buffered.
+        let addr = serve_once(
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n",
+                MAX_MODEL_LIST_BYTES + 1
+            )
+            .into_bytes(),
+        )
+        .await;
+        let r = run_catalogue_probe(
+            "test",
+            client.get(format!("http://{addr}/models")),
+            CatalogueField::Data,
+        )
+        .await;
+        assert!(r.ok);
+        assert_eq!(r.summary, "0 models reachable");
+
+        // Normal catalogue still counts.
+        let addr = serve_once(wire(
+            "200 OK",
+            br#"{"data":[{"id":"a"},{"id":"b"}]}"#,
+            false,
+        ))
+        .await;
+        let r = run_catalogue_probe(
+            "test",
+            client.get(format!("http://{addr}/models")),
+            CatalogueField::Data,
+        )
+        .await;
+        assert_eq!(r.summary, "2 models reachable");
+
+        // Ollama version: an oversized /api/version reads as "unknown", and a
+        // long version string is cut.
+        let addr = serve_once(
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n",
+                MAX_SMALL_JSON_BYTES + 1
+            )
+            .into_bytes(),
+        )
+        .await;
+        let r = probe_ollama_version(&client, &format!("http://{addr}"), None).await;
+        assert_eq!(r.summary, "Ollama unknown reachable");
+        let long = format!(r#"{{"version":"{}"}}"#, "9".repeat(5_000));
+        let addr = serve_once(wire("200 OK", long.as_bytes(), false)).await;
+        let r = probe_ollama_version(&client, &format!("http://{addr}"), None).await;
+        assert!(r.ok && r.summary.len() < 100, "{}", r.summary);
+    }
+
     #[test]
     fn truncates_provider_errors_at_utf8_boundaries() {
         assert_eq!(

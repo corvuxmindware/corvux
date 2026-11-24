@@ -225,7 +225,7 @@ const RAW_FS_BASELINE: &[(&str, usize, &str)] = &[
     ("commands/roost.rs", 18,"ROOST bootstrap + app-data: creates/backs up app-created roost dirs before any backend exists, native tree scanner with AUDIT-076 symlink filtering (MR-B4), roosts.json manifest, index-dir delete, confirmed_roost_roots.json first-open record (R2 — APP-PRIVATE)"),
     ("commands/roost_tree_cache.rs", 3, "APP-PRIVATE: derived file-tree cache in app-data"),
     ("commands/sync.rs", 6, "APP-PRIVATE: sync prefs + TLS identity in app-data (also ratcheted by sync_invariants.rs)"),
-    ("commands/sync_endpoint.rs", 3, "APP-PRIVATE: confirmed_sync_peers.json first-pair record in app-data (R1)"),
+    ("commands/sync_endpoint.rs", 4, "APP-PRIVATE: confirmed_sync_peers.json first-pair record in app-data (R1) + RF-3 read-only listing of <app_data>/vaults to find the paired-peer registries (marked index dirs only)"),
     ("commands/task_notify.rs", 3, "APP-PRIVATE: missed-notification ledger in app-data"),
     ("db/queries/notes.rs", 1, "ROOST (F7, hardened): file_mtime_secs stats a DB-stored absolute path with symlink_metadata (no follow); metadata only, no content read, never returned to the webview. Real fix = RoostFs mtime + store RoostRel"),
     ("db/schema.rs", 5, "APP-PRIVATE: pre-migration snapshot/rollback of graph.db in the app-data index dir"),
@@ -389,6 +389,36 @@ const WIRING: &[(&str, &str, &str, &str)] = &[
         "F2/F11: probes validate the URL and scope the saved token",
     ),
     (
+        "commands/ai/ollama_models.rs",
+        "list_ollama_models",
+        "authorize_ollama_probe(",
+        "AK-1: a probe to a non-saved internet host needs a native confirmation",
+    ),
+    (
+        "commands/ai/connection_test.rs",
+        "test_ollama_connection",
+        "authorize_ollama_probe(",
+        "AK-1: a probe to a non-saved internet host needs a native confirmation",
+    ),
+    (
+        "commands/ai/ollama_models.rs",
+        "list_ollama_models",
+        "no_redirect_client(",
+        "AK-1: a user-supplied address is fetched without following redirects",
+    ),
+    (
+        "commands/ai/connection_test.rs",
+        "test_ollama_connection",
+        "no_redirect_client(",
+        "AK-1: a user-supplied address is fetched without following redirects",
+    ),
+    (
+        "ai/ollama.rs",
+        "new",
+        "no_redirect_client(",
+        "AK-1: Ollama chat (user-chosen base URL) never follows redirects",
+    ),
+    (
         "commands/sync.rs",
         "sync_pin_custom_queue_host",
         "authorize_pin_change(",
@@ -424,16 +454,31 @@ const WIRING: &[(&str, &str, &str, &str)] = &[
         "authorize_removals(",
         "F10: deleting a roost's index + sync credentials needs a native confirmation",
     ),
+    // RF-3 moved the R2 gate out of `open_roost` into `gate_roost_open` so the
+    // whole gate (check → dialog → record) is unit-tested; the chain below pins
+    // open_roost → gate → decision + dialog + lane.
     (
         "commands/roost.rs",
         "open_roost",
-        "roost_open_needs_confirm(",
+        "gate_roost_open(",
         "R2: opening a root the backend never confirmed must hit the native first-open gate",
     ),
     (
         "commands/roost.rs",
-        "open_roost",
-        "CONFIRMED_ROOTS_WRITE.lock()",
+        "gate_roost_open",
+        "roost_open_needs_confirm(",
+        "R2: the gate decides from the backend-owned confirmed set",
+    ),
+    (
+        "commands/roost.rs",
+        "gate_roost_open",
+        "authorize_roost_open(",
+        "R2: an unconfirmed root needs the native first-open dialog",
+    ),
+    (
+        "commands/roost.rs",
+        "gate_roost_open",
+        "lock_or_recover(&CONFIRMED_ROOTS_WRITE)",
         "R2: the confirmed-roots read-modify-write is one lane",
     ),
     (
@@ -445,8 +490,20 @@ const WIRING: &[(&str, &str, &str, &str)] = &[
     (
         "commands/sync.rs",
         "sync_connect_iroh",
+        "gate_iroh_first_pair(",
+        "R1/SY-1: sync_connect_iroh must go through the one pre-dial function (PIN parse, ticket decode, native gate, THEN the enrollment window)",
+    ),
+    (
+        "commands/sync.rs",
+        "gate_iroh_first_pair",
         "authorize_first_pair(",
         "R1: pairing with an unconfirmed NodeId needs a native confirmation",
+    ),
+    (
+        "commands/sync.rs",
+        "gate_iroh_first_pair",
+        "PairAuth::UserConfirmed",
+        "SA-2: the enrollment window opens only when the user answered the dialog just now, never for an already-known peer",
     ),
     (
         "commands/sync.rs",
@@ -459,6 +516,48 @@ const WIRING: &[(&str, &str, &str, &str)] = &[
         "sync_start_listening",
         "authorize_pairing_reveal(",
         "R1-in: starting the inbound listener + enrollment window needs a native confirmation",
+    ),
+    (
+        "commands/sync.rs",
+        "sync_init",
+        "sync_init_inner(",
+        "RF-1: sync_init starts the engine only through the gated sync_init_inner",
+    ),
+    (
+        "commands/sync.rs",
+        "sync_try_autostart",
+        "gated_sync_roost_backend(",
+        "RF-1: autostart refuses a roost that is not the open (R2-confirmed) one before stopping or starting anything",
+    ),
+    (
+        "commands/sync.rs",
+        "sync_try_autostart",
+        "sync_init_inner(",
+        "RF-1: autostart starts the engine only through the gated sync_init_inner",
+    ),
+    (
+        "commands/sync.rs",
+        "sync_init_inner",
+        "gate_then_resolve_sync_state_dir(",
+        "RF-1/R2: sync_init_inner gates on the installed backend BEFORE roost_db_dir writes vault-id.bin",
+    ),
+    (
+        "commands/sync.rs",
+        "sync_init_inner",
+        "check_sync_roost_backend(",
+        "RF-1: the install-commit re-check refuses a closed (None) or switched backend",
+    ),
+    (
+        "commands/sync.rs",
+        "gate_then_resolve_sync_state_dir",
+        "gated_sync_roost_backend(",
+        "RF-1: the state-dir resolver runs only after the backend gate",
+    ),
+    (
+        "commands/sync.rs",
+        "gated_sync_roost_backend",
+        "check_sync_roost_backend(",
+        "RF-1: no installed backend (e.g. after close_roost) or another roost's backend is refused",
     ),
     (
         "commands/mcp.rs",

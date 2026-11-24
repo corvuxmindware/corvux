@@ -1093,6 +1093,210 @@ pub(crate) fn roost_fs_matches_path(fs: &dyn crate::roostfs::RoostFs, roost_path
     crate::commands::roost::same_roost_root(&fs.root_id(), std::path::Path::new(roost_path))
 }
 
+/// Error returned when sync is asked to start while no roost is open.
+const SYNC_INIT_NO_ROOST: &str = "sync_init refused: no roost is open — open the roost first";
+/// Error returned when the open roost is not the one sync was asked to start for.
+const SYNC_INIT_ROOST_CHANGED: &str = "sync_init aborted: active roost changed";
+
+/// RF-1 / R2: sync may only start for the roost whose backend is installed
+/// RIGHT NOW. The only code that installs a backend is `open_roost` (through
+/// `install_roost_backend`), and `open_roost` runs the R2 first-open native
+/// dialog before it installs. So "the installed backend is this roost" proves
+/// the user confirmed this folder, and nothing else here has to trust the
+/// renderer-supplied `roost_path`.
+///
+/// - No backend installed (no roost opened yet, or after `close_roost`) ⇒
+///   refuse. Before RF-1 this case was accepted: the engine then got
+///   `roost_fs = None`, built an on-demand `NativeFs` on whatever path the
+///   renderer sent, and scanned + watched every `.md` under it.
+/// - A backend for a DIFFERENT roost ⇒ refuse (the stale-switch race: writing
+///   roost A's incoming notes through roost B's backend).
+///
+/// Pure so the decision is unit-tested without an `AppHandle`.
+pub(crate) fn check_sync_roost_backend(
+    installed: Option<&dyn crate::roostfs::RoostFs>,
+    roost_path: &str,
+) -> Result<(), String> {
+    match installed {
+        None => Err(SYNC_INIT_NO_ROOST.to_string()),
+        Some(fs) if !roost_fs_matches_path(fs, roost_path) => {
+            Err(SYNC_INIT_ROOST_CHANGED.to_string())
+        }
+        Some(_) => Ok(()),
+    }
+}
+
+/// Read the installed backend and apply [`check_sync_roost_backend`].
+/// Returns the backend so the engine is built on exactly the one that passed.
+async fn gated_sync_roost_backend(
+    roost_fs_state: &crate::commands::files::RoostFsState,
+    roost_path: &str,
+) -> Result<Arc<dyn crate::roostfs::RoostFs>, String> {
+    let installed = roost_fs_state.current().await;
+    if let Err(e) = check_sync_roost_backend(installed.as_deref(), roost_path) {
+        tracing::warn!(
+            requested = %roost_path,
+            active = ?installed.as_ref().map(|fs| fs.root_id()),
+            "sync_init: refused — requested roost is not the open roost"
+        );
+        return Err(e);
+    }
+    installed.ok_or_else(|| SYNC_INIT_NO_ROOST.to_string())
+}
+
+/// RF-1 ordering: gate FIRST, then resolve the per-roost state dir.
+/// `resolve_db_dir` is `paths::roost_db_dir` in production, which runs
+/// `ensure_vault_id_sync` and so WRITES `<roost>/.corvux/vault-id.bin`. It
+/// must never run for a folder that failed the gate. Generic over the
+/// resolver so a test can pass the real `ensure_vault_id_sync` writer without
+/// an `AppHandle` and prove nothing is written on refusal.
+async fn gate_then_resolve_sync_state_dir<F>(
+    roost_fs_state: &crate::commands::files::RoostFsState,
+    roost_path: &str,
+    resolve_db_dir: F,
+) -> Result<(Arc<dyn crate::roostfs::RoostFs>, PathBuf), String>
+where
+    F: FnOnce(&str) -> Result<PathBuf, String>,
+{
+    let backend = gated_sync_roost_backend(roost_fs_state, roost_path).await?;
+    let state_dir = resolve_db_dir(roost_path)
+        .map_err(|e| format!("state dir: {e}"))?
+        .join("sync");
+    Ok((backend, state_dir))
+}
+
+/// RF-1: sync must only start for the roost `open_roost` installed (R2 gate),
+/// and a refused path must never get `.corvux/vault-id.bin` written into it.
+#[cfg(test)]
+mod sync_init_gate_tests {
+    use super::*;
+    use crate::commands::files::RoostFsState;
+    use crate::roostfs::native::NativeFs;
+    use crate::roostfs::RoostFs;
+    use std::path::Path;
+    use tempfile::TempDir;
+
+    fn path_str(dir: &TempDir) -> String {
+        dir.path().to_string_lossy().into_owned()
+    }
+
+    fn vault_id_path(root: &Path) -> PathBuf {
+        root.join(".corvux")
+            .join(crate::sync::vault_id::VAULT_ID_FILE)
+    }
+
+    /// The production resolver (`paths::roost_db_dir`) writes the vault id
+    /// via `ensure_vault_id_sync`; this calls that SAME writer so a test can
+    /// see whether it ran, without an `AppHandle`.
+    fn real_vault_id_writer(p: &str) -> Result<PathBuf, String> {
+        crate::sync::vault_id::ensure_vault_id_sync(Path::new(p))
+            .map(|_| PathBuf::from(p))
+            .map_err(|e| e.to_string())
+    }
+
+    async fn state_with(root: &TempDir) -> RoostFsState {
+        let state = RoostFsState::default();
+        let backend: Arc<dyn RoostFs> = Arc::new(NativeFs::new(root.path()));
+        state.install(backend).await;
+        state
+    }
+
+    #[test]
+    fn decision_refuses_when_no_roost_is_open() {
+        let victim = TempDir::new().expect("tempdir");
+        let err = check_sync_roost_backend(None, &path_str(&victim))
+            .expect_err("no installed backend must be refused (RF-1)");
+        assert_eq!(err, SYNC_INIT_NO_ROOST);
+    }
+
+    #[test]
+    fn decision_refuses_other_roost_and_accepts_the_open_one() {
+        let a = TempDir::new().expect("tempdir a");
+        let b = TempDir::new().expect("tempdir b");
+        let fs_a = NativeFs::new(a.path());
+        let fs_a: &dyn RoostFs = &fs_a;
+        assert_eq!(
+            check_sync_roost_backend(Some(fs_a), &path_str(&b)),
+            Err(SYNC_INIT_ROOST_CHANGED.to_string()),
+            "a backend for A must not authorize sync on B"
+        );
+        assert_eq!(
+            check_sync_roost_backend(Some(fs_a), &path_str(&a)),
+            Ok(()),
+            "the open roost itself is accepted"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_backend_refuses_before_writing_a_vault_id() {
+        // The RF-1 scenario: `close_roost` cleared the backend, then the
+        // renderer asks for sync on some other folder.
+        let victim = TempDir::new().expect("tempdir");
+        let state = RoostFsState::default();
+        let mut resolver_ran = false;
+        let result = gate_then_resolve_sync_state_dir(&state, &path_str(&victim), |p| {
+            resolver_ran = true;
+            real_vault_id_writer(p)
+        })
+        .await;
+        assert_eq!(result.err(), Some(SYNC_INIT_NO_ROOST.to_string()));
+        assert!(!resolver_ran, "state-dir resolver must not run on refusal");
+        assert!(
+            !victim.path().join(".corvux").exists(),
+            "no .corvux/ (vault-id.bin) may be written into a refused folder"
+        );
+    }
+
+    #[tokio::test]
+    async fn other_roost_refuses_before_writing_a_vault_id() {
+        let open = TempDir::new().expect("tempdir open");
+        let victim = TempDir::new().expect("tempdir victim");
+        let state = state_with(&open).await;
+        let result =
+            gate_then_resolve_sync_state_dir(&state, &path_str(&victim), real_vault_id_writer)
+                .await;
+        assert_eq!(result.err(), Some(SYNC_INIT_ROOST_CHANGED.to_string()));
+        assert!(!vault_id_path(victim.path()).exists());
+        assert!(!vault_id_path(open.path()).exists());
+    }
+
+    #[tokio::test]
+    async fn open_roost_passes_and_gets_its_state_dir() {
+        // The legitimate flow: open_roost installed this roost's backend,
+        // then the frontend calls sync_init / sync_try_autostart with it.
+        let open = TempDir::new().expect("tempdir");
+        let state = state_with(&open).await;
+        let (backend, state_dir) =
+            gate_then_resolve_sync_state_dir(&state, &path_str(&open), real_vault_id_writer)
+                .await
+                .expect("the open roost must be accepted");
+        assert!(roost_fs_matches_path(backend.as_ref(), &path_str(&open)));
+        assert_eq!(state_dir, open.path().join("sync"));
+        assert!(
+            vault_id_path(open.path()).exists(),
+            "the resolver runs (and writes the id) only after the gate passes"
+        );
+    }
+
+    #[tokio::test]
+    async fn closing_the_roost_revokes_sync_init() {
+        // open → close: the same path that was accepted is refused once the
+        // backend is cleared (what `close_roost` does).
+        let open = TempDir::new().expect("tempdir");
+        let state = state_with(&open).await;
+        assert!(gated_sync_roost_backend(&state, &path_str(&open))
+            .await
+            .is_ok());
+        state.clear().await;
+        assert_eq!(
+            gated_sync_roost_backend(&state, &path_str(&open))
+                .await
+                .err(),
+            Some(SYNC_INIT_NO_ROOST.to_string())
+        );
+    }
+}
+
 /// Shared implementation behind `sync_init` and `sync_try_autostart`.
 /// Takes the plain types the IPC surface and the autostart path both have,
 /// so we don't duplicate the bring-up sequence (identity → TLS → engine →
@@ -1114,6 +1318,28 @@ async fn sync_init_inner(
     // same-roost double-fire returns the first engine's status without building a
     // second, and a different-roost race runs strictly after the first commits.
     let _init_guard = state.init.lock().await;
+
+    // RF-1 / R2 gate — FIRST, before anything touches `roost_path`. Sync may
+    // only start for the roost whose backend `open_roost` installed (it runs
+    // the native first-open dialog before installing). No backend, or a
+    // backend for another roost, is refused here. `roost_db_dir` (which writes
+    // `<roost>/.corvux/vault-id.bin`) runs only after the gate passes.
+    // Checked under `init`: `open_roost`'s backend swap and `close_roost` both
+    // take `init` too, so the backend cannot change between this check and
+    // the install commit below (which re-checks anyway).
+    //
+    // Sync state (Automerge docs + paired-peer registry) lives in the
+    // app-private data dir keyed by the roost's id. NOT inside the roost — SAF
+    // roosts on Android are read-only via std::fs (EROFS), and even on
+    // desktop the Automerge binaries are device-local (should never sync
+    // through Syncthing into another device's state tree). Received notes are
+    // written through the gated backend (NativeFs on desktop, SafFs on
+    // Android), never through a path-built fallback.
+    let (roost_fs, state_dir) = gate_then_resolve_sync_state_dir(roost_fs_state, roost_path, |p| {
+        crate::paths::roost_db_dir(app, p)
+    })
+    .await?;
+    tracing::info!(state_dir = %state_dir.display(), "sync_init: resolved state_dir");
 
     // Idempotence + leak guard: if an engine is already running for THIS roost,
     // return its status instead of building a second one. A repeat init — the
@@ -1163,48 +1389,14 @@ async fn sync_init_inner(
         Arc::new(Identity::load_or_create(&sync_dir).map_err(|e| format!("identity: {e}"))?);
     let tls = Arc::new(load_or_create_tls(&sync_dir).map_err(|e| format!("tls: {e}"))?);
 
-    // Sync state (Automerge docs + paired-peer registry) lives in the
-    // app-private data dir keyed by roost path. NOT inside the roost — SAF
-    // roosts on Android are read-only via std::fs (EROFS), and even on
-    // desktop the Automerge binaries are device-local (should never sync
-    // through Syncthing into another device's state tree).
-    let state_dir = crate::paths::roost_db_dir(app, roost_path)
-        .map_err(|e| format!("state dir: {e}"))?
-        .join("sync");
-    tracing::info!(state_dir = %state_dir.display(), "sync_init: resolved state_dir");
-
-    // Grab the currently-installed RoostFs backend so received notes are
-    // written through the same abstraction the rest of the app uses
-    // (NativeFs on desktop, SafFs on Android). `None` if no roost has
-    // been opened yet — sync_init should still succeed; writes fall back
-    // to std::fs and will warn on SAF.
-    let roost_fs = roost_fs_state.current().await;
-
-    // AUDIT: guard against a stale roost-switch race. The frontend startup
-    // sequence is fire-and-forget with no cancellation, so if roost A's
-    // sequence lands here *after* the user switched to roost B,
-    // `roost_fs_state.current()` is now B's backend while `roost_path` still
-    // names A. Building the engine with a mismatched (path, backend) pair
-    // would write A's incoming peer notes through B's RoostFs — cross-roost
-    // data bleed. If a backend is installed and it no longer matches the
-    // roost we were asked to init, abort instead of installing a mismatched
-    // engine. `roost_fs == None` (no roost opened yet) is left untouched:
-    // sync_init still succeeds and writes fall back to std::fs.
-    if let Some(fs) = &roost_fs {
-        if !roost_fs_matches_path(fs.as_ref(), roost_path) {
-            tracing::warn!(
-                requested = %roost_path,
-                active = %fs.root_id(),
-                "sync_init: aborting — active roost backend no longer matches requested roost (switch race)"
-            );
-            return Err("sync_init aborted: active roost changed".into());
-        }
-    }
-
+    // `roost_fs` / `state_dir` came from the RF-1 gate at the top of this fn,
+    // so the engine is always built on the installed backend for THIS roost
+    // (never `None`, never another roost's backend — the stale-switch race
+    // where roost A's notes would be written through roost B is refused there).
     let engine = SyncEngine::new(
         PathBuf::from(roost_path),
         state_dir.clone(),
-        roost_fs,
+        Some(roost_fs),
         identity.clone(),
         tls,
         device_name.to_string(),
@@ -1272,25 +1464,21 @@ async fn sync_init_inner(
     //    the early guard) would otherwise install a stale engine after the swap
     //    completed. Under `lifecycle` the backend we read here is the settled
     //    post-switch value, so a mismatch is decisive.
-    //  - GENERATION re-check (cheap backstop): catches a switch that bumped the
-    //    generation but ended with NO backend mounted (e.g. the new roost failed
-    //    to open), where the live-backend check has nothing to compare against.
+    //    Uses the same RF-1 decision as the entry gate, so NO backend mounted
+    //    (closed, or the switch's open failed) is stale too — fail closed.
+    //  - GENERATION re-check (cheap backstop): catches any switch/close that
+    //    bumped the generation since entry, even one that ended back on the
+    //    same roost.
     //
     // On either, stop the half-built engine and bail rather than install it —
     // installing would write the old roost's incoming peer notes through the new
     // roost's backend (cross-roost bleed) or resurrect an engine the switch just
-    // tore down. The early `roost_fs_matches_path` guard still fast-aborts the
+    // tore down. The RF-1 gate at the top still fast-aborts the
     // already-switched case before we waste the engine build.
     {
         let _lifecycle = state.lifecycle.lock().await;
         let live = roost_fs_state.current().await;
-        let backend_stale = match &live {
-            Some(fs) => !roost_fs_matches_path(fs.as_ref(), roost_path),
-            // No roost mounted (never opened, or the switch's open failed). The
-            // generation check below covers the failed-switch case; a genuinely
-            // no-roost-yet init is legitimately allowed to install.
-            None => false,
-        };
+        let backend_stale = check_sync_roost_backend(live.as_deref(), roost_path).is_err();
         let gen_now = state
             .switch_generation
             .load(std::sync::atomic::Ordering::SeqCst);
@@ -1363,6 +1551,10 @@ async fn sync_init_inner(
 /// Initialize the engine for an already-opened roost. Loads or generates
 /// the device identity + TLS cert, creates the stores, but does NOT start
 /// listening. Call `sync_start_listening` to accept inbound connections.
+///
+/// RF-1: `roost_path` comes from the renderer, so `sync_init_inner` refuses
+/// it unless it is the roost `open_roost` (and its R2 first-open dialog)
+/// installed — see [`check_sync_roost_backend`].
 #[tauri::command]
 #[specta::specta]
 pub async fn sync_init(
@@ -1414,6 +1606,13 @@ pub async fn sync_try_autostart(
     roost_fs_state: State<'_, crate::commands::files::RoostFsState>,
     roost_path: String,
 ) -> Result<SyncStatus, String> {
+    // RF-1 / R2: refuse a roost that is not the open one BEFORE doing
+    // anything — in particular before stopping the running engine below, so a
+    // stale or forged autostart for another path can neither start sync there
+    // nor tear down sync for the roost that is actually open.
+    // `sync_init_inner` re-checks under the init lock (authoritative).
+    gated_sync_roost_backend(&roost_fs_state, &roost_path).await?;
+
     // Already running for this roost — nothing to do. If the engine belongs
     // to a previous roost, stop it first so its RoostFs clone releases the
     // old roost lock before this roost tries to resume.
@@ -1945,6 +2144,266 @@ pub async fn sync_listen_iroh(
     })
 }
 
+/// SY-1 / SA-2: the pre-dial sequence of [`sync_connect_iroh`], in its
+/// required order.
+///
+/// 1. Parse the PIN.
+/// 2. Decode the ticket.
+/// 3. Run the R1 gate (`authorize_first_pair`): the ticket AND the PIN come from the webview, and an attacker running their own iroh node chooses both.
+/// 4. Only if the user answered "yes" in the native dialog JUST NOW (`PairAuth::UserConfirmed`), open the enrollment window.
+///
+/// Step 4 is conditional on purpose (SA-2). A NodeId that is already known
+/// (confirmed earlier, or already paired) passes the gate silently, so a
+/// hijacked renderer can trigger that path at will for any NodeId it can read
+/// from `sync_status`. It must not open the inbound window or reset the guess
+/// counter, or each stop/init cycle would grant a fresh batch of PIN guesses.
+/// The cost: connecting to an already-known peer does not admit a first-pair
+/// back-dial from it. Reconnects of a known peer are token-based and never
+/// need the window; a peer that must first-pair back is a new peer, and a new
+/// peer always gets the dialog.
+///
+/// Any failure — bad PIN, bad ticket, declined/dismissed dialog — returns
+/// `Err` and leaves the enrollment window exactly as it was (closed stays
+/// closed; an open window is neither opened again nor extended).
+async fn gate_iroh_first_pair(
+    ticket: &str,
+    pin: &str,
+    app_data_dir: &std::path::Path,
+    confirm: &(impl super::native_confirm::NativeConfirm + ?Sized),
+    open_enrollment_window: impl FnOnce(),
+) -> Result<(iroh::EndpointAddr, Pin), String> {
+    let pin_parsed = Pin::parse(pin).ok_or("invalid PIN — must be 6 digits")?;
+    let peer = crate::sync::transport::iroh::decode_ticket(ticket)
+        .map_err(|e| format!("invalid pairing code: {e}"))?;
+    let node_hex = peer.id.to_string();
+    let key = super::sync_endpoint::peer_confirm_key("iroh", &node_hex);
+    let shown = format!(
+        "iroh node {}…",
+        super::sync_endpoint::short_id(&node_hex, 17)
+    );
+    let auth =
+        super::sync_endpoint::authorize_first_pair(app_data_dir, &key, &shown, confirm).await?;
+    if auth == super::sync_endpoint::PairAuth::UserConfirmed {
+        open_enrollment_window();
+    }
+    Ok((peer, pin_parsed))
+}
+
+#[cfg(test)]
+mod iroh_pre_dial_gate_tests {
+    //! SY-1: "gate before window" for `sync_connect_iroh`. Each test drives
+    //! the real pre-dial function with a scripted dialog and a real
+    //! `EnrollmentWindow`, and checks whether the window was opened.
+    use super::super::native_confirm::test_support::Scripted;
+    use super::*;
+    use crate::sync::crypto::pairing::{
+        EnrollmentWindow, FirstPairGate, ENROLLMENT_WINDOW, GLOBAL_FIRST_PAIR_CAP,
+    };
+
+    fn valid_ticket() -> String {
+        let node = iroh::SecretKey::from_bytes(&[11u8; 32]).public();
+        let addr = iroh::EndpointAddr::new(node);
+        let ticket =
+            crate::sync::transport::iroh::encode_ticket(&addr, None).expect("encode ticket");
+        String::from(&*ticket)
+    }
+
+    /// Run the gate against a fresh (closed) window; return (result is ok,
+    /// window is open afterwards).
+    async fn run(ticket: &str, pin: &str, dialog: &Scripted) -> (bool, bool) {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let window = std::sync::Mutex::new(EnrollmentWindow::new());
+        let ok = gate_iroh_first_pair(ticket, pin, dir.path(), dialog, || {
+            if let Ok(mut w) = window.lock() {
+                w.open(ENROLLMENT_WINDOW);
+            }
+        })
+        .await
+        .is_ok();
+        let open = window.lock().map(|w| w.is_open()).unwrap_or(false);
+        (ok, open)
+    }
+
+    #[tokio::test]
+    async fn invalid_pin_does_not_open_window_or_ask() {
+        let dialog = Scripted::allow();
+        let (ok, open) = run(&valid_ticket(), "", &dialog).await;
+        assert!(!ok, "an empty PIN must be rejected");
+        assert!(
+            !open,
+            "a PIN parse failure must not open the enrollment window"
+        );
+        assert_eq!(dialog.times_asked(), 0, "no dialog for unparseable input");
+    }
+
+    #[tokio::test]
+    async fn invalid_ticket_does_not_open_window_or_ask() {
+        let dialog = Scripted::allow();
+        let (ok, open) = run("", "123456", &dialog).await;
+        assert!(!ok, "an empty ticket must be rejected");
+        assert!(
+            !open,
+            "a ticket decode failure must not open the enrollment window"
+        );
+        assert_eq!(dialog.times_asked(), 0, "no dialog for undecodable input");
+        let (ok, open) = run("corvux1:not-base64!!", "123456", &dialog).await;
+        assert!(
+            !ok && !open,
+            "a garbage corvux1 ticket must not open the window"
+        );
+    }
+
+    #[tokio::test]
+    async fn declined_dialog_does_not_open_window() {
+        let dialog = Scripted::deny();
+        let (ok, open) = run(&valid_ticket(), "123456", &dialog).await;
+        assert!(!ok, "a declined dialog must fail the pairing");
+        assert_eq!(
+            dialog.times_asked(),
+            1,
+            "an unconfirmed NodeId must be asked about"
+        );
+        assert!(
+            !open,
+            "a declined dialog must not open the enrollment window"
+        );
+    }
+
+    #[tokio::test]
+    async fn accepted_dialog_opens_window() {
+        let dialog = Scripted::allow();
+        let (ok, open) = run(&valid_ticket(), "123456", &dialog).await;
+        assert!(ok, "valid inputs + accepted dialog must pass");
+        assert_eq!(dialog.times_asked(), 1);
+        assert!(open, "the window opens only after the gate returned Ok");
+    }
+
+    /// A locked, still-open window: the state an attacker leaves after
+    /// burning the global guess cap.
+    fn locked_window() -> std::sync::Mutex<EnrollmentWindow> {
+        let window = std::sync::Mutex::new(EnrollmentWindow::new());
+        if let Ok(mut w) = window.lock() {
+            w.open(ENROLLMENT_WINDOW);
+            for _ in 0..GLOBAL_FIRST_PAIR_CAP {
+                let _ = w.check_and_reserve_first_pair();
+            }
+        }
+        window
+    }
+
+    fn next_gate(window: &std::sync::Mutex<EnrollmentWindow>) -> FirstPairGate {
+        window
+            .lock()
+            .map(|mut w| w.check_and_reserve_first_pair())
+            .unwrap_or(FirstPairGate::Closed)
+    }
+
+    /// The headline SY-1 loop: a renderer calling the command over and over
+    /// with garbage cannot keep a locked window alive with a fresh budget.
+    /// Garbage calls never reach the window at all, so the lock survives.
+    #[tokio::test]
+    async fn looping_with_garbage_never_resets_a_locked_window() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let window = locked_window();
+        let open_window = || {
+            if let Ok(mut w) = window.lock() {
+                w.open_after_confirm(ENROLLMENT_WINDOW);
+            }
+        };
+        for _ in 0..5 {
+            let dialog = Scripted::allow();
+            let r = gate_iroh_first_pair("", "", dir.path(), &dialog, open_window).await;
+            assert!(r.is_err());
+            assert_eq!(dialog.times_asked(), 0);
+        }
+        assert_eq!(
+            next_gate(&window),
+            FirstPairGate::Locked,
+            "garbage calls must not touch a locked window"
+        );
+    }
+
+    /// SA-4: a real human "yes" is a fresh pairing attempt. Without the
+    /// reset, an attacker who burned the guess cap would lock the legitimate
+    /// user out of pairing (every approved "Show code"/scan only extended a
+    /// window that rejects everyone).
+    #[tokio::test]
+    async fn a_user_confirmed_pairing_starts_with_a_fresh_guess_budget() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let window = locked_window();
+        let r = gate_iroh_first_pair(
+            &valid_ticket(),
+            "123456",
+            dir.path(),
+            &Scripted::allow(),
+            || {
+                if let Ok(mut w) = window.lock() {
+                    w.open_after_confirm(ENROLLMENT_WINDOW);
+                }
+            },
+        )
+        .await;
+        assert!(r.is_ok());
+        assert_eq!(
+            next_gate(&window),
+            FirstPairGate::Allow,
+            "the user's yes must clear the lock an attacker left behind"
+        );
+    }
+
+    /// SA-2: a NodeId the app already knows passes the gate with no dialog, so
+    /// a hijacked renderer can trigger it for any NodeId it can read. That
+    /// path must neither open the window nor refresh a lock/budget.
+    #[tokio::test]
+    async fn an_already_known_peer_pairs_without_opening_the_window() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        // First pairing: the user confirms once and the peer is remembered.
+        let first = Scripted::allow();
+        let window = std::sync::Mutex::new(EnrollmentWindow::new());
+        gate_iroh_first_pair(&valid_ticket(), "123456", dir.path(), &first, || {
+            if let Ok(mut w) = window.lock() {
+                w.open_after_confirm(ENROLLMENT_WINDOW);
+            }
+        })
+        .await
+        .expect("first pair is confirmed by the user");
+        assert_eq!(first.times_asked(), 1);
+
+        // Second connect to the same NodeId with a closed window and a deny
+        // dialog: no question, success, and the window stays closed.
+        let closed = std::sync::Mutex::new(EnrollmentWindow::new());
+        let again = Scripted::deny();
+        let r = gate_iroh_first_pair(&valid_ticket(), "123456", dir.path(), &again, || {
+            if let Ok(mut w) = closed.lock() {
+                w.open_after_confirm(ENROLLMENT_WINDOW);
+            }
+        })
+        .await;
+        assert!(r.is_ok(), "a known peer must still be allowed to connect");
+        assert_eq!(again.times_asked(), 0, "a known peer is not asked about");
+        assert_eq!(
+            next_gate(&closed),
+            FirstPairGate::Closed,
+            "a known peer must NOT open the inbound enrollment window"
+        );
+
+        // And it must not refresh a locked window either.
+        let locked = locked_window();
+        let r = gate_iroh_first_pair(&valid_ticket(), "123456", dir.path(), &again, || {
+            if let Ok(mut w) = locked.lock() {
+                w.open_after_confirm(ENROLLMENT_WINDOW);
+            }
+        })
+        .await;
+        assert!(r.is_ok());
+        assert_eq!(
+            next_gate(&locked),
+            FirstPairGate::Locked,
+            "a known peer must not hand out a fresh guess budget"
+        );
+    }
+}
+
 /// Connect outbound to a peer over the iroh transport.
 ///
 /// `ticket` is the `corvux1:...` string from the host's QR code (or a
@@ -1968,41 +2427,27 @@ pub async fn sync_connect_iroh(
         let guard = state.engine.lock().await;
         guard.as_ref().ok_or("sync engine not initialized")?.clone()
     };
-    // SRX brute-force fix: scanning + entering a PIN is an explicit pairing
-    // action, and below we bind OUR OWN listener so the host can dial us back.
-    // Open the enrollment window so any first-pair back-dial is admitted while
-    // we're actively pairing (reconnects are token-based and never gated).
-    engine.open_enrollment_window();
-    let pin_parsed = Pin::parse(&pin).ok_or("invalid PIN — must be 6 digits")?;
-    let peer = crate::sync::transport::iroh::decode_ticket(&ticket)
-        .map_err(|e| format!("invalid pairing code: {e}"))?;
-
-    // R1 (sharp-edges residual): the ticket AND the PIN both come from the
-    // webview, and an attacker running their own iroh node chooses both.
-    // First pair with an unconfirmed NodeId needs the user's answer in a
-    // native dialog (showing the NodeId prefix to compare with the host
-    // card); confirmed peers (reconnects included) stay silent. Placed
-    // before we bind our own listener, so a decline leaves nothing open.
-    {
+    // SY-1: parse the PIN, decode the ticket, run the R1 native gate, and only
+    // THEN open the first-pair enrollment window — all inside one function so
+    // the order is unit-tested (`iroh_pre_dial_gate_tests`). A bad PIN, a bad
+    // ticket or a declined dialog returns here with the window untouched.
+    // Before SY-1 the window was opened first, so a hijacked webview looping
+    // this command with garbage args kept it open with no dialog.
+    let (peer, pin_parsed) = {
         use tauri::Manager;
         let dir = app
             .path()
             .app_data_dir()
             .map_err(|e| format!("app_data_dir: {e}"))?;
-        let node_hex = peer.id.to_string();
-        let key = super::sync_endpoint::peer_confirm_key("iroh", &node_hex);
-        let shown = format!(
-            "iroh node {}…",
-            super::sync_endpoint::short_id(&node_hex, 17)
-        );
-        super::sync_endpoint::authorize_first_pair(
+        gate_iroh_first_pair(
+            &ticket,
+            &pin,
             &dir,
-            &key,
-            &shown,
             &super::native_confirm::OsDialog(app.clone()),
+            || engine.open_enrollment_window(),
         )
-        .await?;
-    }
+        .await?
+    };
 
     // Symmetric pairing: bind OUR OWN listener with our sticky hosting PIN and
     // build our dialable ticket, then offer both to the host in the handshake

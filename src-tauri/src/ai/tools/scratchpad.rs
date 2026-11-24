@@ -179,10 +179,12 @@ impl Tool for ScratchpadWriteTool {
             )));
         }
         let mode_for_mutation = mode.clone();
-        let (_, final_text, ()) = crate::commands::files::mutate_roost_text_synced(
-            &ctx.app,
+        // Through the write gate: `.corvux/scratchpad.md` is one of the two
+        // agent-owned internal files, and the user's blocklist still applies.
+        let (_, final_text, ()) = super::write_gate::mutate_internal(
+            ctx,
             ".corvux/scratchpad.md",
-            true,
+            ToolError::fatal,
             move |prior| {
                 let next = match mode_for_mutation.as_str() {
                     "replace" => content,
@@ -194,8 +196,7 @@ impl Tool for ScratchpadWriteTool {
                 Ok((next, ()))
             },
         )
-        .await
-        .map_err(ToolError::fatal)?;
+        .await?;
 
         Ok(json!({
             "summary": format!(

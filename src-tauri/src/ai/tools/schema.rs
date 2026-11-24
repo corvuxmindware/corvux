@@ -23,7 +23,10 @@
 //! `additionalProperties`, `format`. Those don't appear in any tool
 //! schema in this codebase today; if they start to, we either extend
 //! this module or pull in the `jsonschema` crate. Don't pre-build
-//! against schemas we never use.
+//! against schemas we never use. Exception: for Write/Destructive tools the
+//! agent loop refuses undeclared keys (the effect of
+//! `additionalProperties: false`) via `write_gate::check_write_call_shape`
+//! — AT-1, a decoy path key must not ride along with the real target.
 
 use serde_json::Value;
 

@@ -57,6 +57,9 @@ mod schema;
 pub mod secret_scanner;
 pub mod trace;
 mod truncate;
+// AT-1/AT-4 choke point: every agent write goes through here. pub(crate) so
+// `commands::files::mutate_roost_note_synced` shares `is_reserved_path`.
+pub(crate) mod write_gate;
 
 pub mod backlinks;
 pub mod graph_query;
@@ -231,6 +234,83 @@ mod no_raw_fs_writes_test {
              Violations:\n  {}\n\
              If a write is legitimate (e.g. app-data, not roost), add it \
              to ALLOWLIST with a short justification.",
+            violations.join("\n  ")
+        );
+    }
+
+    /// AT-1/AT-4 ratchet: the user's `agent_blocked_paths` and the
+    /// reserved-path rule are enforced in ONE place, `write_gate.rs`, on the
+    /// resolved target. So no other file under `ai/tools/` (subfolders
+    /// included) may call the `commands::files` write helpers or a `RoostFs`
+    /// mutator directly — a new write tool that tried would skip the check.
+    /// Route it through `write_gate::{create_note, mutate_note,
+    /// mutate_internal}` and list it in `write_gate::tests::WRITE_TOOLS`.
+    #[test]
+    fn agent_writes_only_through_write_gate() {
+        const FORBIDDEN: &[&str] = &[
+            "create_roost_note_synced",
+            "mutate_roost_note_synced",
+            "mutate_roost_text_synced",
+            ".mkdir(",
+            ".rmdir(",
+            ".trash(",
+            ".trash_expecting(",
+            ".rename(",
+            ".write_atomic(",
+            "fs::write(",
+            "fs::rename(",
+            "fs::remove_file(",
+        ];
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("ai")
+            .join("tools");
+        let mut pending = vec![root.clone()];
+        let mut scanned = 0usize;
+        let mut violations = Vec::new();
+        while let Some(dir) = pending.pop() {
+            for entry in fs::read_dir(&dir).expect("read ai/tools directory") {
+                let path = entry.expect("dir entry").path();
+                if path.is_dir() {
+                    pending.push(path);
+                    continue;
+                }
+                if path.extension().and_then(|s| s.to_str()) != Some("rs") {
+                    continue;
+                }
+                let name = path
+                    .strip_prefix(&root)
+                    .expect("under ai/tools")
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                if name == "write_gate.rs" || name == "approval.rs" {
+                    // write_gate.rs IS the choke point; approval.rs writes
+                    // settings.json in app-data, not the roost (see ALLOWLIST).
+                    continue;
+                }
+                scanned += 1;
+                let src = fs::read_to_string(&path)
+                    .expect("read source")
+                    .replace("\r\n", "\n");
+                let src = strip_balanced_block(&src, "#[cfg(test)]\nmod");
+                let src = strip_balanced_block(&src, "mod tests");
+                for line in src.lines().map(str::trim) {
+                    if line.starts_with("//") {
+                        continue;
+                    }
+                    // `OpenOptions::create(true)` (trace.rs, app-data log) is
+                    // not a roost write; any other `.create(` is.
+                    let roost_create = line.contains(".create(") && !line.contains(".create(true)");
+                    if roost_create || FORBIDDEN.iter().any(|f| line.contains(f)) {
+                        violations.push(format!("{name}: {line}"));
+                    }
+                }
+            }
+        }
+        assert!(scanned > 20, "ratchet scanned too few files ({scanned})");
+        assert!(
+            violations.is_empty(),
+            "AT-1/AT-4: agent writes must go through ai/tools/write_gate.rs:\n  {}",
             violations.join("\n  ")
         );
     }
