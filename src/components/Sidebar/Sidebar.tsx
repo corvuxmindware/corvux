@@ -7,6 +7,7 @@ import { commands, unwrap } from "../../lib/invoke";
 import { confirmDialog } from "../../lib/confirm";
 import { errMsg } from "../../lib/error";
 import { log } from "../../lib/log";
+import { reportActionError } from "../../lib/action-error";
 import { isMobile as isMobilePlatform } from "../../lib/platform";
 import ContextMenu, { type MenuItem } from "./ContextMenu";
 import MoveToSheet from "./MoveToSheet";
@@ -355,11 +356,18 @@ export default function Sidebar(props: SidebarProps) {
   async function handleCreateNote() {
     const name = newNoteName().trim();
     if (name) {
-      const path = await roostStore.createNewNote(name);
-      // Brand-new empty note — always land in write mode.
-      if (path) tabStore.openTab(path, { readOnly: false });
-      setNewNoteName("");
-      setShowNewNote(false);
+      try {
+        const path = await roostStore.createNewNote(name);
+        // Brand-new empty note — always land in write mode.
+        if (path) tabStore.openTab(path, { readOnly: false });
+        setNewNoteName("");
+        setShowNewNote(false);
+      } catch (e) {
+        // Keep the form open with the typed name so the user can rename
+        // and retry instead of losing the input to a silent failure.
+        log.error("sidebar", "failed to create note", e);
+        toastStore.showError("Failed to create note", e, { code: "NOTE_CREATE_FAIL", module: "sidebar" });
+      }
     }
   }
 
@@ -384,7 +392,11 @@ export default function Sidebar(props: SidebarProps) {
         setNewFolderName("");
         setShowNewFolder(false);
       } catch (e) {
-        log.error("sidebar", "failed to create folder", e);
+        reportActionError("Failed to create folder", e, {
+          code: "FOLDER_CREATE_FAIL",
+          module: "sidebar",
+          showReason: true,
+        });
       }
     }
   }
@@ -429,7 +441,11 @@ export default function Sidebar(props: SidebarProps) {
                 await roostStore.refreshFiles({ force: true });
                 tabStore.openTab(path);
               } catch (e) {
-                log.error("sidebar", "failed to create note", e);
+                reportActionError("Failed to create note", e, {
+                  code: "NOTE_CREATE_FAIL",
+                  module: "sidebar",
+                  showReason: true,
+                });
               }
             }
           },
@@ -448,7 +464,11 @@ export default function Sidebar(props: SidebarProps) {
                 // AUDIT-065: tree refresh only.
                 await roostStore.refreshFiles({ force: true });
               } catch (e) {
-                log.error("sidebar", "failed to create folder", e);
+                reportActionError("Failed to create folder", e, {
+                  code: "FOLDER_CREATE_FAIL",
+                  module: "sidebar",
+                  showReason: true,
+                });
               }
             }
           },
@@ -517,7 +537,11 @@ export default function Sidebar(props: SidebarProps) {
             await roostStore.refreshFiles({ force: true });
             tabStore.openTab(newPath);
           } catch (e) {
-            log.error("sidebar", "failed to duplicate", e);
+            reportActionError("Failed to duplicate note", e, {
+              code: "NOTE_DUPLICATE_FAIL",
+              module: "sidebar",
+              showReason: true,
+            });
           }
         },
       },
@@ -576,7 +600,15 @@ export default function Sidebar(props: SidebarProps) {
             // AUDIT-065: tree refresh only.
             await roostStore.refreshFiles({ force: true });
           } catch (e) {
-            log.error("sidebar", "failed to delete", e);
+            // A12: on a provider that cannot move into the trash the backend
+            // says "…cannot move items to the trash, so nothing was
+            // deleted. Delete it with your file manager instead." That
+            // sentence is the whole point — show it, don't just log it.
+            reportActionError("Failed to delete note", e, {
+              code: "NOTE_DELETE_FAIL",
+              module: "sidebar",
+              showReason: true,
+            });
           }
         },
       },
@@ -1101,7 +1133,13 @@ function FolderRow(props: {
         // new path now instead of waiting for the next save.
         void graphStore.indexPath(newPath);
       })
-      .catch((e: unknown) => log.error("sidebar", "move failed", e));
+      .catch((e: unknown) =>
+        reportActionError("Failed to move", e, {
+          code: "ENTRY_MOVE_FAIL",
+          module: "sidebar",
+          showReason: true,
+        }),
+      );
     setDragSource(null);
   }
 

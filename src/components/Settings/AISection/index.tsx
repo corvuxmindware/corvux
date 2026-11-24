@@ -7,6 +7,7 @@ import { For, Show, createMemo, onMount } from "solid-js";
 import { settingsStore, type LlmProvider } from "../../../stores/settings";
 import { isMobile } from "../../../lib/platform";
 import { log } from "../../../lib/log";
+import { reportActionError } from "../../../lib/action-error";
 
 // Behavior panels moved to CorvuxAgentSection.tsx as of 2026-05-20.
 // AISection is the orchestrator: a compact provider dropdown + the
@@ -50,7 +51,10 @@ export default function AISection() {
       // Switching providers mounts the corresponding subcomponent;
       // each one handles its own onMount-time seeding.
     } catch (e) {
-      log.error("ai", "failed to set provider", e);
+      reportActionError("Failed to switch AI provider", e, {
+        code: "AI_PROVIDER_SET_FAIL",
+        module: "ai",
+      });
     }
   }
 

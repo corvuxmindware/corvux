@@ -700,6 +700,10 @@ This note itself has the tags #welcome and #getting-started — they show as col
    * back to the roost root when nothing (or a non-file tab like Graph) is
    * open. Centralised here so every entry point (sidebar button, ⌘N, the
    * command palette, the mobile prompt, wiki-links) shares the behaviour.
+   *
+   * THROWS on a failed create (the store no longer swallows): callers
+   * must surface the error — a silent null made refused creates invisible
+   * (observed on Android, A18). Returns null only when no roost is open.
    */
   async function createNewNote(
     name: string,
@@ -721,21 +725,22 @@ This note itself has the tags #welcome and #getting-started — they show as col
     const sep = dir.includes("\\") ? "\\" : "/";
     const path = `${dir.replace(/[\\/]+$/, "")}${sep}${fileName}`;
 
-    try {
-      await unwrap(commands.createFile(path));
-      // create_file writes the note to disk but does NOT index it — the
-      // graph is only touched on save / move / delete. Without this, a
-      // freshly created note has no graph node (missing from backlinks,
-      // graph view, search, AI retrieval) until the user first edits and
-      // saves it. Index it now. Dynamic import avoids a static
-      // roost → graph store import cycle.
-      void import("./graph").then(({ graphStore }) => graphStore.indexPath(path));
-      await openRoost(roost);
-      return path;
-    } catch (e) {
-      log.error("roost", "failed to create note", e);
-      return null;
-    }
+    // Errors propagate to the caller. Every entry point that can show the
+    // user why the create failed (the mobile New-note sheet, the sidebar
+    // inline form, Ctrl+N) relies on this throw; swallowing here made a
+    // refused create close the sheet silently with no note and no message
+    // (observed on Android, A18: a `:` in the title makes the provider
+    // store a rewritten name, which the SAF create layer correctly refuses).
+    await unwrap(commands.createFile(path));
+    // create_file writes the note to disk but does NOT index it — the
+    // graph is only touched on save / move / delete. Without this, a
+    // freshly created note has no graph node (missing from backlinks,
+    // graph view, search, AI retrieval) until the user first edits and
+    // saves it. Index it now. Dynamic import avoids a static
+    // roost → graph store import cycle.
+    void import("./graph").then(({ graphStore }) => graphStore.indexPath(path));
+    await openRoost(roost);
+    return path;
   }
 
   /**

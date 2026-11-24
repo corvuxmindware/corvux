@@ -1,6 +1,7 @@
 import { createSignal, onCleanup, onMount, Show } from "solid-js";
 import jsQR from "jsqr";
 import { log } from "../../../lib/log";
+import { reportActionError } from "../../../lib/action-error";
 
 /**
  * Camera-based QR scanner for the pairing flow. Opens a back-facing camera via
@@ -224,7 +225,10 @@ export default function QrScanner(props: {
     try {
       await openCamera(list[next]?.deviceId);
     } catch (e) {
-      log.warn("qr-scanner", "switch camera failed", e);
+      reportActionError("Couldn't switch camera", e, {
+        code: "QR_CAMERA_SWITCH_FAIL",
+        module: "qr-scanner",
+      });
     }
   }
 

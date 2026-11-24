@@ -7,6 +7,7 @@ import MobileBottomBar from "./components/MobileBottomBar/MobileBottomBar";
 import { isMacOS, isMobile as isMobilePlatform } from "./lib/platform";
 import { commands, unwrap } from "./lib/invoke";
 import { log } from "./lib/log";
+import { toastStore } from "./components/Toast/Toast";
 import { loadImage, loadAudio, pasteImage } from "./lib/attachments";
 import { createAutoHideOnScroll } from "./lib/auto-hide-on-scroll";
 import { keyboardOpen } from "./lib/keyboard-inset";
@@ -155,8 +156,13 @@ function App() {
       confirmLabel: "Create",
     });
     if (!name) return;
-    const path = await roostStore.createNewNote(name);
-    if (path) tabStore.openTab(path, { readOnly: false });
+    try {
+      const path = await roostStore.createNewNote(name);
+      if (path) tabStore.openTab(path, { readOnly: false });
+    } catch (e) {
+      log.error("app", "failed to create note", e);
+      toastStore.showError("Failed to create note", e, { code: "NOTE_CREATE_FAIL", module: "app.newNote" });
+    }
   }
 
   const paletteCommands = (): PaletteCommand[] =>

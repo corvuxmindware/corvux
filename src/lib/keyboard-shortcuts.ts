@@ -65,10 +65,16 @@ export function registerKeyboardShortcuts(ctx: ShortcutContext): () => void {
         .ask({ title: "New note", placeholder: "Note name", confirmLabel: "Create" })
         .then((name) => {
           if (name) {
-            roostStore.createNewNote(name).then((path) => {
-              // Brand-new empty note — always land in write mode.
-              if (path) tabStore.openTab(path, { readOnly: false });
-            });
+            roostStore
+              .createNewNote(name)
+              .then((path) => {
+                // Brand-new empty note — always land in write mode.
+                if (path) tabStore.openTab(path, { readOnly: false });
+              })
+              .catch((e) => {
+                log.error("shortcuts", "failed to create note", e);
+                toastStore.showError("Failed to create note", e, { code: "NOTE_CREATE_FAIL", module: "shortcuts" });
+              });
           }
         });
       return;
@@ -234,9 +240,14 @@ export async function registerMenuHandler(
             confirmLabel: "Create",
           });
           if (name) {
-            const path = await roostStore.createNewNote(name);
-            // Brand-new empty note — always land in write mode.
-            if (path) tabStore.openTab(path, { readOnly: false });
+            try {
+              const path = await roostStore.createNewNote(name);
+              // Brand-new empty note — always land in write mode.
+              if (path) tabStore.openTab(path, { readOnly: false });
+            } catch (e) {
+              log.error("shortcuts", "failed to create note", e);
+              toastStore.showError("Failed to create note", e, { code: "NOTE_CREATE_FAIL", module: "shortcuts" });
+            }
           }
           break;
         }

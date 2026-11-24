@@ -1,5 +1,6 @@
 import { roostStore } from "../stores/roost";
 import { tabStore } from "../stores/tabs";
+import { toastStore } from "../components/Toast/Toast";
 import { flattenFiles } from "../app/derived";
 
 /// Resolve a `[[wiki-link]]` target to a roost path and open it as a
@@ -94,12 +95,17 @@ export async function navigateToWikiLink(
   }
 
   if (options.createIfMissing) {
-    const path = await roostStore.createNewNote(withoutAnchor);
-    if (path) {
-      // Following a link to a note that didn't exist yet means the user
-      // intends to fill it in — open the empty note in write mode.
-      await tabStore.openTab(path, { readOnly: false });
-      return true;
+    try {
+      const path = await roostStore.createNewNote(withoutAnchor);
+      if (path) {
+        // Following a link to a note that didn't exist yet means the user
+        // intends to fill it in — open the empty note in write mode.
+        await tabStore.openTab(path, { readOnly: false });
+        return true;
+      }
+    } catch (e) {
+      // A failed link-follow create must not look like "nothing happened".
+      toastStore.showError("Failed to create note for link", e, { code: "NOTE_CREATE_FAIL", module: "wiki-link" });
     }
   }
   return false;

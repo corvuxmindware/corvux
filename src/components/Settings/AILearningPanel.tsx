@@ -11,6 +11,7 @@ import { createResource, For, Show, createSignal } from "solid-js";
 import { commands, unwrap } from "../../lib/invoke";
 import type { SignalSummary } from "../../lib/bindings";
 import { log } from "../../lib/log";
+import { reportActionError } from "../../lib/action-error";
 
 export type { SignalSummary };
 
@@ -35,7 +36,10 @@ export default function AILearningPanel() {
       await refetch();
       setConfirmReset(false);
     } catch (e) {
-      log.warn("ai-learning", "reset failed", e);
+      reportActionError("Failed to reset AI learning", e, {
+        code: "AI_LEARNING_RESET_FAIL",
+        module: "ai-learning",
+      });
     } finally {
       setResetting(false);
     }

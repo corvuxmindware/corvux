@@ -2,6 +2,7 @@ import { createSignal, onMount, onCleanup, Show } from "solid-js";
 import { commands, isTauri, unwrap } from "../../../lib/invoke";
 import { confirmDialog } from "../../../lib/confirm";
 import { log } from "../../../lib/log";
+import { reportActionError } from "../../../lib/action-error";
 import { isMobile } from "../../../lib/platform";
 import { lsSet, lsRemove, lsKeysWithPrefix } from "../../../lib/storage";
 import { roostStore } from "../../../stores/roost";
@@ -158,7 +159,10 @@ export default function SyncSection() {
       await unwrap(commands.syncUnpair(deviceIdHex));
       await refresh();
     } catch (e) {
-      log.error("sync", "unpair failed", e);
+      reportActionError("Failed to unpair device", e, {
+        code: "SYNC_UNPAIR_FAIL",
+        module: "sync",
+      });
     }
   };
 
@@ -258,7 +262,10 @@ export default function SyncSection() {
       setInitialized(false);
       setStatus(EMPTY_STATUS);
     } catch (e) {
-      log.error("sync", "stop failed", e);
+      reportActionError("Failed to stop sync", e, {
+        code: "SYNC_STOP_FAIL",
+        module: "sync",
+      });
     }
   };
 

@@ -3,6 +3,7 @@ import CorvuxLogo from "../Brand/CorvuxLogo";
 import { tabStore } from "../../stores/tabs";
 import { roostStore } from "../../stores/roost";
 import { promptStore } from "../Modals/PromptModal";
+import { toastStore } from "../Toast/Toast";
 import { isMobile } from "../../lib/platform";
 
 interface WelcomeProps {
@@ -23,9 +24,13 @@ export default function Welcome(props: WelcomeProps) {
       confirmLabel: "Create",
     });
     if (!name) return;
-    const path = await roostStore.createNewNote(name);
-    // Brand-new empty note — always land in write mode.
-    if (path) tabStore.openTab(path, { readOnly: false });
+    try {
+      const path = await roostStore.createNewNote(name);
+      // Brand-new empty note — always land in write mode.
+      if (path) tabStore.openTab(path, { readOnly: false });
+    } catch (e) {
+      toastStore.showError("Failed to create note", e, { code: "NOTE_CREATE_FAIL", module: "welcome" });
+    }
   }
 
   const actions = [

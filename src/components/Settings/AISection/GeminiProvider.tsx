@@ -15,6 +15,7 @@ import { commands, unwrap } from "../../../lib/invoke";
 import type { ConnectionTestResult } from "../../../lib/bindings";
 import { errMsg } from "../../../lib/error";
 import { log } from "../../../lib/log";
+import { reportActionError } from "../../../lib/action-error";
 import { settingsStore } from "../../../stores/settings";
 
 /** Curated Gemini models. The picker is for discoverability, not
@@ -115,7 +116,10 @@ export default function GeminiProvider() {
       setChatModelSaved(true);
       setTimeout(() => setChatModelSaved(false), 2000);
     } catch (e) {
-      log.error("ai", "failed to set chat model", e);
+      reportActionError("Failed to save chat model", e, {
+        code: "AI_MODEL_SAVE_FAIL",
+        module: "ai",
+      });
     }
   }
 

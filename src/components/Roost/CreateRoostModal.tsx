@@ -4,6 +4,7 @@ import { roostStore } from "../../stores/roost";
 import { commands, isTauri, setBrowserRoost, unwrap } from "../../lib/invoke";
 import { errMsg } from "../../lib/error";
 import { log } from "../../lib/log";
+import { reportActionError } from "../../lib/action-error";
 import { isMobile } from "../../lib/platform";
 import { toastStore } from "../Toast/Toast";
 
@@ -62,7 +63,10 @@ export default function CreateRoostModal(props: CreateRoostModalProps) {
         setParentPath(selected);
       }
     } catch (e) {
-      log.error("roost", "parent dir picker failed", e);
+      reportActionError("Couldn't open the folder picker", e, {
+        code: "ROOST_PICKER_FAIL",
+        module: "roost",
+      });
     }
   }
 

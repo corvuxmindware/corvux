@@ -6,6 +6,7 @@ import { settingsStore } from "../stores/settings";
 import { recorderStore } from "../stores/recorder";
 import { toastStore } from "../components/Toast/Toast";
 import { promptStore } from "../components/Modals/PromptModal";
+import { log } from "./log";
 
 /**
  * Callbacks the palette needs to toggle App-level UI state.
@@ -41,10 +42,16 @@ export function createPaletteCommands(ctx: PaletteContext): PaletteCommand[] {
           .ask({ title: "New note", placeholder: "Note name", confirmLabel: "Create" })
           .then((name) => {
             if (name) {
-              roostStore.createNewNote(name).then((path) => {
-                // Brand-new empty note — always land in write mode.
-                if (path) tabStore.openTab(path, { readOnly: false });
-              });
+              roostStore
+                .createNewNote(name)
+                .then((path) => {
+                  // Brand-new empty note — always land in write mode.
+                  if (path) tabStore.openTab(path, { readOnly: false });
+                })
+                .catch((e) => {
+                  log.error("palette", "failed to create note", e);
+                  toastStore.showError("Failed to create note", e, { code: "NOTE_CREATE_FAIL", module: "palette" });
+                });
             }
           });
       },

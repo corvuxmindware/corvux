@@ -2,6 +2,7 @@ import { createResource, createSignal, For, Show } from "solid-js";
 import { commands, isTauri, unwrap } from "../../lib/invoke";
 import type { SkillListView as SkillView } from "../../lib/bindings";
 import { log } from "../../lib/log";
+import { reportActionError } from "../../lib/action-error";
 import { roostStore } from "../../stores/roost";
 import { tabStore } from "../../stores/tabs";
 import { promptStore } from "../Modals/PromptModal";
@@ -38,7 +39,10 @@ export default function SkillsPanel() {
       await unwrap(commands.skillRefresh(roostStore.roostPath() ?? null));
       await refetch();
     } catch (e) {
-      log.error("skills", "skill_refresh failed", e);
+      reportActionError("Failed to refresh skills", e, {
+        code: "SKILL_REFRESH_FAIL",
+        module: "skills",
+      });
     }
   };
 
