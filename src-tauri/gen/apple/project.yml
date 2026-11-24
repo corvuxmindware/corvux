@@ -51,7 +51,7 @@ targets:
           - UIInterfaceOrientationPortraitUpsideDown
           - UIInterfaceOrientationLandscapeLeft
           - UIInterfaceOrientationLandscapeRight
-        CFBundleShortVersionString: 0.2.4
+        CFBundleShortVersionString: 0.2.5
         CFBundleVersion: "24"
     entitlements:
       path: corvux_iOS/corvux_iOS.entitlements
