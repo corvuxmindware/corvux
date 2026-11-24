@@ -2,8 +2,8 @@
 //!
 //! Wraps `notify-debouncer-full` to emit [`LocalChange`] events for markdown
 //! files inside the roost. The watcher runs on a blocking thread (notify's
-//! native handler); events are bridged to async code via an unbounded Tokio
-//! channel.
+//! native handler); events are bridged to async code via a bounded Tokio
+//! channel; overflow requests a rescan without blocking the native callback.
 //!
 //! # Filtering
 //!
@@ -78,6 +78,132 @@ pub enum LocalChange {
 /// responsive to collaborators.
 const DEBOUNCE: Duration = Duration::from_millis(250);
 
+/// Bound pending filesystem work without dropping saves or removals.
+pub(crate) const LOCAL_CHANGE_CAPACITY: usize = 1024;
+
+/// Overflow is coalesced into a rescan request, never an unbounded path list.
+#[derive(Default)]
+struct Overflow {
+    pending: std::sync::atomic::AtomicBool,
+    notify: tokio::sync::Notify,
+}
+
+#[derive(Clone)]
+pub struct ChangeSender {
+    sender: mpsc::Sender<LocalChange>,
+    overflow: std::sync::Arc<Overflow>,
+}
+
+pub(crate) struct ChangeReceiver {
+    receiver: mpsc::Receiver<LocalChange>,
+    overflow: std::sync::Arc<Overflow>,
+    last_rescan: Option<tokio::time::Instant>,
+}
+
+#[derive(Debug)]
+pub(crate) enum WatcherEvent {
+    Change(LocalChange),
+    Rescan,
+}
+
+pub(crate) fn change_channel() -> (ChangeSender, ChangeReceiver) {
+    let (sender, receiver) = mpsc::channel(LOCAL_CHANGE_CAPACITY);
+    let overflow = std::sync::Arc::new(Overflow::default());
+    (
+        ChangeSender {
+            sender,
+            overflow: overflow.clone(),
+        },
+        ChangeReceiver {
+            receiver,
+            overflow,
+            last_rescan: None,
+        },
+    )
+}
+
+impl ChangeSender {
+    fn request_rescan(&self) {
+        self.overflow
+            .pending
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.overflow.notify.notify_one();
+    }
+
+    fn send(&self, change: LocalChange) -> Result<(), ()> {
+        match self.sender.try_send(change) {
+            Ok(()) => Ok(()),
+            Err(mpsc::error::TrySendError::Closed(_)) => Err(()),
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                self.request_rescan();
+                Ok(())
+            }
+        }
+    }
+}
+
+impl ChangeReceiver {
+    pub(crate) fn request_rescan(&self) {
+        self.overflow
+            .pending
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.overflow.notify.notify_one();
+    }
+
+    pub(crate) async fn recv(&mut self) -> Option<WatcherEvent> {
+        loop {
+            if self
+                .overflow
+                .pending
+                .load(std::sync::atomic::Ordering::Acquire)
+            {
+                if let Some(last) = self.last_rescan {
+                    tokio::time::sleep_until(last + Duration::from_secs(1)).await;
+                }
+                self.overflow
+                    .pending
+                    .store(false, std::sync::atomic::Ordering::Release);
+                self.last_rescan = Some(tokio::time::Instant::now());
+                return Some(WatcherEvent::Rescan);
+            }
+            tokio::select! {
+                _ = self.overflow.notify.notified() => {},
+                change = self.receiver.recv() => return change.map(WatcherEvent::Change),
+            }
+        }
+    }
+}
+
+/// Enumerate exactly the markdown families accepted by the watcher, including
+/// user-authored AI definitions while excluding device-private .corvux state.
+pub(crate) async fn list_watchable_paths(
+    fs: &dyn crate::roostfs::RoostFs,
+) -> Result<Vec<(String, String)>, String> {
+    let mut paths: std::collections::BTreeMap<String, String> =
+        crate::roostfs::walk::list_markdown_path_pairs(fs)
+            .await?
+            .into_iter()
+            .map(|(full, rel)| (rel, full))
+            .collect();
+    for prefix in SYNCABLE_CORVUX_PREFIXES {
+        let prefix = prefix.trim_end_matches('/');
+        if !fs.exists(prefix).await.map_err(|e| e.to_string())? {
+            continue;
+        }
+        for entry in fs.list_recursive(prefix).await.map_err(|e| e.to_string())? {
+            if !entry.is_dir && crate::roostfs::walk::is_markdown_name(&entry.name) {
+                let full = format!(
+                    "{}/{}",
+                    fs.display_root().trim_end_matches(['/', '\\']),
+                    entry.rel_path
+                );
+                paths.insert(entry.rel_path, full);
+            }
+        }
+    }
+    Ok(paths.into_iter().map(|(rel, full)| (full, rel)).collect())
+}
+
 /// Handle on a running watcher. Drop to stop.
 pub struct RoostWatcher {
     _debouncer: Debouncer<notify::RecommendedWatcher, RecommendedCache>,
@@ -87,14 +213,20 @@ impl RoostWatcher {
     /// Start watching `roost` recursively. Change events are pushed onto
     /// `out`. Returns a handle that must be kept alive for the watcher to
     /// run — dropping it stops the watcher.
-    pub fn start(
-        roost: PathBuf,
-        out: mpsc::UnboundedSender<LocalChange>,
-    ) -> Result<Self, StoreError> {
+    pub fn start(roost: PathBuf, out: ChangeSender) -> Result<Self, StoreError> {
         let roost_for_handler = roost.clone();
         let mut debouncer =
             new_debouncer(DEBOUNCE, None, move |res: DebounceEventResult| match res {
                 Ok(events) => {
+                    // A pending rescan already covers this whole batch. Avoid
+                    // expensive per-path canonicalization while overloaded.
+                    if out
+                        .overflow
+                        .pending
+                        .load(std::sync::atomic::Ordering::Acquire)
+                    {
+                        return;
+                    }
                     for ev in events {
                         for path in &ev.paths {
                             if let Some(change) = classify(&roost_for_handler, path, &ev.kind) {
@@ -102,11 +234,19 @@ impl RoostWatcher {
                                     // Receiver gone; engine has shut down.
                                     return;
                                 }
+                                if out
+                                    .overflow
+                                    .pending
+                                    .load(std::sync::atomic::Ordering::Acquire)
+                                {
+                                    return;
+                                }
                             }
                         }
                     }
                 }
                 Err(errors) => {
+                    out.request_rescan();
                     for e in errors {
                         warn!(error = %e, "notify error");
                     }
@@ -287,6 +427,66 @@ fn is_watchable(roost: &Path, path: &Path) -> bool {
 
 #[cfg(test)]
 mod tests {
+
+    #[tokio::test]
+    async fn rescan_includes_syncable_ai_definitions_but_no_private_state() {
+        let root = tempfile::tempdir().unwrap();
+        for rel in [
+            "note.md",
+            ".corvux/skills/example/SKILL.md",
+            ".corvux/agents/example/AGENT.md",
+            ".corvux/memory.md",
+        ] {
+            let path = root.path().join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, b"content").unwrap();
+        }
+        let backend = crate::roostfs::native::NativeFs::new(root.path());
+        let paths: std::collections::BTreeSet<_> = list_watchable_paths(&backend)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|(_, rel)| rel)
+            .collect();
+        assert_eq!(
+            paths,
+            std::collections::BTreeSet::from([
+                "note.md".to_string(),
+                ".corvux/skills/example/SKILL.md".to_string(),
+                ".corvux/agents/example/AGENT.md".to_string()
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn flood_is_bounded_and_coalesces_into_a_rescan() {
+        let (tx, mut rx) = change_channel();
+        for index in 0..LOCAL_CHANGE_CAPACITY + 10_000 {
+            tx.send(LocalChange::Removed {
+                path: NotePath(format!("note-{index}.md")),
+            })
+            .unwrap();
+        }
+        assert_eq!(tx.sender.capacity(), 0);
+        assert!(matches!(rx.recv().await, Some(WatcherEvent::Rescan)));
+        for _ in 0..LOCAL_CHANGE_CAPACITY {
+            assert!(matches!(rx.recv().await, Some(WatcherEvent::Change(_))));
+        }
+        drop(tx);
+        assert!(rx.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn rescan_wakeup_is_not_lost_when_the_data_queue_is_empty() {
+        let (_tx, mut rx) = change_channel();
+        rx.request_rescan();
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(1), rx.recv())
+                .await
+                .unwrap(),
+            Some(WatcherEvent::Rescan)
+        ));
+    }
     use super::*;
     use tempfile::tempdir;
 
@@ -434,7 +634,7 @@ mod tests {
         // FSEvents fires from the canonical path; if we watch the symlinked one
         // events never match. Canonicalize before arming the watcher.
         let roost = tmp.path().canonicalize().unwrap();
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = change_channel();
         let _w = RoostWatcher::start(roost.clone(), tx).unwrap();
 
         // Give the watcher a moment to arm.
@@ -447,7 +647,7 @@ mod tests {
             .expect("watcher should emit within 3s")
             .expect("channel should deliver an event");
         match got {
-            LocalChange::Modified { path, .. } => {
+            WatcherEvent::Change(LocalChange::Modified { path, .. }) => {
                 assert_eq!(path.0, "hello.md");
             }
             other => panic!("expected Modified, got {other:?}"),
@@ -461,7 +661,7 @@ mod tests {
         let corvux = roost.join(".corvux").join("sync").join("docs");
         std::fs::create_dir_all(&corvux).unwrap();
 
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = change_channel();
         let _w = RoostWatcher::start(roost.clone(), tx).unwrap();
         tokio::time::sleep(Duration::from_millis(50)).await;
 
@@ -476,7 +676,10 @@ mod tests {
         // ever does.
         let mut saw_real = false;
         while let Ok(Some(ev)) = tokio::time::timeout(Duration::from_millis(800), rx.recv()).await {
-            match ev {
+            match match ev {
+                WatcherEvent::Change(change) => change,
+                WatcherEvent::Rescan => panic!("unexpected test rescan"),
+            } {
                 LocalChange::Modified { path, .. }
                 | LocalChange::ModifiedWithContent { path, .. }
                 | LocalChange::Removed { path }

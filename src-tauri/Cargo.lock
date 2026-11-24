@@ -1172,6 +1172,7 @@ dependencies = [
  "hmac",
  "iroh",
  "keyring",
+ "libc",
  "llama-cpp-2",
  "mdns-sd",
  "ndarray 0.15.6",

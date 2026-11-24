@@ -311,7 +311,8 @@ fn jwt_segment_len(bytes: &[u8], start: usize) -> usize {
 
 /// `https?://[^/]+:[^/]+@host/...` — URL with credentials embedded.
 fn detect_url_credentials(s: &str, field: &str, out: &mut Vec<SecretWarning>) {
-    let lower = s.to_lowercase();
+    // Schemes are ASCII; a Unicode fold can change byte lengths before a URL.
+    let lower = s.to_ascii_lowercase();
     for needle in ["http://", "https://"] {
         let mut search_from = 0;
         while let Some(rel) = lower[search_from..].find(needle) {
@@ -335,7 +336,7 @@ fn detect_url_credentials(s: &str, field: &str, out: &mut Vec<SecretWarning>) {
                         && !user.contains('/')
                         && !pass.contains('/')
                     {
-                        let m = &s[url_start..end.min(url_start + 60)];
+                        let m = super::utf8_prefix(&s[url_start..end], 60);
                         record(out, SecretKind::UrlCredentials, field, masked_preview(m));
                     }
                 }
@@ -411,6 +412,21 @@ fn is_token_char(c: u8) -> bool {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn url_credentials_keep_unicode_offsets_and_preview_boundaries() {
+        let mut warnings = Vec::new();
+        detect_url_credentials("\u{130}https://\u{fc}", "body", &mut warnings);
+        assert!(warnings.is_empty());
+        let text = format!(
+            "\u{212a}\u{130}HTTPS://user:{}@host/path",
+            "\u{754c}".repeat(40)
+        );
+        detect_url_credentials(&text, "body", &mut warnings);
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].kind, SecretKind::UrlCredentials);
+    }
+
     use super::*;
     use serde_json::json;
 

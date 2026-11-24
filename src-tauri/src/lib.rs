@@ -635,6 +635,7 @@ pub fn run() {
             // runs once per install — subsequent launches load straight from
             // the keychain.
             if secret_store::is_supported() {
+                let disk_settings = settings.clone();
                 let disk_key = settings.gemini_api_key.take();
                 let kc_key = secret_store::get(secret_store::keys::GEMINI_API_KEY)
                     .ok()
@@ -648,9 +649,7 @@ pub fn run() {
                             tracing::warn!("keychain migration failed, leaving key on disk: {e}");
                             Some(k)
                         } else {
-                            if let Ok(json) = serde_json::to_string_pretty(&settings) {
-                                let _ = std::fs::write(&settings_path, json);
-                            }
+                            // Plaintext cleanup is atomic and retried below.
                             Some(k)
                         }
                     }
@@ -676,9 +675,7 @@ pub fn run() {
                             );
                             Some(k)
                         } else {
-                            if let Ok(json) = serde_json::to_string_pretty(&settings) {
-                                let _ = std::fs::write(&settings_path, json);
-                            }
+                            // Plaintext cleanup is atomic and retried below.
                             Some(k)
                         }
                     }
@@ -706,9 +703,7 @@ pub fn run() {
                             );
                             Some(k)
                         } else {
-                            if let Ok(json) = serde_json::to_string_pretty(&settings) {
-                                let _ = std::fs::write(&settings_path, json);
-                            }
+                            // Plaintext cleanup is atomic and retried below.
                             Some(k)
                         }
                     }
@@ -730,9 +725,7 @@ pub fn run() {
                             );
                             Some(k)
                         } else {
-                            if let Ok(json) = serde_json::to_string_pretty(&settings) {
-                                let _ = std::fs::write(&settings_path, json);
-                            }
+                            // Plaintext cleanup is atomic and retried below.
                             Some(k)
                         }
                     }
@@ -755,15 +748,17 @@ pub fn run() {
                             );
                             Some(k)
                         } else {
-                            if let Ok(json) = serde_json::to_string_pretty(&settings) {
-                                let _ = std::fs::write(&settings_path, json);
-                            }
+                            // Plaintext cleanup is atomic and retried below.
                             Some(k)
                         }
                     }
                     _ => None,
                 };
                 settings.anthropic_api_key = an_resolved;
+                // A prior keychain hit must also retry a failed disk cleanup.
+                if let Err(error) = commands::ai::settings::cleanup_migrated_keys(&settings_path, &disk_settings) {
+                    tracing::warn!(%error, "provider key cleanup failed; will retry next launch");
+                }
             }
 
             // Apply the persisted launch-at-startup choice to the OS

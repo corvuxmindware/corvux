@@ -490,48 +490,42 @@ impl SyncEngine {
         // note. The inner heads-CAS is now belt-and-suspenders under this
         // guard but kept for defence in depth. Held outermost, before the
         // DocStore lock. See `note_locks`.
-        let _note_guard = self.inner.note_locks.lock(&note).await;
+        let _note_guard = Arc::new(self.inner.note_locks.lock(&note).await);
+        let bytes = Arc::<[u8]>::from(bytes);
         const MAX_ADOPT_ATTEMPTS: usize = 4;
         let mut doc = None;
         for attempt in 1..=MAX_ADOPT_ATTEMPTS {
             // ── Snapshot + compute under the lock ──
-            let mut conflict_backup: Option<String> = None;
-            // Whether this is a FRESH adoption (no prior DocStore record). Drives
-            // the Hole-A untracked-file guard below — the same guard the live
-            // path has, previously absent here.
-            let mut adopted_fresh = false;
-            // The stored doc's heads BEFORE we touch it — our CAS token. `None`
-            // means "no doc on disk for this note" (a concurrent create then
-            // shows up as a heads mismatch too).
-            let mut snapshot_heads: Option<Vec<automerge::ChangeHash>> = None;
-            let mut candidate = {
-                let store = self.inner.doc_store.lock().await;
-                let our_actor = store.our_actor_id();
-                if store.exists(&note) {
-                    let mut local = store.load_or_create(&note)?;
-                    // Capture heads BEFORE the merge mutates `local`.
-                    snapshot_heads = Some(local.heads());
-                    match NoteDoc::load_with_actor(bytes, our_actor.clone()) {
-                        Ok(mut remote) => match local.merge(&mut remote) {
-                            Ok(_) => local,
-                            Err(_) => {
-                                // QUARANTINE: a queued FullDoc that fails to
-                                // merge would otherwise silently overwrite local
-                                // edits made while this device was offline —
-                                // exactly the window the queue exists to bridge.
-                                // Save them first.
-                                conflict_backup =
-                                    local.render().ok().filter(|t| !t.trim().is_empty());
-                                NoteDoc::load_with_actor(bytes, our_actor)?
+            let (mut candidate, mut conflict_backup, adopted_fresh, snapshot_heads) = {
+                let note = note.clone();
+                let bytes = bytes.clone();
+                super::util::store_task(
+                    self.inner.doc_store.clone(),
+                    _note_guard.clone(),
+                    move |store| {
+                        let our_actor = store.our_actor_id();
+                        let adopted_fresh = !store.exists(&note);
+                        let mut conflict_backup = None;
+                        let mut snapshot_heads = None;
+                        let candidate = if !adopted_fresh {
+                            let mut local = store.load_or_create(&note)?;
+                            snapshot_heads = Some(local.heads());
+                            let mut remote = NoteDoc::load_with_actor(&bytes, our_actor.clone())?;
+                            match local.merge(&mut remote) {
+                                Ok(_) => local,
+                                Err(_) => {
+                                    conflict_backup =
+                                        local.render().ok().filter(|text| !text.trim().is_empty());
+                                    NoteDoc::load_with_actor(&bytes, our_actor)?
+                                }
                             }
-                        },
-                        Err(e) => return Err(e),
-                    }
-                } else {
-                    adopted_fresh = true;
-                    NoteDoc::load_with_actor(bytes, our_actor)?
-                }
-                // lock dropped here — backup I/O must not hold it
+                        } else {
+                            NoteDoc::load_with_actor(&bytes, our_actor)?
+                        };
+                        Ok((candidate, conflict_backup, adopted_fresh, snapshot_heads))
+                    },
+                )
+                .await?
             };
 
             // ── FAIL-CLOSED backups, lock released ──
@@ -584,13 +578,12 @@ impl SyncEngine {
                     )
                     .await
                     {
-                        let existing_text = String::from_utf8_lossy(&existing);
-                        if !existing_text.trim().is_empty() && existing_text != incoming {
-                            match super::peer::write_conflict_artifact(
+                        if existing != incoming.as_bytes() {
+                            match super::peer::write_conflict_bytes(
                                 &self.inner.roost,
                                 self.inner.roost_fs.as_deref(),
                                 &note,
-                                &existing_text,
+                                &existing,
                             )
                             .await
                             {
@@ -623,21 +616,29 @@ impl SyncEngine {
             }
 
             // ── Commit under the lock, guarded by the CAS token ──
-            {
-                let store = self.inner.doc_store.lock().await;
-                let current_heads: Option<Vec<automerge::ChangeHash>> = if store.exists(&note) {
-                    Some(store.load_or_create(&note)?.heads())
-                } else {
-                    None
-                };
-                if current_heads == snapshot_heads {
-                    store.save(&note, &mut candidate)?;
-                    doc = Some(candidate);
-                    break;
-                }
-                // else: a concurrent write landed in the backup window — fall
-                // through, drop the lock, and re-run the adoption against the
-                // now-current state.
+            let committed = {
+                let note = note.clone();
+                super::util::store_task(
+                    self.inner.doc_store.clone(),
+                    _note_guard.clone(),
+                    move |store| {
+                        let current_heads = if store.exists(&note) {
+                            Some(store.load_or_create(&note)?.heads())
+                        } else {
+                            None
+                        };
+                        if current_heads != snapshot_heads {
+                            return Ok(None);
+                        }
+                        store.save(&note, &mut candidate)?;
+                        Ok(Some(candidate))
+                    },
+                )
+                .await?
+            };
+            if let Some(candidate) = committed {
+                doc = Some(candidate);
+                break;
             }
             if attempt == MAX_ADOPT_ATTEMPTS {
                 warn!(
@@ -721,6 +722,33 @@ impl SyncEngine {
 
 #[cfg(test)]
 mod tests {
+
+    #[tokio::test]
+    async fn queue_adopt_preserves_non_utf8_original_bytes() {
+        let (engine, roost, _app) = setup_engine();
+        let bytes = b"LOCAL\xffCONTENT";
+        std::fs::write(roost.path().join("note.md"), bytes).unwrap();
+        let mut remote = NoteDoc::new(dev(9)).unwrap();
+        remote
+            .apply_markdown(&String::from_utf8_lossy(bytes))
+            .unwrap();
+        engine
+            .apply_queue_full_doc(dev(2), NotePath("note.md".into()), &remote.save())
+            .await
+            .unwrap();
+        let saved: Vec<_> = std::fs::read_dir(roost.path())
+            .unwrap()
+            .flatten()
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with("note.conflict-")
+            })
+            .collect();
+        assert_eq!(saved.len(), 1);
+        assert_eq!(std::fs::read(saved[0].path()).unwrap(), bytes);
+    }
+
     use super::*;
     use crate::sync::identity::Identity;
     use crate::sync::transport::tcp_tls::TlsIdentity;

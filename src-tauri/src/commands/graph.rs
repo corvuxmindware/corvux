@@ -1100,31 +1100,30 @@ pub async fn purge_note_from_graph(
     db_state: State<'_, GraphDb>,
 ) -> Result<(), String> {
     validate_graph_path(&path)?;
-    let db_guard = db_state.db.lock().map_err(|e| format!("Lock error: {e}"))?;
-    let db = db_guard.as_ref().ok_or("Graph DB not initialized")?;
-    let note_id = {
-        let roost_guard = db_state
-            .roost_path
-            .lock()
-            .map_err(|e| format!("Lock error: {e}"))?;
-        let roost_root = roost_guard.as_deref().ok_or("Roost path not set")?;
-        queries::note_id_from_abs_path(&path, roost_root)
-    };
-    let purge_result = queries::purge_note(db, &note_id).map_err(|errs| {
-        for e in &errs {
-            tracing::warn!(%note_id, error = %e, "purge_note_from_graph: relation failed");
-        }
-        format!(
-            "Graph purge was incomplete for {note_id}: {}",
-            errs.join("; ")
-        )
-    });
-    drop(db_guard);
-    db_state.invalidate_link_resolver();
-    // NEW-S2: note count + its tasks just dropped — stale-out the cached
-    // stats snapshot so the unchanged-save fast path recomputes.
-    db_state.invalidate_stats_cache();
-    purge_result
+    with_locked_db_blocking(&db_state, |db| {
+        let note_id = {
+            let roost_guard = db_state
+                .roost_path
+                .lock()
+                .map_err(|e| format!("Lock error: {e}"))?;
+            let roost_root = roost_guard.as_deref().ok_or("Roost path not set")?;
+            queries::note_id_from_abs_path(&path, roost_root)
+        };
+        let purge_result = queries::purge_note(db, &note_id).map_err(|errs| {
+            for e in &errs {
+                tracing::warn!(%note_id, error = %e, "purge_note_from_graph: relation failed");
+            }
+            format!(
+                "Graph purge was incomplete for {note_id}: {}",
+                errs.join("; ")
+            )
+        });
+        db_state.invalidate_link_resolver();
+        // NEW-S2: note count + its tasks just dropped — stale-out the cached
+        // stats snapshot so the unchanged-save fast path recomputes.
+        db_state.invalidate_stats_cache();
+        purge_result
+    })
 }
 
 /// AUDIT-053: shared internals for the graph half of a save. Used by
@@ -1328,19 +1327,19 @@ pub async fn get_backlinks(
     db_state: State<'_, GraphDb>,
 ) -> Result<Vec<BacklinkResult>, String> {
     validate_graph_path(&note_path)?;
-    let guard = db_state.db.lock().map_err(|e| format!("Lock error: {e}"))?;
-    let db = guard.as_ref().ok_or("Graph DB not initialized")?;
-    let Some(note_id) = queries::lookup_note_id_by_path(db, &note_path)? else {
-        return Ok(Vec::new());
-    };
-    let entries = queries::get_backlinks(db, &note_id)?;
-    Ok(entries
-        .into_iter()
-        .map(|e| BacklinkResult {
-            title: e.title,
-            path: e.path,
-        })
-        .collect())
+    with_locked_db_blocking(&db_state, |db| {
+        let Some(note_id) = queries::lookup_note_id_by_path(db, &note_path)? else {
+            return Ok(Vec::new());
+        };
+        let entries = queries::get_backlinks(db, &note_id)?;
+        Ok(entries
+            .into_iter()
+            .map(|e| BacklinkResult {
+                title: e.title,
+                path: e.path,
+            })
+            .collect())
+    })
 }
 
 /// Get forward links for a note (notes this note links TO).
@@ -1351,19 +1350,19 @@ pub async fn get_note_links(
     db_state: State<'_, GraphDb>,
 ) -> Result<Vec<ForwardLinkResult>, String> {
     validate_graph_path(&note_path)?;
-    let guard = db_state.db.lock().map_err(|e| format!("Lock error: {e}"))?;
-    let db = guard.as_ref().ok_or("Graph DB not initialized")?;
-    let Some(note_id) = queries::lookup_note_id_by_path(db, &note_path)? else {
-        return Ok(Vec::new());
-    };
-    let entries = queries::get_note_links(db, &note_id)?;
-    Ok(entries
-        .into_iter()
-        .map(|e| ForwardLinkResult {
-            target: e.target,
-            link_text: e.link_text,
-        })
-        .collect())
+    with_locked_db_blocking(&db_state, |db| {
+        let Some(note_id) = queries::lookup_note_id_by_path(db, &note_path)? else {
+            return Ok(Vec::new());
+        };
+        let entries = queries::get_note_links(db, &note_id)?;
+        Ok(entries
+            .into_iter()
+            .map(|e| ForwardLinkResult {
+                target: e.target,
+                link_text: e.link_text,
+            })
+            .collect())
+    })
 }
 
 /// PageRank — top hub notes ordered by rank descending. Returns from
@@ -1563,25 +1562,25 @@ pub async fn get_note_tags(
     db_state: State<'_, GraphDb>,
 ) -> Result<Vec<String>, String> {
     validate_graph_path(&note_path)?;
-    let guard = db_state.db.lock().map_err(|e| format!("Lock error: {e}"))?;
-    let db = guard.as_ref().ok_or("Graph DB not initialized")?;
-    let Some(note_id) = queries::lookup_note_id_by_path(db, &note_path)? else {
-        return Ok(Vec::new());
-    };
-    queries::get_note_tags(db, &note_id)
+    with_locked_db_blocking(&db_state, |db| {
+        let Some(note_id) = queries::lookup_note_id_by_path(db, &note_path)? else {
+            return Ok(Vec::new());
+        };
+        queries::get_note_tags(db, &note_id)
+    })
 }
 
 /// Get graph-wide statistics.
 #[tauri::command]
 #[specta::specta]
 pub async fn get_graph_stats(db_state: State<'_, GraphDb>) -> Result<GraphStatsResult, String> {
-    let guard = db_state.db.lock().map_err(|e| format!("Lock error: {e}"))?;
-    let db = guard.as_ref().ok_or("Graph DB not initialized")?;
-    let stats = queries::get_graph_stats(db)?;
-    Ok(GraphStatsResult {
-        notes: stats.notes,
-        links: stats.links,
-        tags: stats.tags,
+    with_locked_db_blocking(&db_state, |db| {
+        let stats = queries::get_graph_stats(db)?;
+        Ok(GraphStatsResult {
+            notes: stats.notes,
+            links: stats.links,
+            tags: stats.tags,
+        })
     })
 }
 

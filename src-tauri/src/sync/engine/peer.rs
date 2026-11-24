@@ -1257,8 +1257,11 @@ async fn handle_inbound<T: Transport>(
             // NOTE: reached both directly and via the FullDocChunk final-chunk
             // re-dispatch — which deliberately does NOT hold this guard, so
             // acquiring here is not a re-entry (see note_locks invariants).
-            let _note_guard = ctx.note_locks.lock(&path).await;
-            let store = ctx.doc_store.lock().await;
+            let _note_guard = Arc::new(ctx.note_locks.lock(&path).await);
+            let snapshot = {
+                let path = path.clone();
+                let events = ctx.events.clone();
+                super::util::store_task(ctx.doc_store.clone(), _note_guard.clone(), move |store| {
             // Adoption vs. merge:
             //
             // If we have no existing doc for this note, we **adopt** the
@@ -1306,7 +1309,7 @@ async fn handle_inbound<T: Transport>(
             // `render_to_roost` overwrite would erase it with no trace. We back
             // it up after the store lock drops (disk I/O off the lock).
             let adopted_fresh = !store.exists(&path);
-            let mut doc = if store.exists(&path) {
+            let doc = if store.exists(&path) {
                 let mut local = store.load_or_create(&path)?;
                 // Capture the CAS token BEFORE the merge mutates `local`.
                 snapshot_heads = Some(local.heads());
@@ -1341,12 +1344,12 @@ async fn handle_inbound<T: Transport>(
                                     // SYN-I5/B8: previously silent. Surface like
                                     // the parse-fail sibling below so a note we
                                     // couldn't adopt isn't shown as synced.
-                                    let _ = ctx.events.send(SyncEvent::NoteSyncFailed {
+                                    let _ = events.send(SyncEvent::NoteSyncFailed {
                                         path: path.0.clone(),
                                         reason: "incoming copy couldn't be read on retry (corrupt)"
                                             .into(),
                                     });
-                                    return Ok(false);
+                                    return Ok(None);
                                 }
                             }
                         }
@@ -1359,12 +1362,12 @@ async fn handle_inbound<T: Transport>(
                         );
                         // H-6: covers a schema too new to load (C-5) as well as
                         // a corrupt/undecodable FullDoc — previously silent.
-                        let _ = ctx.events.send(SyncEvent::NoteSyncFailed {
+                        let _ = events.send(SyncEvent::NoteSyncFailed {
                             path: path.0.clone(),
                             reason: "incoming copy couldn't be read (corrupt or newer schema)"
                                 .into(),
                         });
-                        return Ok(false);
+                        return Ok(None);
                     }
                 }
             } else {
@@ -1376,12 +1379,12 @@ async fn handle_inbound<T: Transport>(
                             error = %e,
                             "handle_inbound: FullDoc into-empty failed — skipping note (peer's stored doc is corrupt)"
                         );
-                        let _ = ctx.events.send(SyncEvent::NoteSyncFailed {
+                        let _ = events.send(SyncEvent::NoteSyncFailed {
                             path: path.0.clone(),
                             reason: "incoming copy couldn't be read (corrupt or newer schema)"
                                 .into(),
                         });
-                        return Ok(false);
+                        return Ok(None);
                     }
                 }
             };
@@ -1395,7 +1398,14 @@ async fn handle_inbound<T: Transport>(
             // keep local, surface `NoteSyncFailed`, and let a future round retry
             // the whole adopt (backup-first). Disk I/O must not hold the store
             // lock, and the commit below re-locks, so drop the lock now.
-            drop(store);
+
+                    Ok(Some((doc, conflict_backup, snapshot_heads, adopted_fresh)))
+                }).await?
+            };
+            let Some((mut doc, mut conflict_backup, snapshot_heads, adopted_fresh)) = snapshot
+            else {
+                return Ok(false);
+            };
 
             // (a) Merge-divergence: local CRDT edits captured just before the
             //     adopt discarded them.
@@ -1440,13 +1450,12 @@ async fn handle_inbound<T: Transport>(
                     if let Some(existing) =
                         read_note_on_disk(&ctx.roost, ctx.roost_fs.as_deref(), &path).await
                     {
-                        let existing_text = String::from_utf8_lossy(&existing);
-                        if !existing_text.trim().is_empty() && existing_text != incoming {
-                            match write_conflict_artifact(
+                        if existing != incoming.as_bytes() {
+                            match write_conflict_bytes(
                                 &ctx.roost,
                                 ctx.roost_fs.as_deref(),
                                 &path,
-                                &existing_text,
+                                &existing,
                             )
                             .await
                             {
@@ -1475,43 +1484,36 @@ async fn handle_inbound<T: Transport>(
                 }
             }
 
-            // Backups are safe (or there was nothing to preserve) — COMMIT the
-            // adopt now. Same defensive wrap as the SyncMessage path: a save can
-            // fail on internal corruption even after a successful load. Don't
-            // kill the peer task; the user can manually "Reset sync history" if
-            // the bad note is critical.
-            {
-                let store = ctx.doc_store.lock().await;
-                // B1 CAS: if a concurrent local save moved the stored doc's
-                // heads while the lock was released for backup I/O, do NOT
-                // overwrite it. Skip this round; the sync state for this path is
-                // untouched, so the next exchange re-detects the divergence and
-                // re-adopts against the fresh local (no data loss).
-                let current_heads: Option<Vec<automerge::ChangeHash>> = if store.exists(&path) {
-                    Some(store.load_or_create(&path)?.heads())
-                } else {
-                    None
-                };
-                if current_heads != snapshot_heads {
-                    warn!(
-                        path = %path,
-                        "handle_inbound: note changed locally during the adopt backup window — skipping this round, will re-merge on the next exchange"
-                    );
+            // Re-check the CAS token and commit on the blocking pool. The job
+            // owns a share of the note/reset guard until all disk I/O finishes.
+            let committed = {
+                let path = path.clone();
+                super::util::store_task(ctx.doc_store.clone(), _note_guard.clone(), move |store| {
+                    let current_heads = if store.exists(&path) {
+                        Some(store.load_or_create(&path)?.heads())
+                    } else {
+                        None
+                    };
+                    if current_heads != snapshot_heads {
+                        return Ok(None);
+                    }
+                    if let Err(error) = store.save(&path, &mut doc) {
+                        let _ = store.remove(&path);
+                        return Err(error.into());
+                    }
+                    Ok(Some(doc))
+                })
+                .await
+            };
+            let mut doc = match committed {
+                Ok(Some(doc)) => doc,
+                Ok(None) => {
+                    warn!(path = %path, "handle_inbound: note changed during backup; retrying next exchange");
                     return Ok(false);
                 }
-                if let Err(e) = store.save(&path, &mut doc) {
-                    let msg = e.to_string();
-                    warn!(
-                        path = %path,
-                        error = %msg,
-                        "handle_inbound: FullDoc save failed — dropping this note from local store"
-                    );
-                    let _ = store.remove(&path);
+                Err(error) => {
+                    warn!(path = %path, %error, "handle_inbound: FullDoc commit failed");
                     ctx.sync.forget(&path);
-                    // SYN-I5/B8: surface it (the SyncMessage save-fail twin
-                    // already does). `forget` above gives the durable retry
-                    // (peer re-offers next exchange); this stops the UI showing
-                    // the note as synced when it isn't on disk.
                     let _ = ctx.events.send(SyncEvent::NoteSyncFailed {
                         path: path.0.clone(),
                         reason: "could not save adopted note (disk full or permission denied)"
@@ -1519,16 +1521,9 @@ async fn handle_inbound<T: Transport>(
                     });
                     return Ok(false);
                 }
-                info!(
-                    peer = %ctx.peer_display_name,
-                    path = %path,
-                    "sync: adopted FullDoc from peer"
-                );
-                // Reset our sync state for this path so the next exchange starts
-                // from the adopted heads, not the stale pre-conflict heads that
-                // would otherwise keep re-triggering the error.
-                ctx.sync.forget(&path);
-            }
+            };
+            info!(peer = %ctx.peer_display_name, path = %path, "sync: adopted FullDoc from peer");
+            ctx.sync.forget(&path);
 
             // Adopted doc may itself be a tombstone (peer deleted while we
             // had no copy) — reconcile handles both render and trash.
@@ -2427,9 +2422,14 @@ pub(super) fn conflict_note_path(note: &NotePath, content_hash: &str) -> NotePat
 /// exists to preserve. 128 bits pushes the birthday bound to 2^64, collision-
 /// free in practice. Identical text still shares one filename (idempotent) —
 /// that reuse is intended; distinct-text collision is the bug this closes.
+#[cfg(test)]
 fn conflict_content_hash(text: &str) -> String {
+    conflict_bytes_hash(text.as_bytes())
+}
+
+fn conflict_bytes_hash(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
-    let digest = Sha256::digest(text.as_bytes());
+    let digest = Sha256::digest(bytes);
     hex::encode(&digest[..16])
 }
 
@@ -2475,12 +2475,23 @@ pub(super) async fn write_conflict_artifact(
     note: &NotePath,
     text: &str,
 ) -> ConflictBackup {
-    if text.trim().is_empty() {
+    write_conflict_bytes(roost, roost_fs, note, text.as_bytes()).await
+}
+
+/// Preserve on-disk bytes verbatim, including content that cannot be decoded.
+/// Only valid UTF-8 whitespace qualifies for the empty-note exception.
+pub(super) async fn write_conflict_bytes(
+    roost: &std::path::Path,
+    roost_fs: Option<&dyn RoostFs>,
+    note: &NotePath,
+    bytes: &[u8],
+) -> ConflictBackup {
+    if std::str::from_utf8(bytes).is_ok_and(|text| text.trim().is_empty()) {
         return ConflictBackup::NothingToSave;
     }
     // M-6: content-addressed suffix — identical local text reuses one artifact
     // (idempotent, no pile-up), distinct text gets a distinct file.
-    let conflict = conflict_note_path(note, &conflict_content_hash(text));
+    let conflict = conflict_note_path(note, &conflict_bytes_hash(bytes));
 
     // One guarded write (resolve_fs → backend or on-demand NativeFs). The
     // artifact goes through safe_resolve + write_atomic, so a final-component or
@@ -2499,7 +2510,7 @@ pub(super) async fn write_conflict_artifact(
             }
         }
     }
-    match fs.write_atomic(rel, text.as_bytes()).await {
+    match fs.write_atomic(rel, bytes).await {
         Ok(()) => {
             warn!(path = %rel, "sync: saved local edits to conflict artifact before adopting remote");
             ConflictBackup::Saved(conflict)
@@ -2513,6 +2524,49 @@ pub(super) async fn write_conflict_artifact(
 
 #[cfg(test)]
 mod tests {
+
+    #[tokio::test]
+    async fn fresh_adopt_preserves_non_utf8_bytes_even_if_lossy_text_matches() {
+        let roost = tempfile::tempdir().unwrap();
+        let bytes = b"LOCAL\xffCONTENT";
+        std::fs::write(roost.path().join("note.md"), bytes).unwrap();
+        let store = Arc::new(Mutex::new(DocStore::new(
+            roost.path().to_path_buf(),
+            dev(1),
+        )));
+        store.lock().await.init().unwrap();
+        let mut remote = NoteDoc::new(dev(9)).unwrap();
+        let incoming = String::from_utf8_lossy(bytes).into_owned();
+        remote.apply_markdown(&incoming).unwrap();
+        let mut ctx = bootstrap_ctx(roost.path(), store);
+        let mut transport = MockTransport::pair().0;
+        handle_inbound(
+            &mut transport,
+            &mut ctx,
+            Message::FullDoc {
+                path: NotePath("note.md".into()),
+                bytes: remote.save(),
+            },
+        )
+        .await
+        .unwrap();
+        let saved: Vec<_> = std::fs::read_dir(roost.path())
+            .unwrap()
+            .flatten()
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with("note.conflict-")
+            })
+            .collect();
+        assert_eq!(saved.len(), 1);
+        assert_eq!(std::fs::read(saved[0].path()).unwrap(), bytes);
+        assert_eq!(
+            std::fs::read_to_string(roost.path().join("note.md")).unwrap(),
+            incoming
+        );
+    }
+
     use super::*;
     use crate::sync::crypto::pairing::Pin;
     use crate::sync::transport::mock::MockTransport;

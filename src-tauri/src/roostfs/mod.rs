@@ -17,6 +17,7 @@ use async_trait::async_trait;
 use serde::Serialize;
 use thiserror::Error;
 
+pub(crate) mod atomic;
 pub mod native;
 pub mod trash;
 pub mod walk;

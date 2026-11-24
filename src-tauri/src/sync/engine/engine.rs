@@ -44,6 +44,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::{broadcast, Mutex, RwLock};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -263,6 +264,8 @@ pub(super) struct SyncEngineInner {
 
     /// Drop to kill the watcher.
     pub(super) watcher: Mutex<Option<RoostWatcher>>,
+    /// Cap delayed deletion verifications before spawning, not inside a task.
+    tombstone_slots: Arc<tokio::sync::Semaphore>,
 
     /// Sender side of the watcher→engine change pipe. The engine fan-outs
     /// each change to every connected peer.
@@ -503,6 +506,7 @@ impl SyncEngine {
                 queue_pull_task: Mutex::new(None),
                 outbox_drain_task: Mutex::new(None),
                 watcher: Mutex::new(None),
+                tombstone_slots: Arc::new(tokio::sync::Semaphore::new(64)),
                 watcher_task: Mutex::new(None),
                 events,
                 pairing_rate_limiter: std::sync::Arc::new(std::sync::Mutex::new(
@@ -1186,12 +1190,20 @@ impl SyncEngine {
     /// re-check is self-cancelling: if a `Modified` for the same path lands in
     /// the window and rewrites the file, the probe simply finds it present and
     /// no tombstone is written — no explicit cancellation bookkeeping needed.
-    fn schedule_verified_tombstone(&self, note: crate::sync::protocol::NotePath) {
+    async fn schedule_verified_tombstone(&self, note: crate::sync::protocol::NotePath) {
+        let permit = tokio::select! {
+            _ = self.inner.cancel.cancelled() => return,
+            permit = self.inner.tombstone_slots.clone().acquire_owned() => match permit {
+                Ok(permit) => permit,
+                Err(_) => return,
+            },
+        };
         let engine = self.clone();
         // SYN-I4: tracked + cancel-aware. A pending verify-delay must not
         // outlive `stop()` (it would fire `verify_then_tombstone` into a
         // torn-down engine, or hold `tracker.wait()` for the full 1.2s delay).
         self.spawn_tracked(move |token| async move {
+            let _permit = permit;
             tokio::select! {
                 _ = token.cancelled() => {} // engine stopping — drop the pending tombstone
                 _ = tokio::time::sleep(Self::REMOVAL_VERIFY_DELAY) => {
@@ -1199,6 +1211,33 @@ impl SyncEngine {
                 }
             }
         });
+    }
+
+    /// Reconcile disk truth after event coalescing: ingest current notes,
+    /// publish index refreshes, and verify missing notes before tombstoning.
+    async fn reconcile_watcher_overflow(&self) -> SyncResult<()> {
+        self.scan_roost().await?;
+        let store = self.inner.doc_store.clone();
+        let known = tokio::task::spawn_blocking(move || store.blocking_lock().list())
+            .await
+            .map_err(|e| std::io::Error::other(e.to_string()))??;
+        let mut tick = tokio::time::interval(Duration::from_millis(5));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        for note in known {
+            if self.is_stopped() {
+                break;
+            }
+            if self.note_exists_on_disk(&note).await? {
+                tick.tick().await;
+                let _ = self
+                    .inner
+                    .events
+                    .send(SyncEvent::NoteWritten { path: note.0 });
+            } else {
+                self.schedule_verified_tombstone(note).await;
+            }
+        }
+        Ok(())
     }
 
     /// Start the roost watcher. Local markdown edits get fanned-out to
@@ -1214,7 +1253,7 @@ impl SyncEngine {
         if guard.is_some() {
             return Ok(());
         }
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<LocalChange>();
+        let (tx, mut rx) = super::watcher::change_channel();
 
         // Soft-start: on Android SAF roosts (`content://...`) the native
         // `notify` crate can't install a recursive watch — its inotify call
@@ -1304,12 +1343,27 @@ impl SyncEngine {
         // belt-and-suspenders abort in `stop()`.
         let task = self.spawn_tracked(move |token| async move {
             loop {
-                let change = tokio::select! {
+                let received = tokio::select! {
                     _ = token.cancelled() => break,
                     c = rx.recv() => match c {
                         Some(c) => c,
                         None => break, // watcher sender dropped
                     },
+                };
+                let change = match received {
+                    super::watcher::WatcherEvent::Change(change) => change,
+                    super::watcher::WatcherEvent::Rescan => {
+                        tokio::select! {
+                            _ = token.cancelled() => break,
+                            result = engine.reconcile_watcher_overflow() => {
+                                if let Err(error) = result {
+                                    warn!(%error, "watcher overflow reconciliation failed; retrying");
+                                    rx.request_rescan();
+                                }
+                            }
+                        }
+                        continue;
+                    }
                 };
                 // An external removal (Finder/Obsidian/agent shell deleting a
                 // file) must become a CRDT tombstone, not a destructive drop.
@@ -1321,7 +1375,7 @@ impl SyncEngine {
                     // event (rename churn, our own rewrite, iOS resume rescan)
                     // must not become a propagated tombstone — verify the file
                     // is really gone after a short delay first.
-                    engine.schedule_verified_tombstone(path.clone());
+                    engine.schedule_verified_tombstone(path.clone()).await;
                     continue;
                 }
                 // External folder delete (Finder/Explorer/agent shell removing
@@ -1349,7 +1403,7 @@ impl SyncEngine {
                         // a transient prefix event (e.g. iOS resume) must not
                         // tombstone every note under it. Each note is
                         // re-verified independently after the delay.
-                        engine.schedule_verified_tombstone(note);
+                        engine.schedule_verified_tombstone(note).await;
                     }
                     continue;
                 }
@@ -1552,6 +1606,83 @@ fn paths_under_prefix(
 
 #[cfg(test)]
 mod tests {
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn overflow_rescan_recovers_edits_creates_and_verified_deletions() {
+        let (engine, _roost, _app) = setup_engine();
+        let root = engine.inner.roost.clone();
+        for name in ["kept.md", "gone.md"] {
+            std::fs::write(root.join(name), b"original").unwrap();
+        }
+        assert_eq!(engine.scan_roost().await.unwrap(), 2);
+        std::fs::write(root.join("kept.md"), b"updated").unwrap();
+        std::fs::write(root.join("added.md"), b"new note").unwrap();
+        std::fs::remove_file(root.join("gone.md")).unwrap();
+        engine.reconcile_watcher_overflow().await.unwrap();
+        {
+            let store = engine.inner.doc_store.lock().await;
+            assert_eq!(
+                store
+                    .load_or_create(&NotePath("kept.md".into()))
+                    .unwrap()
+                    .render()
+                    .unwrap(),
+                "updated"
+            );
+            assert_eq!(
+                store
+                    .load_or_create(&NotePath("added.md".into()))
+                    .unwrap()
+                    .render()
+                    .unwrap(),
+                "new note"
+            );
+        }
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let deleted = engine
+                    .inner
+                    .doc_store
+                    .lock()
+                    .await
+                    .load_or_create(&NotePath("gone.md".into()))
+                    .unwrap()
+                    .is_deleted()
+                    .unwrap();
+                if deleted {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        engine.stop().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn saturated_deletion_quota_does_not_block_shutdown() {
+        let (engine, _roost, _app) = setup_engine();
+        let _held = engine
+            .inner
+            .tombstone_slots
+            .clone()
+            .acquire_many_owned(64)
+            .await
+            .unwrap();
+        let worker = engine.clone();
+        let task = tokio::spawn(async move {
+            worker
+                .schedule_verified_tombstone(NotePath("gone.md".into()))
+                .await;
+        });
+        tokio::task::yield_now().await;
+        engine.stop().await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap();
+    }
     use super::*;
     use crate::sync::crypto::pairing::Pin;
     use crate::sync::protocol::NotePath;
@@ -2915,7 +3046,9 @@ mod tests {
     async fn stop_cancels_and_drains_pending_tombstone_task() {
         let (engine, _v, _d) = setup_engine();
         // Schedule a verify-then-tombstone that sleeps 1.2s before acting.
-        engine.schedule_verified_tombstone(NotePath("live.md".into()));
+        engine
+            .schedule_verified_tombstone(NotePath("live.md".into()))
+            .await;
         assert!(
             !engine.inner.tracker.is_empty(),
             "the scheduled tombstone task should be tracked"

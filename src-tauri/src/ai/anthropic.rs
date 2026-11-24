@@ -180,7 +180,7 @@ async fn stream_chat_impl<R: tauri::Runtime>(
 
     if !response.status().is_success() {
         let status = response.status();
-        let body_text = response.text().await.unwrap_or_default();
+        let body_text = crate::ai::http::error_body(response).await;
         tracing::error!(
             status = %status,
             model = model,
@@ -273,7 +273,7 @@ async fn stream_chat_with_tools_impl<R: tauri::Runtime + 'static>(
 
     if !response.status().is_success() {
         let status = response.status();
-        let body_text = response.text().await.unwrap_or_default();
+        let body_text = crate::ai::http::error_body(response).await;
         tracing::error!(
             status = %status,
             model = %model,

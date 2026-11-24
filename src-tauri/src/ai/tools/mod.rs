@@ -262,12 +262,6 @@ mod no_raw_fs_writes_test {
                 "roost registry manifest in app-data",
             ),
             (
-                "roost.rs",
-                "let existing = fs::read_to_string(&path).unwrap_or_default();",
-                1,
-                "legacy .stignore maintenance, tracked separately as TOCTOU-001",
-            ),
-            (
                 "roost_tree_cache.rs",
                 "let bytes = std::fs::read(&path).ok()?;",
                 1,

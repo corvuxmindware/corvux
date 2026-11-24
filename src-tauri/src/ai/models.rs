@@ -93,7 +93,13 @@ pub async fn download_gemma4_e2b(client: &reqwest::Client, app: &AppHandle) -> R
         .emit(app)
         .ok();
 
-    if !is_valid_install(&gguf_path, GEMMA4_E2B_MIN_BYTES, GEMMA4_E2B_SHA256) {
+    let verify_path = gguf_path.clone();
+    let valid = tokio::task::spawn_blocking(move || {
+        is_valid_install(&verify_path, GEMMA4_E2B_MIN_BYTES, GEMMA4_E2B_SHA256)
+    })
+    .await
+    .map_err(|e| format!("Model verification task failed: {e}"))?;
+    if !valid {
         // Existing file (if any) failed the SHA pin — delete before
         // re-downloading so we don't leave a poisoned blob next to a fresh .part.
         if gguf_path.exists() {
@@ -306,7 +312,12 @@ async fn download_file(
     // upstream byte-for-byte matches the pinned hash, promote .part →
     // dest. Otherwise verify_or_purge has already deleted the .part
     // and returned an Err.
-    verify_or_purge(&tmp, expected_sha256, file_label)?;
+    let verify_path = tmp.clone();
+    let expected = expected_sha256.to_string();
+    let label = file_label.to_string();
+    tokio::task::spawn_blocking(move || verify_or_purge(&verify_path, &expected, &label))
+        .await
+        .map_err(|e| format!("Model verification task failed: {e}"))??;
 
     // Atomic rename: either the full file exists or the .part does.
     tokio::fs::rename(&tmp, dest)

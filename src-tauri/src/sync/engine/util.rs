@@ -3,6 +3,73 @@
 
 use super::peer::PeerHandle;
 
+/// Run a serialized DocStore transaction on the blocking pool. Keep a share
+/// of the note/reset guard inside the job: cancelling its async waiter must
+/// not release the mutation barrier while the filesystem commit is unfinished.
+pub(super) async fn store_task<T, F>(
+    store: std::sync::Arc<tokio::sync::Mutex<crate::sync::store::doc_store::DocStore>>,
+    note_guard: std::sync::Arc<super::note_locks::NoteGuard>,
+    operation: F,
+) -> crate::sync::error::SyncResult<T>
+where
+    T: Send + 'static,
+    F: FnOnce(&crate::sync::store::doc_store::DocStore) -> crate::sync::error::SyncResult<T>
+        + Send
+        + 'static,
+{
+    tokio::task::spawn_blocking(move || {
+        let _note_guard = note_guard;
+        let store = store.blocking_lock();
+        operation(&store)
+    })
+    .await
+    .map_err(|error| std::io::Error::other(format!("sync storage task failed: {error}")))?
+}
+
+#[cfg(test)]
+mod storage_task_tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn cancelled_waiter_keeps_reset_barrier_until_storage_job_finishes() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(tokio::sync::Mutex::new(
+            crate::sync::store::doc_store::DocStore::new(
+                dir.path().to_path_buf(),
+                crate::sync::identity::DeviceId([1; 16]),
+            ),
+        ));
+        let locks = Arc::new(super::super::note_locks::NoteLocks::new());
+        let guard = Arc::new(
+            locks
+                .lock(&crate::sync::protocol::NotePath("note.md".into()))
+                .await,
+        );
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let (release, wait) = std::sync::mpsc::channel();
+        let task = tokio::spawn(store_task(store, guard, move |_| {
+            let _ = started.send(());
+            wait.recv_timeout(Duration::from_secs(2))
+                .map_err(|e| std::io::Error::other(e.to_string()))?;
+            Ok(())
+        }));
+        ready.await.unwrap();
+        task.abort();
+        let _ = task.await;
+        let mut reset = tokio::spawn(async move { locks.block_all().await });
+        assert!(tokio::time::timeout(Duration::from_millis(25), &mut reset)
+            .await
+            .is_err());
+        release.send(()).unwrap();
+        let _guard = tokio::time::timeout(Duration::from_secs(1), reset)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+}
+
 pub(super) fn now_millis() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

@@ -342,12 +342,30 @@ impl RoostFs for NativeFs {
 
     async fn create(&self, rel: &str, initial: &[u8]) -> Result<(), RoostError> {
         let target = self.safe_resolve(rel).await?;
-        // `create` promises "fails if it already exists", so an existence check
-        // that could not be made must fail the create, not allow it.
-        if exists_checked(&target)? {
-            return Err(RoostError::AlreadyExists(rel.to_string()));
+        if let Some(parent) = target.parent() {
+            fs::create_dir_all(parent).await?;
         }
-        self.write_atomic(rel, initial).await
+        let tmp = target.with_extension(format!("{}.corvux.tmp", uuid::Uuid::new_v4()));
+        let result = async {
+            let mut file = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&tmp)
+                .await?;
+            file.write_all(initial).await?;
+            file.sync_all().await?;
+            drop(file);
+            let from = tmp.clone();
+            tokio::task::spawn_blocking(move || super::atomic::rename_no_replace(&from, &target))
+                .await
+                .map_err(|e| RoostError::Io(format!("create task failed: {e}")))??;
+            Ok(())
+        }
+        .await;
+        if result.is_err() {
+            let _ = fs::remove_file(&tmp).await;
+        }
+        result
     }
 
     async fn trash(&self, rel: &str) -> Result<(), RoostError> {
@@ -386,15 +404,12 @@ impl RoostFs for NativeFs {
         if !from.exists() {
             return Err(RoostError::NotFound(from_rel.to_string()));
         }
-        // `fs::rename` REPLACES an existing target, so "could not tell" must
-        // not read as "free".
-        if exists_checked(&to)? {
-            return Err(RoostError::AlreadyExists(to_rel.to_string()));
-        }
         if let Some(parent) = to.parent() {
             fs::create_dir_all(parent).await?;
         }
-        fs::rename(&from, &to).await?;
+        tokio::task::spawn_blocking(move || super::atomic::rename_no_replace(&from, &to))
+            .await
+            .map_err(|e| RoostError::Io(format!("rename task failed: {e}")))??;
         Ok(())
     }
 
@@ -445,6 +460,36 @@ impl RoostFs for NativeFs {
 
 #[cfg(test)]
 mod tests {
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_creates_and_renames_never_clobber() {
+        let dir = tempfile::tempdir().unwrap();
+        let fs = NativeFs::new(dir.path());
+        for index in 0..8 {
+            let target = format!("created-{index}.md");
+            let (a, b) = tokio::join!(fs.create(&target, b"alpha"), fs.create(&target, b"bravo"));
+            assert_ne!(a.is_ok(), b.is_ok());
+            assert!(matches!(
+                a.as_ref().err().or(b.as_ref().err()),
+                Some(RoostError::AlreadyExists(_))
+            ));
+            let winner = if a.is_ok() { b"alpha" } else { b"bravo" };
+            assert_eq!(fs.read(&target).await.unwrap(), winner);
+            let left = format!("left-{index}.md");
+            let right = format!("right-{index}.md");
+            let dest = format!("renamed-{index}.md");
+            std::fs::write(dir.path().join(&left), b"left").unwrap();
+            std::fs::write(dir.path().join(&right), b"right").unwrap();
+            let (a, b) = tokio::join!(fs.rename(&left, &dest), fs.rename(&right, &dest));
+            assert_ne!(a.is_ok(), b.is_ok());
+            assert!(matches!(
+                a.as_ref().err().or(b.as_ref().err()),
+                Some(RoostError::AlreadyExists(_))
+            ));
+            let retained = if a.is_ok() { &right } else { &left };
+            assert!(dir.path().join(retained).exists());
+        }
+    }
     use super::*;
     use tempfile::TempDir;
 

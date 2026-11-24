@@ -160,7 +160,7 @@ pub fn rebind_index_watcher(app: &AppHandle, roost_dir: &Path) {
         return; // not initialized (some test contexts)
     };
 
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<LocalChange>();
+    let (tx, mut rx) = crate::sync::engine::watcher::change_channel();
     let watcher = match RoostWatcher::start(roost_dir.to_path_buf(), tx) {
         Ok(w) => w,
         Err(e) => {
@@ -174,8 +174,23 @@ pub fn rebind_index_watcher(app: &AppHandle, roost_dir: &Path) {
     };
 
     let app_for_task = app.clone();
+    let watched_root = roost_dir.to_path_buf();
     let consumer = tokio::spawn(async move {
-        while let Some(change) = rx.recv().await {
+        let mut emit_tick = tokio::time::interval(std::time::Duration::from_millis(5));
+        emit_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        while let Some(received) = rx.recv().await {
+            let change = match received {
+                crate::sync::engine::watcher::WatcherEvent::Change(change) => change,
+                crate::sync::engine::watcher::WatcherEvent::Rescan => {
+                    if let Err(error) =
+                        reconcile_index_overflow(&app_for_task, &watched_root, &mut emit_tick).await
+                    {
+                        warn!(%error, "index watcher reconciliation failed; retrying");
+                        rx.request_rescan();
+                    }
+                    continue;
+                }
+            };
             // Sync's own watcher handles emission while sync is enabled.
             if sync_active(&app_for_task) {
                 continue;
@@ -186,7 +201,20 @@ pub fn rebind_index_watcher(app: &AppHandle, roost_dir: &Path) {
             // UI). Without this, nested notes linger as graph/FTS ghosts until
             // the next reconcile-on-open.
             if let LocalChange::RemovedPrefix { prefix } = &change {
-                for rel in nested_indexed_notes(&app_for_task, &prefix.0) {
+                let app = app_for_task.clone();
+                let prefix = prefix.0.clone();
+                let nested =
+                    match tokio::task::spawn_blocking(move || nested_indexed_notes(&app, &prefix))
+                        .await
+                    {
+                        Ok(nested) => nested,
+                        Err(error) => {
+                            warn!(%error, "index watcher: prefix lookup failed");
+                            continue;
+                        }
+                    };
+                for rel in nested {
+                    emit_tick.tick().await;
                     if let Err(e) = SyncStreamEvent(SyncEventPayload::NoteDeleted { path: rel })
                         .emit(&app_for_task)
                     {
@@ -195,6 +223,7 @@ pub fn rebind_index_watcher(app: &AppHandle, roost_dir: &Path) {
                 }
                 continue;
             }
+            emit_tick.tick().await;
             if let Err(e) = SyncStreamEvent(change_to_payload(&change)).emit(&app_for_task) {
                 debug!(error = %e, "index watcher: event emit failed");
             }
@@ -211,6 +240,64 @@ pub fn rebind_index_watcher(app: &AppHandle, roost_dir: &Path) {
         }),
     );
     debug!(roost = %roost_dir.display(), "index watcher: bound");
+}
+
+/// Repair derived indexes from a complete path listing after event overflow.
+/// A failed/partial walk never turns into deletions; it is retried instead.
+async fn reconcile_index_overflow(
+    app: &AppHandle,
+    root: &Path,
+    tick: &mut tokio::time::Interval,
+) -> Result<(), String> {
+    use crate::commands::files::{to_rel, RoostFsState};
+    let roost = app.state::<RoostFsState>();
+    let (backend, generation) = roost
+        .current_with_generation()
+        .await
+        .ok_or("No roost is open")?;
+    if !super::roost::same_roost_root(backend.display_root(), root) {
+        return Err("Roost changed during watcher reconciliation".into());
+    }
+    let pairs = crate::sync::engine::watcher::list_watchable_paths(backend.as_ref()).await?;
+    let display = backend.display_root().to_string();
+    let live: std::collections::HashSet<String> = pairs
+        .iter()
+        .filter_map(|(full, _)| to_rel(full, &display))
+        .collect();
+    let app_for_read = app.clone();
+    let indexed = tokio::task::spawn_blocking(
+        move || -> Result<Vec<crate::db::queries::NoteIndexEntry>, String> {
+            let graph = app_for_read.state::<crate::commands::graph::GraphDb>();
+            let guard = graph.db.lock().map_err(|e| e.to_string())?;
+            match guard.as_ref() {
+                Some(db) => crate::db::queries::list_all_notes(db, i64::MAX as usize),
+                None => Ok(Vec::new()),
+            }
+        },
+    )
+    .await
+    .map_err(|e| e.to_string())??;
+    for note in indexed {
+        if let Some(rel) = to_rel(&note.path, &display).filter(|rel| !live.contains(rel)) {
+            tick.tick().await;
+            if !roost.is_generation_current(generation) {
+                return Err("Roost changed during watcher reconciliation".into());
+            }
+            SyncStreamEvent(SyncEventPayload::NoteDeleted { path: rel })
+                .emit(app)
+                .map_err(|e| e.to_string())?;
+        }
+    }
+    for (full, _) in pairs {
+        tick.tick().await;
+        if !roost.is_generation_current(generation) {
+            return Err("Roost changed during watcher reconciliation".into());
+        }
+        SyncStreamEvent(SyncEventPayload::NoteWritten { path: full })
+            .emit(app)
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(())
 }
 
 /// Stop watching the previous roost when no replacement is being installed.

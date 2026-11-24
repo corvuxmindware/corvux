@@ -158,7 +158,7 @@ impl SyncEngine {
                 // stale disk render could land between our disk read and our
                 // commit — we'd then ingest and fan out the stale text. Held
                 // outermost, before the DocStore lock. See `note_locks`.
-                let _note_guard = self.inner.note_locks.lock(path).await;
+                let _note_guard = std::sync::Arc::new(self.inner.note_locks.lock(path).await);
                 // Content lives on disk; read it through the guarded backend
                 // (resolve_fs → backend or on-demand NativeFs) by ROOST-RELATIVE
                 // path rather than the watcher's raw absolute path — so a
@@ -174,39 +174,69 @@ impl SyncEngine {
                 else {
                     return Ok(false);
                 };
-                let text = String::from_utf8_lossy(&bytes).into_owned();
-                let store = self.inner.doc_store.lock().await;
-                let mut doc = store.load_or_create(path)?;
-                // A local write to a path we hold as tombstoned means the user
-                // recreated the file (same name again, folder rename round-trip,
-                // git checkout, restore-from-backup). Local file reappearance is
-                // explicit intent to have this note, so clear the tombstone
-                // BEFORE applying text — otherwise every device re-trashes it on
-                // the next merge (`reconcile_doc_to_roost` trashes any doc whose
-                // `deleted` flag is set). This is local-only; the remote
-                // edit-vs-delete "delete wins" policy is untouched.
-                let restored = restore_if_tombstoned(&mut doc)?;
-                let changed = doc.apply_markdown(&text)?;
-                if changed || restored {
-                    store.save(path, &mut doc)?;
-                }
-                Ok(changed || restored)
+                let text = match String::from_utf8(bytes) {
+                    Ok(text) => text,
+                    Err(_) => {
+                        let reason = "note is not valid UTF-8; original file left unchanged";
+                        let _ = self.inner.events.send(SyncEvent::NoteSyncFailed {
+                            path: path.0.clone(),
+                            reason: reason.into(),
+                        });
+                        return Err(
+                            std::io::Error::new(std::io::ErrorKind::InvalidData, reason).into()
+                        );
+                    }
+                };
+                let path = path.clone();
+                super::util::store_task(
+                    self.inner.doc_store.clone(),
+                    _note_guard.clone(),
+                    move |store| {
+                        let mut doc = store.load_or_create(&path)?;
+                        // A local write to a path we hold as tombstoned means the user
+                        // recreated the file (same name again, folder rename round-trip,
+                        // git checkout, restore-from-backup). Local file reappearance is
+                        // explicit intent to have this note, so clear the tombstone
+                        // BEFORE applying text — otherwise every device re-trashes it on
+                        // the next merge (`reconcile_doc_to_roost` trashes any doc whose
+                        // `deleted` flag is set). This is local-only; the remote
+                        // edit-vs-delete "delete wins" policy is untouched.
+                        let restored = restore_if_tombstoned(&mut doc)?;
+                        let changed = doc.apply_markdown(&text)?;
+                        if changed || restored {
+                            store.save(&path, &mut doc)?;
+                        }
+                        Ok(changed || restored)
+                    },
+                )
+                .await
             }
             LocalChange::ModifiedWithContent { path, content } => {
                 // Content is already in memory (Android IPC / editor save passed
                 // it), so the COMMIT skips a disk read. The authoritative disk
                 // write is the locked render below (B3).
-                let _note_guard = self.inner.note_locks.lock(path).await;
-                let mut doc = {
-                    let store = self.inner.doc_store.lock().await;
-                    let mut doc = store.load_or_create(path)?;
-                    let restored = restore_if_tombstoned(&mut doc)?; // see Modified arm
-                    let changed = doc.apply_markdown(content)?;
-                    if !(changed || restored) {
-                        return Ok(false);
-                    }
-                    store.save(path, &mut doc)?;
-                    doc
+                let _note_guard = std::sync::Arc::new(self.inner.note_locks.lock(path).await);
+                let candidate = {
+                    let path = path.clone();
+                    let content = content.clone();
+                    super::util::store_task(
+                        self.inner.doc_store.clone(),
+                        _note_guard.clone(),
+                        move |store| {
+                            let mut doc = store.load_or_create(&path)?;
+                            let restored = restore_if_tombstoned(&mut doc)?; // see Modified arm
+                            let changed = doc.apply_markdown(&content)?;
+                            if !(changed || restored) {
+                                return Ok(None);
+                            }
+                            store.save(&path, &mut doc)?;
+                            Ok(Some(doc))
+                        },
+                    )
+                    .await?
+                };
+                let Some(mut doc) = candidate else {
+                    return Ok(false);
                 }; // DocStore lock released before disk I/O; note lock still held
                    // B3 (SYN-I3): the authoritative disk write for a local save is
                    // this render, done UNDER the same per-note lock as the commit,

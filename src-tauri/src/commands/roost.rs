@@ -974,6 +974,7 @@ fn sort_tree(entries: &mut [FileEntry]) {
 /// wins, so the negations have to appear BEFORE the `.corvux`
 /// exclusion for them to take effect.
 fn ensure_stignore(roost: &Path) -> std::io::Result<()> {
+    use std::io::{Read, Seek, SeekFrom, Write};
     // Patterns are written in match-priority order: negations first,
     // then exclusions. Matches Syncthing's first-match-wins semantics.
     const REQUIRED: &[&str] = &[
@@ -998,7 +999,11 @@ fn ensure_stignore(roost: &Path) -> std::io::Result<()> {
         }
         Ok(_) | Err(_) => {}
     }
-    let existing = fs::read_to_string(&path).unwrap_or_default();
+    // Open without following a symlink, then read AND rewrite this same handle.
+    // A later path swap cannot redirect the write to another file.
+    let mut file = crate::roostfs::atomic::open_no_follow(&path)?;
+    let mut existing = String::new();
+    file.read_to_string(&mut existing)?;
     let missing: Vec<&&str> = REQUIRED
         .iter()
         .filter(|pat| !existing.lines().any(|l| l.trim() == **pat))
@@ -1019,7 +1024,10 @@ fn ensure_stignore(roost: &Path) -> std::io::Result<()> {
         out.push_str(pat);
         out.push('\n');
     }
-    fs::write(&path, out)
+    file.seek(SeekFrom::Start(0))?;
+    file.write_all(out.as_bytes())?;
+    file.set_len(out.len() as u64)?;
+    file.sync_all()
 }
 
 #[cfg(test)]

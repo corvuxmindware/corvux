@@ -577,7 +577,8 @@ pub async fn search_roost(
 
     // ── FTS5 (the only lane) ─────────────────────────────────────────
     let fts_started = std::time::Instant::now();
-    let fts_hits: Vec<FtsHit> = run_fts(&query, &state, generation)?;
+    let fts_hits: Vec<FtsHit> =
+        tokio::task::block_in_place(|| run_fts(&query, &state, generation))?;
     let fts_ms = fts_started.elapsed().as_millis();
 
     let fused = reciprocal_rank_fusion(&fts_hits, 50);
@@ -647,13 +648,13 @@ pub async fn search_roost(
     // cold index never completed), which is exactly when the user would
     // otherwise see nothing.
     if results.is_empty() && fts_hits.is_empty() {
-        let index_trusted = {
+        let index_trusted = tokio::task::block_in_place(|| -> Result<bool, String> {
             let guard = state.0.lock().map_err(|e| format!("Lock error: {e}"))?;
-            guard
+            Ok(guard
                 .as_ref()
                 .map(|bound| bound.generation == generation && bound.db.index_complete())
-                .unwrap_or(false)
-        };
+                .unwrap_or(false))
+        })?;
         if !index_trusted {
             let grep = grep_search(backend.as_ref(), &query).await?;
             if !roost_fs.is_generation_current(generation) {

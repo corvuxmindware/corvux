@@ -127,7 +127,8 @@ pub async fn save_roost_note(
     // read-only state so the frontend stays consistent without paying for
     // a no-op re-index.
     if outcome == WriteOutcome::Unchanged {
-        let (stats, tasks, backlinks) = read_unchanged_state(&path, &db_state)?;
+        let (stats, tasks, backlinks) =
+            tokio::task::block_in_place(|| read_unchanged_state(&path, &db_state))?;
         tracing::debug!(path = %path, "save_roost_note: content unchanged, skipped fan-out (EDT-2)");
         return Ok(SaveOutcome {
             stats,
@@ -147,7 +148,7 @@ pub async fn save_roost_note(
     // Phase 3: FTS5 update — separate DB, separate lock. Failures here
     // don't poison the save; we surface them as a structured Fts5Outcome
     // so the frontend can render a non-blocking warning.
-    let fts5 = match update_fts5(&path, &content, &search_state) {
+    let fts5 = match tokio::task::block_in_place(|| update_fts5(&path, &content, &search_state)) {
         Ok(()) => Fts5Outcome::Indexed,
         Err(e) => {
             tracing::warn!(path = %path, error = %e, "save_roost_note: FTS5 update failed (fail-soft)");
@@ -160,7 +161,7 @@ pub async fn save_roost_note(
     // chained `get_backlinks` IPC the frontend used to fire is now a
     // single in-process DB read piggy-backing on the lock the indexer
     // just held.
-    let backlinks = read_backlinks(&path, &db_state)?;
+    let backlinks = tokio::task::block_in_place(|| read_backlinks(&path, &db_state))?;
 
     tracing::info!(
         path = %path,

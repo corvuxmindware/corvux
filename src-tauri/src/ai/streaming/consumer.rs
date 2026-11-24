@@ -48,6 +48,9 @@ use super::sse::find_sse_boundary;
 /// frames during thinking blocks).
 const POLL_TIMEOUT: Duration = Duration::from_millis(100);
 
+/// Bound incomplete frames and coalesced events before copying network bytes.
+const MAX_SSE_BUFFER_BYTES: usize = 1024 * 1024;
+
 /// Async iterator over the SSE events in a streaming HTTP body.
 ///
 /// Generic over `S: Stream<Item = reqwest::Result<Bytes>>` so callers
@@ -60,7 +63,7 @@ where
 {
     stream: S,
     cancel: Arc<AtomicBool>,
-    buffer: String,
+    buffer: Vec<u8>,
 }
 
 impl<S> SseEvents<S>
@@ -71,7 +74,7 @@ where
         Self {
             stream,
             cancel,
-            buffer: String::new(),
+            buffer: Vec::new(),
         }
     }
 
@@ -86,7 +89,7 @@ where
     pub async fn next_event(&mut self) -> Result<Option<String>, String> {
         // Buffer may already contain a fully-framed event from a prior
         // pull that delivered multiple events in one chunk.
-        if let Some(event) = self.drain_buffered_event() {
+        if let Some(event) = self.drain_buffered_event()? {
             return Ok(Some(event));
         }
 
@@ -97,28 +100,48 @@ where
             let chunk = match tokio::time::timeout(POLL_TIMEOUT, self.stream.next()).await {
                 Ok(Some(Ok(c))) => c,
                 Ok(Some(Err(e))) => return Err(format!("stream read error: {e}")),
-                Ok(None) => return Ok(None), // EOF — leftover partial bytes dropped
-                Err(_elapsed) => continue,   // 100ms tick, re-check cancel
+                Ok(None) => {
+                    std::str::from_utf8(&self.buffer)
+                        .map_err(|_| "provider stream ended with invalid UTF-8".to_string())?;
+                    return Ok(None); // EOF — valid but unframed tail is dropped
+                }
+                Err(_elapsed) => continue, // 100ms tick, re-check cancel
             };
-            self.buffer.push_str(&String::from_utf8_lossy(&chunk));
-            if let Some(event) = self.drain_buffered_event() {
+            if self.buffer.len().saturating_add(chunk.len()) > MAX_SSE_BUFFER_BYTES {
+                return Err("provider SSE buffer exceeded its 1 MiB limit".into());
+            }
+            self.buffer.extend_from_slice(&chunk);
+            if let Some(event) = self.drain_buffered_event()? {
                 return Ok(Some(event));
             }
         }
     }
 
-    fn drain_buffered_event(&mut self) -> Option<String> {
-        let pos = find_sse_boundary(&self.buffer)?;
-        let event = self.buffer[..pos].to_string();
+    fn drain_buffered_event(&mut self) -> Result<Option<String>, String> {
+        // A chunk may end partway through a codepoint. Keep those bytes until
+        // the next chunk and inspect only the valid prefix for SSE delimiters.
+        let text = match std::str::from_utf8(&self.buffer) {
+            Ok(text) => text,
+            Err(error) if error.error_len().is_none() => {
+                std::str::from_utf8(&self.buffer[..error.valid_up_to()])
+                    .map_err(|_| "invalid provider UTF-8 prefix".to_string())?
+            }
+            Err(_) => return Err("provider stream contains invalid UTF-8".into()),
+        };
+        let Some(pos) = find_sse_boundary(text) else {
+            return Ok(None);
+        };
+        let event = text[..pos].to_string();
         // Defensive trim: find_sse_boundary already returns the offset
         // past the `\n\n` (or `\r\n\r\n`), but some providers send
         // stray leading newlines between events as keepalive padding —
         // strip them so the next find_sse_boundary call starts clean.
-        self.buffer = self.buffer[pos..]
-            .trim_start_matches('\n')
-            .trim_start_matches('\r')
-            .to_string();
-        Some(event)
+        let padding = self.buffer[pos..]
+            .iter()
+            .take_while(|b| **b == b'\n' || **b == b'\r')
+            .count();
+        self.buffer.drain(..pos + padding);
+        Ok(Some(event))
     }
 }
 
@@ -131,6 +154,40 @@ pub type BoxedSseEvents = SseEvents<Pin<Box<dyn Stream<Item = reqwest::Result<By
 
 #[cfg(test)]
 mod tests {
+
+    #[tokio::test]
+    async fn preserves_utf8_split_at_every_byte() {
+        let text = "data: \u{754c}\u{1f600}\u{e9}\n\n";
+        let chunks: Vec<reqwest::Result<Bytes>> = text
+            .as_bytes()
+            .iter()
+            .map(|b| Ok(Bytes::copy_from_slice(&[*b])))
+            .collect();
+        let mut events = SseEvents::new(
+            futures_util::stream::iter(chunks),
+            Arc::new(AtomicBool::new(false)),
+        );
+        assert_eq!(events.next_event().await.unwrap().as_deref(), Some(text));
+        assert_eq!(events.next_event().await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn rejects_oversize_and_invalid_utf8_streams() {
+        for bytes in [
+            Bytes::from(vec![b'x'; MAX_SSE_BUFFER_BYTES + 1]),
+            Bytes::from_static(&[0xff]),
+            Bytes::from_static(&[0xe7]),
+        ] {
+            let chunks: Vec<reqwest::Result<Bytes>> = vec![Ok(bytes)];
+            let mut events = SseEvents::new(
+                futures_util::stream::iter(chunks),
+                Arc::new(AtomicBool::new(false)),
+            );
+            assert!(events.next_event().await.is_err());
+            assert!(events.buffer.len() <= MAX_SSE_BUFFER_BYTES);
+        }
+    }
+
     use super::*;
     use futures_util::stream;
 

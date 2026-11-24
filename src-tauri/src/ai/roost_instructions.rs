@@ -251,7 +251,8 @@ fn sanitize(body: &str) -> (String, Vec<&'static str>) {
 /// `s`, leaving the surrounding text intact. Case-insensitive. Bounded
 /// search — no regex, no allocation per match beyond the output buffer.
 fn strip_tag(s: &str, tag: &str) -> String {
-    let lower = s.to_lowercase();
+    // Tag names are ASCII. Preserve the original string's byte offsets.
+    let lower = s.to_ascii_lowercase();
     let needles = [
         format!("</{tag}>"),
         format!("<{tag}>"),
@@ -300,6 +301,15 @@ fn strip_tag(s: &str, tag: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn strips_ascii_tags_after_length_changing_unicode() {
+        assert_eq!(
+            strip_tag("\u{212a}\u{130}<TOOL_CALL>hello</tool_call>", "tool_call"),
+            "\u{212a}\u{130}hello"
+        );
+    }
+
     use super::*;
     use std::io::Write;
     use std::path::PathBuf;

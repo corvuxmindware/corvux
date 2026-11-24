@@ -99,7 +99,9 @@ pub fn to_note_path(roost: &Path, abs: &Path) -> Result<NotePath, StoreError> {
     for c in rel.components() {
         match c {
             Component::Normal(s) => {
-                let s = s.to_string_lossy();
+                let s = s
+                    .to_str()
+                    .ok_or_else(|| StoreError::InvalidPath("filename is not valid UTF-8".into()))?;
                 if s.contains('\0') || s.contains('/') || s.contains('\\') {
                     return Err(StoreError::InvalidPath(s.into()));
                 }
@@ -111,7 +113,7 @@ pub fn to_note_path(roost: &Path, abs: &Path) -> Result<NotePath, StoreError> {
                 if is_windows_unsafe_component(&s) {
                     return Err(StoreError::InvalidPath(s.into()));
                 }
-                parts.push(s.into_owned());
+                parts.push(s.to_owned());
             }
             _ => {
                 return Err(StoreError::InvalidPath(rel.to_string_lossy().into()));
@@ -198,6 +200,24 @@ fn is_windows_unsafe_component(name: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_distinct_non_utf8_filenames_without_collapsing_identity() {
+        use std::os::unix::ffi::OsStringExt;
+        let root = tempfile::tempdir().unwrap();
+        for byte in [0xfe, 0xff] {
+            let path = root.path().join(std::ffi::OsString::from_vec(vec![
+                b'n', byte, b'.', b'm', b'd',
+            ]));
+            std::fs::write(&path, b"note").unwrap();
+            assert!(matches!(
+                to_note_path(root.path(), &path),
+                Err(StoreError::InvalidPath(_))
+            ));
+        }
+    }
+
     use super::*;
     use tempfile::tempdir;
 

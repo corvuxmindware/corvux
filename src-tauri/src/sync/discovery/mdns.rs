@@ -68,7 +68,7 @@ pub const SERVICE_TYPE: &str = "_corvux-sync._tcp.local.";
 
 /// A peer the browser has observed on the LAN. Emitted to the frontend so
 /// users can tap-to-pair instead of typing IP addresses.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DiscoveredPeer {
     pub device_id: DeviceId,
     pub display_name: String,
@@ -105,13 +105,57 @@ pub struct Discovery {
     inner: Arc<DiscoveryInner>,
 }
 
+const MAX_SEEN_PEERS: usize = 256;
+const SEEN_TTL: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+
+struct SeenPeer {
+    peer: DiscoveredPeer,
+    last_seen: std::time::Instant,
+}
+
+fn remember_peer(
+    seen: &mut HashMap<DeviceId, SeenPeer>,
+    peer: DiscoveredPeer,
+    now: std::time::Instant,
+) -> bool {
+    if let Some(entry) = seen.get_mut(&peer.device_id) {
+        let changed = entry.peer != peer;
+        entry.peer = peer;
+        entry.last_seen = now;
+        return changed;
+    }
+    if seen.len() >= MAX_SEEN_PEERS {
+        return false;
+    }
+    seen.insert(
+        peer.device_id,
+        SeenPeer {
+            peer,
+            last_seen: now,
+        },
+    );
+    true
+}
+
+fn expire_seen(seen: &mut HashMap<DeviceId, SeenPeer>, now: std::time::Instant) -> Vec<DeviceId> {
+    let mut expired = Vec::new();
+    seen.retain(|id, entry| {
+        let keep = now.saturating_duration_since(entry.last_seen) < SEEN_TTL;
+        if !keep {
+            expired.push(*id);
+        }
+        keep
+    });
+    expired
+}
+
 struct DiscoveryInner {
     daemon: ServiceDaemon,
     /// Our own device ID so the browser can skip our own advertisements.
     our_device_id: DeviceId,
     /// Cache of peers we've seen, keyed by device ID. Keeps `Lost` events
     /// from firing when mDNS briefly republishes the same service.
-    seen: Mutex<HashMap<DeviceId, DiscoveredPeer>>,
+    seen: Mutex<HashMap<DeviceId, SeenPeer>>,
     /// Full service name we registered; needed to unregister cleanly on
     /// shutdown. None if we never announced.
     registered_full_name: Mutex<Option<String>>,
@@ -202,15 +246,31 @@ impl Discovery {
             })?;
         let inner = self.inner.clone();
         tokio::spawn(async move {
-            while let Ok(event) = receiver.recv_async().await {
+            let mut sweep = tokio::time::interval(std::time::Duration::from_secs(30));
+            sweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                let event = tokio::select! {
+                    event = receiver.recv_async() => match event { Ok(event) => event, Err(_) => break },
+                    _ = sweep.tick() => {
+                        let expired = expire_seen(&mut *inner.seen.lock().await, std::time::Instant::now());
+                        for device_id in expired {
+                            if out.send(DiscoveryEvent::Lost { device_id }).is_err() { return; }
+                        }
+                        continue;
+                    }
+                };
                 match event {
                     ServiceEvent::ServiceResolved(info) => {
                         match parse_peer(&info, inner.our_device_id) {
                             Ok(Some(peer)) => {
                                 let mut seen = inner.seen.lock().await;
-                                seen.insert(peer.device_id, peer.clone());
+                                let emit = remember_peer(
+                                    &mut seen,
+                                    peer.clone(),
+                                    std::time::Instant::now(),
+                                );
                                 drop(seen);
-                                if out.send(DiscoveryEvent::Found(peer)).is_err() {
+                                if emit && out.send(DiscoveryEvent::Found(peer)).is_err() {
                                     return;
                                 }
                             }
@@ -230,7 +290,7 @@ impl Discovery {
                         let mut seen = inner.seen.lock().await;
                         let removed_id = seen
                             .iter()
-                            .find(|(_, p)| full_name_matches(p, &full_name))
+                            .find(|(_, p)| full_name_matches(&p.peer, &full_name))
                             .map(|(id, _)| *id);
                         if let Some(id) = removed_id {
                             seen.remove(&id);
@@ -435,6 +495,38 @@ fn full_name_matches(peer: &DiscoveredPeer, full_name: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn peer_cache_is_bounded_expires_and_refreshes_existing_devices() {
+        fn peer(index: u16) -> DiscoveredPeer {
+            let mut id = [0u8; 16];
+            id[..2].copy_from_slice(&index.to_le_bytes());
+            DiscoveredPeer {
+                device_id: DeviceId(id),
+                display_name: format!("peer-{index}"),
+                roost_name: "roost".into(),
+                addr: "127.0.0.1".into(),
+                port: 1234,
+                node_id: None,
+                iroh_addrs: Vec::new(),
+            }
+        }
+        let now = std::time::Instant::now();
+        let mut seen = HashMap::new();
+        for index in 0..MAX_SEEN_PEERS {
+            assert!(remember_peer(&mut seen, peer(index as u16), now));
+        }
+        assert!(!remember_peer(&mut seen, peer(MAX_SEEN_PEERS as u16), now));
+        assert_eq!(seen.len(), MAX_SEEN_PEERS);
+        assert!(!remember_peer(
+            &mut seen,
+            peer(0),
+            now + std::time::Duration::from_secs(1)
+        ));
+        let expired = expire_seen(&mut seen, now + SEEN_TTL);
+        assert_eq!(expired.len(), MAX_SEEN_PEERS - 1);
+        assert_eq!(seen.len(), 1);
+    }
     use super::*;
 
     #[test]

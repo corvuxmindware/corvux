@@ -199,7 +199,11 @@ fn scalar_field(frontmatter: &str, key: &str) -> Option<String> {
                 if !buf.is_empty() {
                     buf.push('\n');
                 }
-                buf.push_str(&line[cur_indent.min(line.len())..]);
+                let start = line
+                    .char_indices()
+                    .nth(cur_indent)
+                    .map_or(line.len(), |(i, _)| i);
+                buf.push_str(&line[start..]);
             }
             return Some(buf);
         }
@@ -235,6 +239,19 @@ pub fn read_and_parse(skill_md_path: &Path) -> Result<SkillManifest, SkillParseE
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn block_scalar_uses_character_indents_for_unicode_whitespace() {
+        assert_eq!(
+            scalar_field(
+                "description: |\n\u{a0}Line\n\u{a0}\u{a0}Next",
+                "description"
+            )
+            .as_deref(),
+            Some("Line\n\u{a0}Next")
+        );
+    }
+
     use super::*;
 
     fn p(s: &str) -> PathBuf {

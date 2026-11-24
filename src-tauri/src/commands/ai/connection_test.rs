@@ -112,7 +112,7 @@ pub async fn test_gemini_connection(
                     ),
                 ))
             } else {
-                let body_excerpt = resp.text().await.unwrap_or_default();
+                let body_excerpt = crate::ai::http::error_body(resp).await;
                 tracing::warn!(latency_ms, status = %status, "test_gemini: rejected");
                 Ok(ConnectionTestResult::fail(
                     latency_ms,
@@ -189,7 +189,7 @@ pub async fn test_openrouter_connection(
                     ),
                 ))
             } else {
-                let body_excerpt = resp.text().await.unwrap_or_default();
+                let body_excerpt = crate::ai::http::error_body(resp).await;
                 tracing::warn!(latency_ms, status = %status, "test_openrouter: rejected");
                 Ok(ConnectionTestResult::fail(
                     latency_ms,
@@ -261,7 +261,7 @@ pub async fn test_ollama_connection(
                     format!("Ollama {} reachable", version),
                 ))
             } else {
-                let body_excerpt = resp.text().await.unwrap_or_default();
+                let body_excerpt = crate::ai::http::error_body(resp).await;
                 tracing::warn!(latency_ms, status = %status, "test_ollama: rejected");
                 Ok(ConnectionTestResult::fail(
                     latency_ms,
@@ -332,7 +332,7 @@ pub async fn test_openai_connection(
                     ),
                 ))
             } else {
-                let body_excerpt = resp.text().await.unwrap_or_default();
+                let body_excerpt = crate::ai::http::error_body(resp).await;
                 tracing::warn!(latency_ms, status = %status, "test_openai: rejected");
                 Ok(ConnectionTestResult::fail(
                     latency_ms,
@@ -402,7 +402,7 @@ pub async fn test_anthropic_connection(
                     ),
                 ))
             } else {
-                let body_excerpt = resp.text().await.unwrap_or_default();
+                let body_excerpt = crate::ai::http::error_body(resp).await;
                 tracing::warn!(latency_ms, status = %status, "test_anthropic: rejected");
                 Ok(ConnectionTestResult::fail(
                     latency_ms,
@@ -441,7 +441,20 @@ fn truncate(mut s: String, max: usize) -> String {
     if s.len() <= max {
         return s;
     }
-    s.truncate(max);
+    let cut = crate::ai::tools::utf8_prefix(&s, max).len();
+    s.truncate(cut);
     s.push('…');
     s
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn truncates_provider_errors_at_utf8_boundaries() {
+        assert_eq!(
+            super::truncate("\u{754c}".repeat(100), 239),
+            format!("{}\u{2026}", "\u{754c}".repeat(79))
+        );
+        assert_eq!(super::truncate("\u{1f600}".into(), 0), "\u{2026}");
+    }
 }

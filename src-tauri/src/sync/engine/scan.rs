@@ -69,52 +69,28 @@ impl SyncEngine {
         // safe_resolve) stays within the roost even across symlinked dirs; the
         // raw std::fs tree walk that could pull external files into the CRDT is
         // gone.
-        let files: Vec<(NotePath, String)> = {
-            use crate::roostfs::walk::collect_markdown;
+        let files: Vec<NotePath> = {
             let fsh = super::peer::resolve_fs(&roost, self.inner.roost_fs.as_deref());
-            let fs = fsh.as_fs();
-            match collect_markdown(fs).await {
-                Ok(pairs) => pairs
-                    .into_iter()
-                    .filter_map(|(full, content)| {
-                        let display_root = fs.display_root();
-                        let trimmed = full
-                            .trim_start_matches(display_root)
-                            .trim_start_matches(['/', '\\'])
-                            .replace('\\', "/");
-                        if trimmed.is_empty() {
-                            None
-                        } else {
-                            Some((NotePath(trimmed), content))
-                        }
-                    })
-                    .collect(),
-                Err(e) => {
-                    warn!(error = %e, "scan_roost: RoostFs walk failed");
-                    Vec::new()
-                }
-            }
+            super::watcher::list_watchable_paths(fsh.as_fs())
+                .await
+                .map_err(std::io::Error::other)?
+                .into_iter()
+                .map(|(_, rel)| NotePath(rel))
+                .collect()
         };
 
         let total = files.len();
         info!(total, roost = %roost.display(), "scan_roost: starting");
         let mut processed = 0usize;
 
-        for (note, _snapshot) in files {
+        for note in files {
             {
                 // Serialize this note's ingest against a concurrent remote adopt
                 // (a peer can connect and adopt mid-scan). See `note_locks`.
-                let _note_guard = self.inner.note_locks.lock(&note).await;
-                // B4 (SYN-I3): re-read the content UNDER the lock. The
-                // `collect_markdown` snapshot was taken before any lock, so a
-                // peer that adopted this note between the walk and here could
-                // have committed+rendered newer content; applying the pre-lock
-                // snapshot would clobber it and fan the stale text back out.
-                // Read-after-lock mirrors the `apply_local_change` Modified arm.
-                // (Cost: one extra read per note vs. reusing the walk snapshot —
-                // acceptable for a one-time bootstrap; a paths-only walk is a
-                // possible follow-up.) A file that vanished since the walk, or a
-                // rejected escape, reads Err → skip.
+                let _note_guard = std::sync::Arc::new(self.inner.note_locks.lock(&note).await);
+                // Re-read under the note guard so a peer adopt cannot land
+                // between this disk read and the CRDT commit. The initial walk
+                // collects paths only; missing/blocked files are skipped below.
                 let text = match super::peer::resolve_fs(
                     &self.inner.roost,
                     self.inner.roost_fs.as_deref(),
@@ -123,10 +99,22 @@ impl SyncEngine {
                 .read(&note.0)
                 .await
                 {
-                    Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+                    Ok(bytes) => match String::from_utf8(bytes) {
+                        Ok(text) => text,
+                        Err(_) => {
+                            let _ = self.inner.events.send(SyncEvent::NoteSyncFailed {
+                                path: note.0.clone(),
+                                reason: "note is not valid UTF-8; original file left unchanged"
+                                    .into(),
+                            });
+                            continue;
+                        }
+                    },
                     Err(_) => continue,
                 };
-                let store = self.inner.doc_store.lock().await;
+                let transaction = {
+                    let note = note.clone();
+                    super::util::store_task(self.inner.doc_store.clone(), _note_guard.clone(), move |store| {
                 // First-time ingest vs. rescan:
                 //
                 // - EXISTING doc → `load_or_create` (under our device actor). No
@@ -154,7 +142,7 @@ impl SyncEngine {
                         Ok(d) => d,
                         Err(e) => {
                             warn!(error = %e, note = %note, "scan_roost: load_or_create failed");
-                            continue;
+                            return Err(e.into());
                         }
                     }
                 } else {
@@ -162,7 +150,7 @@ impl SyncEngine {
                         Ok(d) => d,
                         Err(e) => {
                             warn!(error = %e, note = %note, "scan_roost: seed_from_markdown failed");
-                            continue;
+                            return Err(e.into());
                         }
                     }
                 };
@@ -174,21 +162,33 @@ impl SyncEngine {
                 match doc.is_deleted() {
                     Ok(true) => {
                         debug!(note = %note, "scan_roost: skipping tombstoned note present on disk");
-                        continue;
+                        return Ok(false);
                     }
                     Ok(false) => {}
                     Err(e) => {
                         warn!(error = %e, note = %note, "scan_roost: is_deleted check failed");
-                        continue;
+                        return Err(e.into());
                     }
                 }
                 if let Err(e) = doc.apply_markdown(&text) {
                     warn!(error = %e, note = %note, "scan_roost: apply_markdown failed");
-                    continue;
+                    return Err(e.into());
                 }
                 if let Err(e) = store.save(&note, &mut doc) {
                     warn!(error = %e, note = %note, "scan_roost: save failed");
-                    continue;
+                    return Err(e.into());
+                }
+
+                        Ok(true)
+                    }).await
+                };
+                match transaction {
+                    Ok(true) => {}
+                    Ok(false) => continue,
+                    Err(error) => {
+                        warn!(%note, %error, "scan_roost: note transaction failed");
+                        continue;
+                    }
                 }
             }
             processed += 1;
@@ -474,6 +474,32 @@ impl SyncEngine {
 
 #[cfg(test)]
 mod tests {
+
+    #[tokio::test]
+    async fn invalid_utf8_is_never_committed_or_rewritten() {
+        let (engine, roost, _app) = setup_engine();
+        let note = NotePath("invalid.md".into());
+        let bytes = b"original\xffbytes";
+        std::fs::write(roost.path().join(&note.0), bytes).unwrap();
+        let mut rx = engine.inner.events.subscribe();
+        let result = engine
+            .apply_local_change(&super::super::watcher::LocalChange::Modified {
+                path: note.clone(),
+                abs: roost.path().join(&note.0),
+            })
+            .await;
+        assert!(result.is_err());
+        assert!(!engine.inner.doc_store.lock().await.exists(&note));
+        assert_eq!(std::fs::read(roost.path().join(&note.0)).unwrap(), bytes);
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            SyncEvent::NoteSyncFailed { .. }
+        ));
+        engine.scan_roost().await.unwrap();
+        assert!(!engine.inner.doc_store.lock().await.exists(&note));
+        assert_eq!(std::fs::read(roost.path().join(&note.0)).unwrap(), bytes);
+    }
+
     use super::*;
     use crate::sync::identity::Identity;
     use crate::sync::transport::tcp_tls::TlsIdentity;

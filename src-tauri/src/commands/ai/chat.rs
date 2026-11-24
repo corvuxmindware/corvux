@@ -112,19 +112,21 @@ pub async fn chat_send(
     const LOW_CONF_WINDOW_DAYS: f64 = 30.0;
     const LOW_CONF_THRESHOLD: f64 = 0.70;
     const LOW_CONF_MIN_DECISIONS: i64 = 5;
-    let low_confidence_tools: Vec<String> = {
-        let db_guard = db_state.db.lock().map_err(|e| format!("Lock error: {e}"))?;
-        match db_guard.as_ref() {
-            Some(db) => crate::db::queries::approval_log::high_rejection_tools(
-                db,
-                Some(LOW_CONF_WINDOW_DAYS * 86_400.0),
-                LOW_CONF_THRESHOLD,
-                LOW_CONF_MIN_DECISIONS,
-            )
-            .unwrap_or_default(),
-            None => Vec::new(),
-        }
-    };
+    let low_confidence_tools: Vec<String> =
+        tokio::task::block_in_place(|| -> Result<Vec<String>, String> {
+            let db_guard = db_state.db.lock().map_err(|e| format!("Lock error: {e}"))?;
+            let tools = match db_guard.as_ref() {
+                Some(db) => crate::db::queries::approval_log::high_rejection_tools(
+                    db,
+                    Some(LOW_CONF_WINDOW_DAYS * 86_400.0),
+                    LOW_CONF_THRESHOLD,
+                    LOW_CONF_MIN_DECISIONS,
+                )
+                .unwrap_or_default(),
+                None => Vec::new(),
+            };
+            Ok(tools)
+        })?;
     if !low_confidence_tools.is_empty() {
         tracing::info!(
             tools = ?low_confidence_tools,
@@ -270,21 +272,23 @@ pub async fn chat_send(
     // untrusted: files may have moved or become symlinks since indexing.
     let mentioned = match (last_question.as_deref(), roost_backend.as_deref()) {
         (Some(question), Some(backend)) => {
-            let notes = {
-                let guard = db_state.db.lock().map_err(|e| format!("Lock error: {e}"))?;
-                guard
-                    .as_ref()
-                    .and_then(|db| crate::db::queries::list_all_notes(db, 200).ok())
-                    .unwrap_or_default()
-            };
+            let notes = tokio::task::block_in_place(
+                || -> Result<Vec<crate::db::queries::NoteIndexEntry>, String> {
+                    let guard = db_state.db.lock().map_err(|e| format!("Lock error: {e}"))?;
+                    Ok(guard
+                        .as_ref()
+                        .and_then(|db| crate::db::queries::list_all_notes(db, 200).ok())
+                        .unwrap_or_default())
+                },
+            )?;
             find_mentioned_notes(&notes, backend, question).await
         }
         _ => Vec::new(),
     };
 
-    let system = {
+    let system = tokio::task::block_in_place(|| -> Result<Option<String>, String> {
         let db_guard = db_state.db.lock().map_err(|e| format!("Lock error: {e}"))?;
-        if let Some(db) = db_guard.as_ref() {
+        let system = if let Some(db) = db_guard.as_ref() {
             let mention_section = if mentioned.is_empty() {
                 String::new()
             } else {
@@ -364,8 +368,9 @@ pub async fn chat_send(
                     "{date_section}{memory_section}{roost_instructions_section}{p}\n\n{registry_blurb}"
                 )
             })
-        }
-    }; // DB lock dropped
+        };
+        Ok(system)
+    })?; // DB lock dropped
 
     // Abort any in-flight chat task and reset the flag before launching a new one.
     {

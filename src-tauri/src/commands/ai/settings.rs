@@ -100,6 +100,10 @@ pub(crate) fn redacted_settings_json(settings: &Settings) -> Result<String, Stri
 /// invoking this so disk and memory advance as one serialized mutation lane.
 pub(crate) fn persist_settings_file(path: &Path, settings: &Settings) -> Result<(), String> {
     let json = redacted_settings_json(settings)?;
+    persist_settings_json(path, &json)
+}
+
+fn persist_settings_json(path: &Path, json: &str) -> Result<(), String> {
     let tmp = path.with_extension("json.tmp");
     let mut file = std::fs::OpenOptions::new()
         .create(true)
@@ -116,6 +120,47 @@ pub(crate) fn persist_settings_file(path: &Path, settings: &Settings) -> Result<
         let _ = std::fs::remove_file(&tmp);
         format!("replace settings file: {e}")
     })
+}
+
+/// Strip only keys confirmed in secret storage, starting from the original
+/// disk snapshot so failed migrations retain their existing fallback. This is
+/// retried on every launch even when key hydration took the keychain-hit arm.
+pub(crate) fn cleanup_migrated_keys(path: &Path, original: &Settings) -> Result<(), String> {
+    cleanup_migrated_keys_with(original, secret_store::get, |disk| {
+        let json = serde_json::to_string_pretty(disk).map_err(|e| e.to_string())?;
+        persist_settings_json(path, &json)
+    })
+}
+
+fn cleanup_migrated_keys_with(
+    original: &Settings,
+    mut get: impl FnMut(&str) -> Result<Option<String>, String>,
+    persist: impl FnOnce(&Settings) -> Result<(), String>,
+) -> Result<(), String> {
+    let mut disk = original.clone();
+    let mut changed = false;
+    for (key, slot) in [
+        (&mut disk.gemini_api_key, secret_store::keys::GEMINI_API_KEY),
+        (
+            &mut disk.openrouter_api_key,
+            secret_store::keys::OPENROUTER_API_KEY,
+        ),
+        (&mut disk.ollama_api_key, secret_store::keys::OLLAMA_API_KEY),
+        (&mut disk.openai_api_key, secret_store::keys::OPENAI_API_KEY),
+        (
+            &mut disk.anthropic_api_key,
+            secret_store::keys::ANTHROPIC_API_KEY,
+        ),
+    ] {
+        if key.is_some() && get(slot)?.is_some() {
+            *key = None;
+            changed = true;
+        }
+    }
+    if changed {
+        persist(&disk)?;
+    }
+    Ok(())
 }
 
 #[cfg(not(windows))]
@@ -568,6 +613,49 @@ pub async fn create_agents_md(roost_fs: State<'_, RoostFsState>) -> Result<Strin
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn retries_plaintext_cleanup_when_keychain_already_contains_key() {
+        let original = Settings {
+            gemini_api_key: Some("old-disk-key".into()),
+            ..Settings::default()
+        };
+        for fail in [true, false] {
+            let result = cleanup_migrated_keys_with(
+                &original,
+                |_| Ok(Some("stored-key".into())),
+                |disk| {
+                    assert!(disk.gemini_api_key.is_none());
+                    if fail {
+                        Err("locked".into())
+                    } else {
+                        Ok(())
+                    }
+                },
+            );
+            assert_eq!(result.is_err(), fail);
+            assert_eq!(original.gemini_api_key.as_deref(), Some("old-disk-key"));
+        }
+    }
+
+    #[test]
+    fn plaintext_cleanup_retains_unmigrated_fallbacks() {
+        let original = Settings {
+            gemini_api_key: Some("gemini".into()),
+            openai_api_key: Some("openai".into()),
+            ..Settings::default()
+        };
+        cleanup_migrated_keys_with(
+            &original,
+            |slot| Ok((slot == secret_store::keys::GEMINI_API_KEY).then(|| "stored".into())),
+            |disk| {
+                assert!(disk.gemini_api_key.is_none());
+                assert_eq!(disk.openai_api_key.as_deref(), Some("openai"));
+                Ok(())
+            },
+        )
+        .unwrap();
+    }
     use super::*;
 
     /// S-03: after lifting provider keys, the on-disk JSON shape must

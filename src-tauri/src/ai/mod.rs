@@ -1,6 +1,7 @@
 pub mod anthropic;
 pub mod capability;
 pub mod gemini;
+pub(crate) mod http;
 pub mod models;
 pub mod ollama;
 pub mod openai;
