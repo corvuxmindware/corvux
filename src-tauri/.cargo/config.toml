@@ -28,6 +28,13 @@
 CFLAGS = "-DSQLITE_ENABLE_FTS5=1"
 SQLITE_ENABLE_FTS5 = "1"
 
+# llama.cpp's common library auto-detects Homebrew OpenSSL, although Corvux
+# only uses it for local inference (downloads use reqwest with rustls).
+# Its bundled cpp-httplib does not compile against OpenSSL 4, and linking a
+# Homebrew dylib would also make the macOS app depend on the build machine.
+# llama-cpp-sys forwards CMAKE_* variables to its CMake configuration.
+CMAKE_DISABLE_FIND_PACKAGE_OpenSSL = "TRUE"
+
 # iOS targets — device + simulators.
 CFLAGS_aarch64-apple-ios = { value = "-DSQLITE_ENABLE_FTS5=1", force = true }
 CFLAGS_aarch64-apple-ios-sim = { value = "-DSQLITE_ENABLE_FTS5=1", force = true }
