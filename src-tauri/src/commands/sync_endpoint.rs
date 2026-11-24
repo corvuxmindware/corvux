@@ -84,6 +84,128 @@ pub(super) fn validate_queue_endpoint(url: &str, pinned_host: &str) -> Result<St
     Ok(trimmed.to_string())
 }
 
+/// Normalize a pin request (`host` + the "type it twice" confirmation) into the
+/// stored form. An empty host means "clear the pin".
+///
+/// The double entry is a TYPO guard for a human, nothing more: both strings
+/// arrive in the same IPC message, so a script in the webview satisfies it
+/// trivially. The real control is [`authorize_pin_change`].
+pub(super) fn normalize_pin_host(host: &str, host_confirm: &str) -> Result<String, String> {
+    let host = host.trim().to_ascii_lowercase();
+    let confirm = host_confirm.trim().to_ascii_lowercase();
+    if host != confirm {
+        return Err("host and confirmation must match exactly".into());
+    }
+    if !host.is_empty() {
+        // Sanity: host should not include a scheme or path. We accept hostnames
+        // only (`example.com`, `queue.example.com:8443` allowed).
+        if host.contains("://") || host.contains('/') {
+            return Err("pinned host must be a bare hostname, no scheme or path".into());
+        }
+        if host.chars().any(|c| c.is_whitespace()) {
+            return Err("pinned host must not contain whitespace".into());
+        }
+    }
+    Ok(host)
+}
+
+/// F3 (sharp-edges 2026-11-11): pinning a host is what lets a queue endpoint on
+/// that host pass [`validate_queue_endpoint`], so it is the real trust decision.
+/// Setting a NEW pin needs the user's answer in a native OS dialog the webview
+/// cannot click. Clearing a pin, or re-saving the pin already in place, widens
+/// nothing and does not prompt.
+pub(super) async fn authorize_pin_change(
+    current_pin: &str,
+    new_pin: &str,
+    confirm: &(impl super::native_confirm::NativeConfirm + ?Sized),
+) -> Result<(), String> {
+    if new_pin.is_empty() || new_pin.eq_ignore_ascii_case(current_pin) {
+        return Ok(());
+    }
+    let body = format!(
+        "Corvux is about to trust \"{}\" as a sync queue server — a relay that holds your \
+         encrypted sync data while your other devices are offline.\n\n\
+         The server cannot read your notes, but it will see when and how much you sync. \
+         Only continue for a server you run or trust.\n\n\
+         If you did not just do this in Settings \u{2192} Sync, choose Cancel.",
+        super::native_confirm::dialog_safe(new_pin, 100)
+    );
+    if confirm
+        .confirm("Trust this sync server?", &body, "Trust server")
+        .await
+    {
+        Ok(())
+    } else {
+        Err("Not trusted: the confirmation was cancelled, so the host was not pinned.".into())
+    }
+}
+
+#[cfg(test)]
+mod pin_tests {
+    use super::super::native_confirm::test_support::Scripted;
+    use super::*;
+
+    #[test]
+    fn normalizes_and_requires_matching_entries() {
+        assert_eq!(
+            normalize_pin_host(" Q.Example.NET ", "q.example.net").unwrap(),
+            "q.example.net"
+        );
+        assert!(normalize_pin_host("a.example", "b.example").is_err());
+        assert_eq!(normalize_pin_host("", "  ").unwrap(), "");
+    }
+
+    #[test]
+    fn rejects_scheme_path_and_whitespace() {
+        assert!(normalize_pin_host("https://q.example", "https://q.example").is_err());
+        assert!(normalize_pin_host("q.example/x", "q.example/x").is_err());
+        assert!(normalize_pin_host("q example", "q example").is_err());
+    }
+
+    /// The audit's attack, verbatim: both fields supplied by the same caller.
+    /// The double entry passes — the native dialog is what stops it.
+    #[tokio::test]
+    async fn a_script_that_types_the_host_twice_is_still_stopped_by_the_dialog() {
+        let host = normalize_pin_host("evil.example", "evil.example").unwrap();
+        let dialog = Scripted::deny();
+        let err = authorize_pin_change("", &host, &dialog).await.unwrap_err();
+        assert!(err.contains("not pinned"), "{err}");
+        assert_eq!(dialog.times_asked(), 1);
+    }
+
+    #[tokio::test]
+    async fn an_approved_new_pin_goes_through() {
+        let dialog = Scripted::allow();
+        authorize_pin_change("old.example", "q.example", &dialog)
+            .await
+            .unwrap();
+        assert_eq!(dialog.times_asked(), 1);
+    }
+
+    #[tokio::test]
+    async fn clearing_or_resaving_the_same_pin_never_prompts() {
+        let dialog = Scripted::deny();
+        authorize_pin_change("q.example", "", &dialog)
+            .await
+            .unwrap();
+        authorize_pin_change("q.example", "q.example", &dialog)
+            .await
+            .unwrap();
+        authorize_pin_change("q.example", "Q.EXAMPLE", &dialog)
+            .await
+            .unwrap();
+        assert_eq!(dialog.times_asked(), 0);
+    }
+
+    #[tokio::test]
+    async fn control_characters_in_the_host_cannot_forge_dialog_text() {
+        // `normalize_pin_host` rejects whitespace, but `\r`/`\n` are whitespace
+        // too — so a forged line never reaches the dialog. Belt and braces:
+        // dialog_safe flattens anything that slips through.
+        assert!(normalize_pin_host("a.example\nFAKE", "a.example\nFAKE").is_err());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

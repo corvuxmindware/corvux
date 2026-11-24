@@ -232,14 +232,9 @@ fn run_fts(app: &tauri::AppHandle, query: &str) -> Result<Vec<FtsHit>, ToolError
 }
 
 fn clip(s: &str, n: usize) -> String {
-    if s.len() <= n {
-        return s.to_string();
-    }
-    let mut cut = n;
-    while cut > 0 && !s.is_char_boundary(cut) {
-        cut -= 1;
-    }
-    format!("{}…", &s[..cut])
+    let mut out = s.to_string();
+    super::truncate_utf8_with(&mut out, n, "…");
+    out
 }
 
 #[cfg(test)]

@@ -3,6 +3,7 @@ import { commands, unwrap } from "../lib/invoke";
 import type {
   Settings as WireSettings,
   DeviceProfile as WireDeviceProfile,
+  ProviderKeyStatus,
 } from "../lib/bindings";
 
 // The store's exported interfaces below are the *normalized* in-memory
@@ -18,6 +19,7 @@ import type {
 // not via 50 `?.` checks scattered across the panels.
 import { lsGet, lsSet } from "../lib/storage";
 import { log } from "../lib/log";
+import { isSecurityCancel } from "../lib/error";
 import { roostSettingsStore } from "./roostSettings";
 import { isLightBackgroundTheme } from "../lib/theme-kind";
 
@@ -68,6 +70,14 @@ export interface ModelStatus {
   path: string;
 }
 
+/** Provider API keys (`gemini_api_key`, `openrouter_api_key`,
+ *  `ollama_api_key`, `openai_api_key`, `anthropic_api_key`) are WRITE-ONLY
+ *  from the webview's point of view (security finding F11):
+ *  - `getSettings` always returns them as `null` — the saved key never
+ *    reaches the webview. Ask `settingsStore.keyStatus()` whether one is saved.
+ *  - On `saveSettings`: `null` = leave the saved key unchanged, `""` = remove
+ *    it, any other string = set/replace it.
+ *  The store therefore never keeps a typed key after a save (see `save()`). */
 export interface Settings {
   gemini_api_key: string | null;
   model: string;
@@ -180,6 +190,29 @@ const DEFAULT_SETTINGS: Settings = {
   close_to_tray: true,
 };
 
+/** No provider has a saved key — the state before the first status fetch. */
+const NO_KEYS_SAVED: ProviderKeyStatus = {
+  gemini: false,
+  openrouter: false,
+  ollama: false,
+  openai: false,
+  anthropic: false,
+};
+
+/** Copy of `s` with all five provider-key fields reset to `null`
+ *  ("unchanged" on the next save). Applied after every successful save so a
+ *  key the user just typed does not linger in the long-lived store. */
+function withoutKeys(s: Settings): Settings {
+  return {
+    ...s,
+    gemini_api_key: null,
+    openrouter_api_key: null,
+    ollama_api_key: null,
+    openai_api_key: null,
+    anthropic_api_key: null,
+  };
+}
+
 /** Hydrate the wire-shape `Settings` into the store's required-fields
  *  view. `#[serde(default)]` on the Rust side already fills missing
  *  fields at serialize time, but the bindings type marks them
@@ -265,6 +298,9 @@ function createSettingsStore() {
   const [llmModelStatus, setLlmModelStatus] = createSignal<ModelStatus | null>(null);
   const [llmLoaded, setLlmLoaded] = createSignal<boolean>(false);
   const [agentProfiles, setAgentProfiles] = createSignal<AgentProfileInfo[]>([]);
+  // Which providers have a saved key. The ONLY way the UI learns this —
+  // the key strings themselves are never sent to the webview.
+  const [keyStatus, setKeyStatus] = createSignal<ProviderKeyStatus>({ ...NO_KEYS_SAVED });
 
   // Theme — persisted in localStorage, applied via data-theme attribute
   const stored = lsGet("corvux:theme") as Theme | null;
@@ -340,11 +376,13 @@ function createSettingsStore() {
   async function load() {
     try {
       const result = await unwrap(commands.getSettings());
-      setSettings(normalizeSettings(result));
+      // Defensive: even if a backend ever sent a key, don't hold it.
+      setSettings(withoutKeys(normalizeSettings(result)));
       setLoaded(true);
     } catch (e) {
       log.error("settings", "failed to load settings", e);
     }
+    await refreshKeyStatus();
     try {
       const profile = await unwrap(commands.getDeviceProfile());
       setDeviceProfile(normalizeDeviceProfile(profile));
@@ -354,6 +392,18 @@ function createSettingsStore() {
     }
     await loadLlmModelStatus();
     await loadAgentProfiles();
+  }
+
+  /** Ask the backend which providers have a saved key. Never throws — a
+   *  failed refresh keeps the last known status. */
+  async function refreshKeyStatus() {
+    try {
+      const status = await unwrap(commands.getProviderKeyStatus());
+      // A booleans-only snapshot; fill any missing field with "no key".
+      setKeyStatus({ ...NO_KEYS_SAVED, ...status });
+    } catch (e) {
+      log.warn("settings", "failed to fetch provider key status", e);
+    }
   }
 
   /** Fetch the available agent-profile descriptors so the picker can
@@ -408,38 +458,42 @@ function createSettingsStore() {
     // both against the same stale snapshot made the later response erase the
     // first field even though both IPC calls succeeded.
     const operation = saveChain.then(async () => {
+      // `settings()` holds null keys, so any key the caller did not pass goes
+      // out as `null` = "unchanged". A caller removes a key with `""`.
       const merged: Settings = { ...settings(), ...updates };
       try {
         await unwrap(commands.saveSettings(merged));
-        setSettings(merged);
       } catch (e) {
-        log.error("settings", "failed to save settings", e);
+        // A declined native confirmation is the user's choice, not a fault.
+        // Still rethrown so the caller can revert its optimistic UI.
+        if (isSecurityCancel(e)) {
+          log.info("settings", "settings change cancelled at the security confirmation");
+        } else {
+          log.error("settings", "failed to save settings", e);
+        }
         throw e;
       }
+      // Saved. Don't keep typed keys in the long-lived store; learn the new
+      // saved/not-saved state from the backend instead.
+      setSettings(withoutKeys(merged));
+      await refreshKeyStatus();
     });
     saveChain = operation.catch(() => undefined);
     return operation;
   }
 
-  /** True if the *active* provider is "ready to chat" — has a key
-   *  (Gemini, OpenRouter) or has a model selected (Ollama, which
-   *  doesn't need a key on the localhost path). Used by the chat
-   *  panel + onboarding to gate the ready state without inspecting
+  /** True if the *active* provider is "ready to chat" — has a saved key
+   *  (Gemini, OpenRouter, OpenAI, Anthropic) or has a model selected
+   *  (Ollama, which doesn't need a key on the localhost path). Key presence
+   *  comes from `keyStatus` — the webview never sees the key itself. Used by
+   *  the chat panel + onboarding to gate the ready state without inspecting
    *  the provider at every call site. */
   function hasApiKey(): boolean {
     const s = settings();
     if (s.llm_provider === "ollama") {
       return !!s.ollama_model && s.ollama_model.trim().length > 0;
     }
-    const key =
-      s.llm_provider === "openrouter"
-        ? s.openrouter_api_key
-        : s.llm_provider === "openai"
-          ? s.openai_api_key
-          : s.llm_provider === "anthropic"
-            ? s.anthropic_api_key
-            : s.gemini_api_key;
-    return !!key && key.trim().length > 0;
+    return keyStatus()[s.llm_provider];
   }
 
   function setEditorFont(f: EditorFont) {
@@ -464,6 +518,7 @@ function createSettingsStore() {
 
   return {
     settings, loaded, load, save, hasApiKey,
+    keyStatus, refreshKeyStatus,
     deviceProfile,
     llmModelStatus, loadLlmModelStatus,
     llmLoaded, loadLlmModel, unloadLlmModel,

@@ -43,6 +43,17 @@ export const commands = {
 	 *  on-disk roosts invisible. The frontend owns the JSON shape (a `RoostEntry[]`
 	 *  blob) — we just store it, written atomically (tmp + rename) so a crash
 	 *  mid-write can't truncate the manifest.
+	 * 
+	 *  F10 (sharp-edges 2026-11-11): this blob is also the AUTHORITY for a
+	 *  destructive startup decision — `paths::gc_orphaned_index_dirs` deletes the
+	 *  index dir and scoped sync credentials of every roost the manifest does not
+	 *  list. So the backend no longer trusts it blindly:
+	 * 
+	 *  * the shape is validated (array, bounded size/count, every entry has a real
+	 *    `path`) — garbage is rejected, never stored;
+	 *  * a write that DROPS a previously listed roost needs the user's answer in a
+	 *    native OS dialog the webview cannot click, unless they already confirmed
+	 *    that roost's removal there through [`delete_roost_index`].
 	 */
 	writeRoostManifest: (json: string) => typedError<null, string>(__TAURI_INVOKE("write_roost_manifest", { json })),
 	/**
@@ -63,6 +74,11 @@ export const commands = {
 	 *  is success. Intended for roosts that aren't currently open (an open roost
 	 *  holds its DB files, which can block deletion on Windows); the caller
 	 *  tolerates an error and still drops the registry entry.
+	 * 
+	 *  F10: this also deletes the roost's scoped sync credentials, so it needs the
+	 *  same out-of-band confirmation as dropping the roost from the manifest. On
+	 *  success the path is remembered as confirmed, so the manifest write that
+	 *  completes the "Remove roost" flow does not ask again.
 	 */
 	deleteRoostIndex: (roostPath: string) => typedError<null, string>(__TAURI_INVOKE("delete_roost_index", { roostPath })),
 	readFile: (path: string) => typedError<string, string>(__TAURI_INVOKE("read_file", { path })),
@@ -658,13 +674,21 @@ export const commands = {
 	skillCreate: (roostPath: string, name: string) => typedError<string, string>(__TAURI_INVOKE("skill_create", { roostPath, name })),
 	getSettings: () => typedError<Settings, string>(__TAURI_INVOKE("get_settings")),
 	/**
-	 *  Persist settings. On platforms with a keychain the Gemini,
-	 *  OpenRouter, and Ollama API keys are pulled out of the struct,
-	 *  written to the OS keychain, and the on-disk settings.json keeps
-	 *  the fields as `null`. The in-memory copy still holds the real keys
-	 *  so subsequent `get_settings` calls return them.
+	 *  Persist settings.
+	 * 
+	 *  Provider API keys follow `settings_guard`'s contract: a key field of `None`
+	 *  leaves the stored key alone, `Some("")` removes it, `Some(k)` replaces it.
+	 *  Keys live in the OS keychain; settings.json keeps them as `null`; the
+	 *  in-memory copy holds the live values for chat. `get_settings` never returns
+	 *  them (F11).
+	 * 
+	 *  Changes that loosen a safety setting — enabling agent auto-approve, pinning
+	 *  a tool, un-blocking a path, pointing Ollama at an internet host — need the
+	 *  user to confirm in a native OS dialog the webview cannot click (F1/F2). The
+	 *  decision and the answer are written to the approval log.
 	 */
 	saveSettings: (settings: Settings) => typedError<null, string>(__TAURI_INVOKE("save_settings", { settings })),
+	getProviderKeyStatus: () => typedError<ProviderKeyStatus, string>(__TAURI_INVOKE("get_provider_key_status")),
 	aiConsentCheck: () => typedError<{
 	/**
 	 *  Stable consent key: `gemini`, `openrouter`, `openai`, `anthropic`, or
@@ -873,10 +897,15 @@ export const commands = {
 	 */
 	syncSetQueueEndpoint: (endpoint: string) => typedError<null, string>(__TAURI_INVOKE("sync_set_queue_endpoint", { endpoint })),
 	/**
-	 *  Pin a custom queue host (e.g. a self-hosted Corvux queue). The user
-	 *  must type the host twice to confirm — this is a defense against a
-	 *  compromised renderer silently rerouting queue traffic. Pass an empty
+	 *  Pin a custom queue host (e.g. a self-hosted Corvux queue). Pass an empty
 	 *  `host` to clear an existing pin.
+	 * 
+	 *  The host must be typed twice, but that only catches a human typo: both
+	 *  strings arrive in the same IPC message, so a compromised renderer supplies
+	 *  both (F3, sharp-edges 2026-11-11). The control is a native OS dialog the
+	 *  webview cannot click, shown whenever a NEW host would be trusted
+	 *  (`authorize_pin_change`). Prefs are loaded AFTER the dialog so a settings
+	 *  change made while it was open is not overwritten with a stale copy.
 	 */
 	syncPinCustomQueueHost: (host: string, hostConfirm: string) => typedError<null, string>(__TAURI_INVOKE("sync_pin_custom_queue_host", { host, hostConfirm })),
 	/**
@@ -1896,6 +1925,18 @@ export type ProgressPayload = {
 	bytes_downloaded: number,
 	total_bytes: number,
 	percent: number | null,
+};
+
+/**
+ *  Which provider keys are configured — the only thing the Settings UI needs.
+ *  Booleans, never key material (not even a last-4 hint).
+ */
+export type ProviderKeyStatus = {
+	gemini: boolean,
+	openrouter: boolean,
+	ollama: boolean,
+	openai: boolean,
+	anthropic: boolean,
 };
 
 /**  Frontend-facing snapshot of queue settings. */

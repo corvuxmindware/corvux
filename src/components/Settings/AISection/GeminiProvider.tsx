@@ -14,7 +14,7 @@ import { For, Show, createSignal, onMount } from "solid-js";
 import { commands, unwrap } from "../../../lib/invoke";
 import type { ConnectionTestResult } from "../../../lib/bindings";
 import { errMsg } from "../../../lib/error";
-import { log } from "../../../lib/log";
+import { confirmDialog } from "../../../lib/confirm";
 import { reportActionError } from "../../../lib/action-error";
 import { settingsStore } from "../../../stores/settings";
 
@@ -45,16 +45,6 @@ const CHAT_MODELS: { id: string; label: string; hint: string }[] = [
   },
 ];
 
-/** Last-4 helper. Returns "•••" for keys shorter than 4 chars.
- *  Duplicated from OpenRouterProvider — 5 lines isn't worth a shared
- *  module yet. */
-function last4(key: string | null | undefined): string {
-  if (!key) return "";
-  const trimmed = key.trim();
-  if (trimmed.length <= 4) return "•••";
-  return trimmed.slice(-4);
-}
-
 export default function GeminiProvider() {
   const [apiKeyInput, setApiKeyInput] = createSignal("");
   const [geminiModelInput, setGeminiModelInput] = createSignal("");
@@ -65,11 +55,22 @@ export default function GeminiProvider() {
   const [geminiTest, setGeminiTest] = createSignal<ConnectionTestResult | null>(null);
   const [geminiSaveError, setGeminiSaveError] = createSignal<string | null>(null);
 
+  // The saved key never reaches the webview — only "is one saved?" does.
+  const hasSavedKey = () => settingsStore.keyStatus().gemini;
+  // Test is meaningful with a typed key, or with a saved one (the backend
+  // falls back to the saved key when we send an empty string).
+  const canTest = () => apiKeyInput().trim().length > 0 || hasSavedKey();
+
   async function handleSaveApiKey() {
     const key = apiKeyInput().trim();
+    // Empty = nothing to save. Removing a key is the explicit "Remove" action,
+    // never a side effect of pressing Save on an empty box.
+    if (!key) return;
     setGeminiSaveError(null);
     try {
-      await settingsStore.save({ gemini_api_key: key || null });
+      await settingsStore.save({ gemini_api_key: key });
+      // Don't keep the key in the component once the backend has it.
+      setApiKeyInput("");
       setSaved(true);
       setEditingGemini(false);
       // A new save invalidates any prior test result — the user might
@@ -83,18 +84,16 @@ export default function GeminiProvider() {
     }
   }
 
-  /** Probe the saved Gemini key against `models.list`. We send the
-   *  CURRENT input (apiKeyInput) rather than the persisted settings
-   *  because users typically click Test right after typing — letting
-   *  them validate before pressing Save. If the input is empty, we
-   *  fall back to the persisted key. */
+  /** Probe a Gemini key against `models.list`. We send the CURRENT input
+   *  (apiKeyInput) because users typically click Test right after typing —
+   *  letting them validate before pressing Save. If the input is empty we
+   *  send `""` and the backend tests the SAVED key (the webview no longer
+   *  holds it). */
   async function handleTestGemini() {
     setGeminiTesting(true);
     setGeminiTest(null);
     try {
-      const candidate =
-        apiKeyInput().trim() || (settingsStore.settings().gemini_api_key ?? "");
-      const result = await unwrap(commands.testGeminiConnection(candidate));
+      const result = await unwrap(commands.testGeminiConnection(apiKeyInput().trim()));
       setGeminiTest(result);
     } catch (e) {
       const msg = errMsg(e);
@@ -106,6 +105,20 @@ export default function GeminiProvider() {
       });
     } finally {
       setGeminiTesting(false);
+    }
+  }
+
+  /** Delete the saved key. Sends `""` — `null` now means "leave it alone". */
+  async function handleRemoveKey() {
+    if (!(await confirmDialog("Remove the saved Gemini API key from this device?"))) return;
+    setGeminiSaveError(null);
+    try {
+      await settingsStore.save({ gemini_api_key: "" });
+      setApiKeyInput("");
+      setEditingGemini(false);
+      setGeminiTest(null);
+    } catch (e) {
+      setGeminiSaveError(errMsg(e));
     }
   }
 
@@ -125,7 +138,6 @@ export default function GeminiProvider() {
 
   onMount(() => {
     const s = settingsStore.settings();
-    if (s.gemini_api_key) setApiKeyInput(s.gemini_api_key);
     setGeminiModelInput(s.model || "gemini-3.1-flash-lite");
   });
 
@@ -134,21 +146,16 @@ export default function GeminiProvider() {
       <div>
         <label class="text-text-primary text-sm block mb-1">Gemini API Key</label>
 
-        {/* Saved-state chip — shown when there's a persisted key AND
-            the user isn't editing. Hides the actual value so a
-            shoulder-surfer / screenshot doesn't leak it; "ends in
-            XXXX" is enough to confirm "yes, the right key is in
-            place" without exposing the full string. */}
+        {/* Saved-state chip — shown when a key is saved AND the user
+            isn't editing. The key itself is never in the webview, so the
+            chip can only say "saved" — no characters of it. */}
         <Show
-          when={
-            !editingGemini() &&
-            (settingsStore.settings().gemini_api_key ?? "").length > 0
-          }
+          when={!editingGemini() && hasSavedKey()}
           fallback={
             <div class="flex gap-2">
               <input
                 type="password"
-                placeholder="AIza..."
+                placeholder={hasSavedKey() ? "Paste a new key to replace the saved one" : "AIza..."}
                 value={apiKeyInput()}
                 onInput={(e) => setApiKeyInput(e.currentTarget.value)}
                 onKeyDown={(e) => {
@@ -158,18 +165,30 @@ export default function GeminiProvider() {
               />
               <button
                 onClick={handleSaveApiKey}
-                class="px-4 py-2 bg-accent text-bg-primary rounded-lg text-sm font-medium hover:opacity-90 transition-opacity"
+                disabled={!apiKeyInput().trim()}
+                class="px-4 py-2 bg-accent text-bg-primary rounded-lg text-sm font-medium hover:opacity-90 disabled:opacity-50 disabled:cursor-not-allowed transition-opacity"
               >
                 Save
               </button>
               <button
                 onClick={handleTestGemini}
-                disabled={geminiTesting()}
-                class="px-3 py-2 border border-border bg-bg-secondary text-text-primary rounded-lg text-sm hover:bg-bg-hover disabled:opacity-50 disabled:cursor-wait transition-colors"
+                disabled={geminiTesting() || !canTest()}
+                class="px-3 py-2 border border-border bg-bg-secondary text-text-primary rounded-lg text-sm hover:bg-bg-hover disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
                 title="Verify the key against Gemini's models endpoint"
               >
                 {geminiTesting() ? "Testing…" : "Test"}
               </button>
+              <Show when={editingGemini()}>
+                <button
+                  onClick={() => {
+                    setApiKeyInput("");
+                    setEditingGemini(false);
+                  }}
+                  class="px-3 py-2 border border-border bg-bg-secondary text-text-secondary rounded-lg text-sm hover:bg-bg-hover transition-colors"
+                >
+                  Cancel
+                </button>
+              </Show>
             </div>
           }
         >
@@ -189,20 +208,18 @@ export default function GeminiProvider() {
               <path d="M20 6L9 17l-5-5" />
             </svg>
             <span class="flex-1 text-sm text-text-primary truncate min-w-0">
-              Saved · ends in{" "}
-              <span class="font-mono text-text-secondary">
-                •••{last4(settingsStore.settings().gemini_api_key)}
-              </span>
+              Key saved
             </span>
             <button
               onClick={() => {
-                setApiKeyInput(settingsStore.settings().gemini_api_key ?? "");
+                // Start empty — the saved key can't be shown or prefilled.
+                setApiKeyInput("");
                 setEditingGemini(true);
                 setGeminiTest(null);
               }}
               class="px-2 py-1 text-xs rounded border border-border text-text-secondary hover:bg-bg-hover hover:text-text-primary transition-colors"
             >
-              Edit
+              Replace
             </button>
             <button
               onClick={handleTestGemini}
@@ -210,6 +227,12 @@ export default function GeminiProvider() {
               class="px-2 py-1 text-xs rounded border border-border text-text-secondary hover:bg-bg-hover hover:text-text-primary disabled:opacity-50 disabled:cursor-wait transition-colors"
             >
               {geminiTesting() ? "Testing…" : "Test"}
+            </button>
+            <button
+              onClick={() => void handleRemoveKey()}
+              class="px-2 py-1 text-xs rounded border border-border text-text-secondary hover:bg-bg-hover hover:text-red transition-colors"
+            >
+              Remove
             </button>
           </div>
         </Show>

@@ -191,7 +191,7 @@ fn hex32(bytes: &[u8; 16]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-fn normalize_key(key: &str) -> String {
+pub(crate) fn normalize_key(key: &str) -> String {
     // NEW-M1: case-folding is gated on the host filesystem's semantics —
     // mirrors `commands::roost::same_roost_root` (AUDIT-045). Windows/macOS
     // default to case-insensitive filesystems (NTFS, consumer APFS), so
@@ -294,7 +294,7 @@ fn is_orphaned_index_dir(
 /// (`roosts.json`, a `RoostEntry[]` blob written by the frontend). Returns
 /// `None` if the JSON isn't the expected array shape (so the caller can skip the
 /// sweep rather than treat "unparseable" as "no roosts").
-fn manifest_paths(json: &str) -> Option<Vec<String>> {
+pub(crate) fn manifest_paths(json: &str) -> Option<Vec<String>> {
     let v: serde_json::Value = serde_json::from_str(json).ok()?;
     let arr = v.as_array()?;
     Some(

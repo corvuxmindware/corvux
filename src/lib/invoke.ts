@@ -174,6 +174,55 @@ function buildFileTree(roostPath = getMockRoostPath()): FileEntry[] {
   });
 }
 
+// ── Mock provider-key store (browser dev only) ───────────────────
+//
+// Mirrors the backend contract from security finding F11 so browser-dev
+// exercises the same UI paths as the real app:
+//   - `get_settings` NEVER returns a key (all five fields come back null);
+//   - `save_settings` key fields: null = leave the stored key alone,
+//     ""/whitespace = remove it, non-empty = set/replace it;
+//   - `get_provider_key_status` reports booleans only.
+// Keys live in their own localStorage entry (stand-in for the OS keychain),
+// never inside the `corvux-settings` blob the webview reads back.
+
+const MOCK_KEYS_LS = "corvux-mock-provider-keys";
+const MOCK_KEY_FIELDS = [
+  "gemini_api_key",
+  "openrouter_api_key",
+  "ollama_api_key",
+  "openai_api_key",
+  "anthropic_api_key",
+] as const;
+
+function readMockKeys(): Record<string, string> {
+  try {
+    const raw = lsGet(MOCK_KEYS_LS);
+    return raw ? (JSON.parse(raw) as Record<string, string>) : {};
+  } catch {
+    return {};
+  }
+}
+
+/** Copy of a settings object with every key field forced to null. */
+function redactMockKeys(settings: Record<string, unknown>): Record<string, unknown> {
+  const out = { ...settings };
+  for (const f of MOCK_KEY_FIELDS) out[f] = null;
+  return out;
+}
+
+/** Apply `save_settings` key semantics to the mock key store. */
+function applyMockKeyWrites(settings: Record<string, unknown>) {
+  const keys = readMockKeys();
+  for (const f of MOCK_KEY_FIELDS) {
+    const v = settings[f];
+    if (typeof v !== "string") continue; // null / absent = unchanged
+    const trimmed = v.trim();
+    if (trimmed) keys[f] = trimmed;
+    else delete keys[f];
+  }
+  lsSet(MOCK_KEYS_LS, JSON.stringify(keys));
+}
+
 // ── Mock invoke handler ──────────────────────────────────────────
 
 // `export` so `./mock-commands.ts` can delegate to the same in-memory
@@ -700,9 +749,13 @@ export async function mockInvoke<T>(cmd: string, args?: Record<string, unknown>)
         const parsed = JSON.parse(stored);
         // Backfill fields added in later versions so mock stays shape-compatible
         if (parsed.embedding_backend === undefined) parsed.embedding_backend = "auto";
-        return parsed as T;
+        // Keys are write-only: never hand one back, even a legacy one that an
+        // older mock build left inside this blob.
+        return redactMockKeys(parsed) as T;
       }
-      return {
+      // `redactMockKeys` forces all five key fields to null (the real backend
+      // always returns them null), including openai/anthropic below.
+      return redactMockKeys({
         // Q-04: keep in sync with `src/stores/settings.ts:DEFAULT_SETTINGS`
         // and Rust `Settings::default()` in
         // `src-tauri/src/commands/ai/types.rs` — see `default_settings_tests`.
@@ -725,7 +778,7 @@ export async function mockInvoke<T>(cmd: string, args?: Record<string, unknown>)
           agent_blocked_paths: [],
         },
         use_native_tools: true,
-      } as T;
+      }) as T;
     }
 
     case "get_device_profile": {
@@ -741,9 +794,21 @@ export async function mockInvoke<T>(cmd: string, args?: Record<string, unknown>)
 
     case "save_settings": {
       const settings = args?.settings as Record<string, unknown>;
-      lsSet("corvux-settings", JSON.stringify(settings));
+      applyMockKeyWrites(settings);
+      lsSet("corvux-settings", JSON.stringify(redactMockKeys(settings)));
       console.log("[mock] Settings saved");
       return undefined as T;
+    }
+
+    case "get_provider_key_status": {
+      const keys = readMockKeys();
+      return {
+        gemini: !!keys.gemini_api_key,
+        openrouter: !!keys.openrouter_api_key,
+        ollama: !!keys.ollama_api_key,
+        openai: !!keys.openai_api_key,
+        anthropic: !!keys.anthropic_api_key,
+      } as T;
     }
 
     case "chat_send": {
@@ -753,10 +818,13 @@ export async function mockInvoke<T>(cmd: string, args?: Record<string, unknown>)
       const stored = lsGet("corvux-settings");
       const settings: Record<string, unknown> = stored ? JSON.parse(stored) : {};
       const provider = (settings.llm_provider as string | undefined) ?? "gemini";
+      // Keys come from the mock key store, not the settings blob (which
+      // never holds them — see the F11 note above).
+      const mockKeys = readMockKeys();
       const apiKey =
         provider === "openrouter"
-          ? (settings.openrouter_api_key as string | null)
-          : (settings.gemini_api_key as string | null);
+          ? (mockKeys.openrouter_api_key ?? null)
+          : (mockKeys.gemini_api_key ?? null);
 
       if (!apiKey) {
         const lastMsg = messages?.[messages.length - 1]?.content ?? "";

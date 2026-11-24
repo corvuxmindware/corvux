@@ -29,11 +29,25 @@ pub fn path_is_blocked(path: &str, patterns: &[String]) -> bool {
     })
 }
 
+/// Canonical form for comparison, applied to BOTH the pattern and the path.
+///
+/// `agent_blocked_paths` is the one agent control the webview cannot talk its
+/// way past (the loop hard-rejects before any approval card exists), so the
+/// matcher has to see every spelling the file system treats as the same path
+/// (reviewer finding #10):
+/// * case-insensitive — `journal/x.md` IS `Journal/x.md` on Windows and macOS,
+///   and over-blocking on a case-sensitive file system only errs safe;
+/// * Windows ignores trailing dots and spaces in a name (`Journal./x.md`,
+///   `Journal /x.md` resolve to `Journal\x.md`), so strip them per segment;
+/// * empty segments (`Journal//x.md`) collapse.
 fn normalize(s: &str) -> String {
     s.replace('\\', "/")
-        .trim_start_matches('/')
-        .trim_end_matches('/')
-        .to_string()
+        .split('/')
+        .map(|seg| seg.trim_end_matches(['.', ' ']))
+        .filter(|seg| !seg.is_empty())
+        .collect::<Vec<_>>()
+        .join("/")
+        .to_lowercase()
 }
 
 /// Match `path` against `pattern`. Trailing `/` on the pattern is
@@ -168,6 +182,47 @@ mod tests {
         assert!(path_is_blocked("qa.md", &p));
         assert!(!path_is_blocked("q.md", &p)); // ? requires exactly one
         assert!(!path_is_blocked("q12.md", &p));
+    }
+
+    /// Reviewer #10: the one hard agent control must see every spelling the
+    /// file system treats as the same path.
+    #[test]
+    fn blocking_is_case_insensitive() {
+        let p = pats(&["Journal/"]);
+        assert!(path_is_blocked("journal/x.md", &p));
+        assert!(path_is_blocked("JOURNAL/x.md", &p));
+        assert!(path_is_blocked("Journal/X.MD", &p));
+        let p = pats(&["Finance/*.md"]);
+        assert!(path_is_blocked("finance/Q1.md", &p));
+        let p = pats(&["Notes/Secret.md"]);
+        assert!(path_is_blocked("notes/secret.md", &p));
+    }
+
+    #[test]
+    fn windows_trailing_dots_and_spaces_do_not_dodge_a_block() {
+        let p = pats(&["Journal/"]);
+        assert!(path_is_blocked("Journal./x.md", &p));
+        assert!(path_is_blocked("Journal../x.md", &p));
+        assert!(path_is_blocked("Journal /x.md", &p));
+        assert!(path_is_blocked("Journal. ./x.md", &p));
+        // ...and in the PATTERN, so a pattern typed with a stray dot still works.
+        let p = pats(&["Journal./"]);
+        assert!(path_is_blocked("Journal/x.md", &p));
+    }
+
+    #[test]
+    fn repeated_slashes_collapse() {
+        let p = pats(&["Journal/"]);
+        assert!(path_is_blocked("Journal//x.md", &p));
+        assert!(path_is_blocked("//Journal///x.md", &p));
+    }
+
+    #[test]
+    fn the_new_folding_does_not_over_block_siblings() {
+        let p = pats(&["Journal"]);
+        assert!(!path_is_blocked("JournalArchive/x.md", &p));
+        assert!(!path_is_blocked("Journals/x.md", &p));
+        assert!(!path_is_blocked("Other/Journal.md", &p));
     }
 
     #[test]

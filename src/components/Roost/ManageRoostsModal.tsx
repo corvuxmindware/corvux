@@ -3,7 +3,8 @@ import { Portal } from "solid-js/web";
 import { roostRegistry, type RoostEntry } from "../../stores/roosts";
 import { roostStore } from "../../stores/roost";
 import { appInvoke as invoke, isTauri, setBrowserRoost, commands, unwrap } from "../../lib/invoke";
-import { errMsg } from "../../lib/error";
+import { errMsg, isSecurityCancel } from "../../lib/error";
+import { confirmDialog } from "../../lib/confirm";
 import { isAndroid as platformIsAndroid, isIOS as platformIsIOS } from "../../lib/platform";
 import { toastStore } from "../Toast/Toast";
 import CreateRoostModal from "./CreateRoostModal";
@@ -37,20 +38,31 @@ export default function ManageRoostsModal(props: ManageRoostsModalProps) {
     const msg = isActive
       ? `Remove '${entry.displayName}' from the list? This is your active roost — the files on disk stay, but the app will close the roost.`
       : `Remove '${entry.displayName}' from the list? Files on disk are not deleted.`;
-    if (!confirm(msg)) return;
+    // `confirmDialog` waits for the answer: on desktop/iOS the Tauri dialog
+    // plugin makes `window.confirm` async, so a bare `confirm()` returned a
+    // truthy Promise and both questions below were treated as "yes".
+    if (!(await confirmDialog(msg))) return;
 
     // MR-B3: offer to reclaim the roost's local index (graph.db + search.db +
     // file-tree cache) so removing a roost doesn't orphan a multi-MB index.
     // Only for non-active roosts — the active roost holds its DB files open,
     // which blocks deletion on Windows. The user's notes are never touched.
     if (isTauri && !isActive) {
-      const alsoDelete = confirm(
+      const alsoDelete = await confirmDialog(
         `Also delete Corvux's local index for '${entry.displayName}'? This frees disk space and rebuilds automatically if you reopen the roost. Your notes are not affected.`,
       );
       if (alsoDelete) {
         try {
           await unwrap(commands.deleteRoostIndex(entry.path));
         } catch (e) {
+          // F10: the backend asks in a native OS dialog before deleting the
+          // index + sync credentials. Declining it means "don't remove this
+          // roost" — stop here so the list doesn't drop a roost the user just
+          // refused to remove (it would reappear on next launch).
+          if (isSecurityCancel(e)) {
+            toastStore.show("Roost not removed. You cancelled the confirmation.", "info");
+            return;
+          }
           // Non-fatal — an orphaned index is harmless; still drop the entry.
           toastStore.show(`Couldn't delete local index: ${errMsg(e)}`, "error");
         }

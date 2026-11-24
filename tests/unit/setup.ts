@@ -91,6 +91,16 @@ vi.mock("../../src/lib/invoke", () => {
       case "save_settings": {
         return undefined as T;
       }
+      case "get_provider_key_status": {
+        // F11: the webview learns "is a key saved?" only from this command.
+        return {
+          gemini: false,
+          openrouter: false,
+          ollama: false,
+          openai: false,
+          anthropic: false,
+        } as T;
+      }
       case "get_device_profile": {
         return {
           total_ram_gb: 16,
@@ -174,6 +184,8 @@ vi.mock("../../src/lib/invoke", () => {
     testGeminiConnection: ["apiKey"],
     testOpenrouterConnection: ["apiKey"],
     testOllamaConnection: ["baseUrl", "apiKey"],
+    testOpenaiConnection: ["apiKey"],
+    testAnthropicConnection: ["apiKey"],
     graphPageRank: ["limit"],
     graphCommunities: ["limit"],
     graphBridges: ["limit"],

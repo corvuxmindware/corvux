@@ -94,15 +94,8 @@ pub fn hash_args(args_json: &str) -> String {
 pub fn record_decision(db: &DbInstance, entry: &ApprovalLogEntry) -> Result<(), String> {
     let mut summary = entry.args_summary.clone();
     if summary.len() > SUMMARY_MAX {
-        // UTF-8 safe truncate — `char_indices` finds a valid boundary.
-        let cut = summary
-            .char_indices()
-            .map(|(i, _)| i)
-            .take_while(|i| *i <= SUMMARY_MAX)
-            .last()
-            .unwrap_or(0);
-        summary.truncate(cut);
-        summary.push('…');
+        // UTF-8 safe truncate on a codepoint boundary.
+        crate::ai::tools::truncate_utf8_with(&mut summary, SUMMARY_MAX, "…");
     }
 
     let mut params = BTreeMap::new();

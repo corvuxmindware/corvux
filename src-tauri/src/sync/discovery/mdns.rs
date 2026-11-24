@@ -475,14 +475,7 @@ fn parse_device_id(hex_str: &str) -> Option<DeviceId> {
 
 /// Byte-safe string truncation that won't split a UTF-8 codepoint.
 fn truncate_bytes(s: &str, max_bytes: usize) -> String {
-    if s.len() <= max_bytes {
-        return s.to_string();
-    }
-    let mut end = max_bytes;
-    while end > 0 && !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    s[..end].to_string()
+    crate::ai::tools::utf8_prefix(s, max_bytes).to_string()
 }
 
 /// Best-effort match of a removed service's fully-qualified name against

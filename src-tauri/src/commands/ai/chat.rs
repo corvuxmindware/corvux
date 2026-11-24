@@ -736,9 +736,21 @@ fn build_chat_provider(
                      Open Settings → AI and pick an installed Ollama model."
                     .into());
             }
+            // F2 (sharp-edges 2026-11-11): the base URL decides where the roost
+            // index, injected note bodies and the bearer token are sent, so it is
+            // re-validated on EVERY chat, not only when it was saved. An install
+            // whose stored value predates the validator keeps working if it is
+            // safe, and gets a message that says what to fix if it is not.
+            let target =
+                super::provider_url::validate_provider_base_url(&ollama_base).map_err(|e| {
+                    format!(
+                        "The Ollama server address in Settings \u{2192} AI {e}. \
+                         Open Settings \u{2192} AI and correct it."
+                    )
+                })?;
             Ok(Box::new(OllamaChat::new(
                 http_state.0.clone(),
-                ollama_base,
+                target.url,
                 ollama_key,
                 ollama_model,
             )))

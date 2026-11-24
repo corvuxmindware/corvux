@@ -247,17 +247,9 @@ fn strip_frontmatter(content: &str) -> String {
 
 /// Clip a string to at most `max` bytes on a UTF-8 boundary. Returns
 /// (clipped, was_truncated).
-fn clip_bytes(s: String, max: usize) -> (String, bool) {
-    if s.len() <= max {
-        return (s, false);
-    }
-    let mut cut = max;
-    while cut > 0 && !s.is_char_boundary(cut) {
-        cut -= 1;
-    }
-    let mut out = s[..cut].to_string();
-    out.push_str("\n…[truncated]");
-    (out, true)
+fn clip_bytes(mut s: String, max: usize) -> (String, bool) {
+    let cut = super::truncate_utf8_with(&mut s, max, "\n…[truncated]");
+    (s, cut)
 }
 
 #[cfg(test)]

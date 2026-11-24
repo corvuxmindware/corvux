@@ -35,10 +35,17 @@ pub struct NativeFs {
 }
 
 impl NativeFs {
-    /// Test/legacy constructor — does not acquire a roost lock. Production
-    /// callers should use [`NativeFs::open_locked`] so two Corvux instances
-    /// can't race writes against the same roost.
-    pub fn new(root: impl Into<PathBuf>) -> Self {
+    /// UNLOCKED handle — does not acquire the roost lock, so nothing stops a
+    /// second Corvux instance from racing writes against the same roost.
+    ///
+    /// Never the constructor for the roost the app has OPEN: that is
+    /// [`NativeFs::open_locked`]. This one exists for a SECONDARY view of a
+    /// roost whose lock is already held (sync's on-demand `resolve_fs`, the
+    /// `vault_id` helper) and for tests. It is `pub(crate)` — not part of the
+    /// public surface — and `tests/roost_boundary_guard.rs` pins the exact set
+    /// of production files allowed to call it, so a third caller fails the
+    /// build instead of silently skipping the lock (sharp-edges F8).
+    pub(crate) fn new(root: impl Into<PathBuf>) -> Self {
         let root = root.into();
         let display = root.to_string_lossy().into_owned();
         // AUDIT-076: canonicalize root once. Fall back to the raw root if

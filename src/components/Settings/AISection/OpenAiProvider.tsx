@@ -10,6 +10,7 @@ import { For, Show, createSignal, onMount } from "solid-js";
 import { commands, unwrap } from "../../../lib/invoke";
 import type { ConnectionTestResult } from "../../../lib/bindings";
 import { errMsg } from "../../../lib/error";
+import { confirmDialog } from "../../../lib/confirm";
 import { settingsStore } from "../../../stores/settings";
 
 const DEFAULT_MODEL = "gpt-5.5";
@@ -22,13 +23,6 @@ const OPENAI_MODELS: { id: string; label: string }[] = [
   { id: "gpt-5.4-nano", label: "GPT-5.4 nano — cheapest, high-volume" },
 ];
 
-function last4(key: string | null | undefined): string {
-  if (!key) return "";
-  const trimmed = key.trim();
-  if (trimmed.length <= 4) return "•••";
-  return trimmed.slice(-4);
-}
-
 export default function OpenAiProvider() {
   const [keyInput, setKeyInput] = createSignal("");
   const [modelInput, setModelInput] = createSignal("");
@@ -38,15 +32,26 @@ export default function OpenAiProvider() {
   const [test, setTest] = createSignal<ConnectionTestResult | null>(null);
   const [saveError, setSaveError] = createSignal<string | null>(null);
 
+  // The saved key never reaches the webview — only "is one saved?" does.
+  const hasSavedKey = () => settingsStore.keyStatus().openai;
+  // Test is meaningful with a typed key, or with a saved one (the backend
+  // falls back to the saved key when we send an empty string).
+  const canTest = () => keyInput().trim().length > 0 || hasSavedKey();
+
+  /** Saves the model, and the key too when one was typed. An empty key box
+   *  leaves the saved key alone (`null` = unchanged) — removing a key is the
+   *  explicit Remove action. */
   async function handleSave() {
     const key = keyInput().trim();
     const model = modelInput().trim() || DEFAULT_MODEL;
     setSaveError(null);
     try {
       await settingsStore.save({
-        openai_api_key: key || null,
+        ...(key ? { openai_api_key: key } : {}),
         openai_model: model,
       });
+      // Don't keep the key in the component once the backend has it.
+      setKeyInput("");
       setSaved(true);
       setEditing(false);
       setTest(null);
@@ -60,8 +65,8 @@ export default function OpenAiProvider() {
     setTesting(true);
     setTest(null);
     try {
-      const candidate = keyInput().trim() || (settingsStore.settings().openai_api_key ?? "");
-      const result = await unwrap(commands.testOpenaiConnection(candidate));
+      // Empty input => `""` => the backend tests the SAVED key.
+      const result = await unwrap(commands.testOpenaiConnection(keyInput().trim()));
       setTest(result);
     } catch (e) {
       setTest({ ok: false, latency_ms: 0, summary: "Test failed", error_message: errMsg(e) });
@@ -70,9 +75,23 @@ export default function OpenAiProvider() {
     }
   }
 
+  /** Delete the saved key. Sends `""` — `null` now means "leave it alone". */
+  async function handleRemoveKey() {
+    if (!(await confirmDialog("Remove the saved OpenAI API key from this device?"))) return;
+    setSaveError(null);
+    try {
+      await settingsStore.save({ openai_api_key: "" });
+      setKeyInput("");
+      setEditing(false);
+      setTest(null);
+    } catch (e) {
+      setSaveError(errMsg(e));
+    }
+  }
+
   onMount(() => {
+    // The key box always starts empty: the saved key is never in the webview.
     const s = settingsStore.settings();
-    if (s.openai_api_key) setKeyInput(s.openai_api_key);
     setModelInput(s.openai_model || DEFAULT_MODEL);
   });
 
@@ -82,12 +101,12 @@ export default function OpenAiProvider() {
         <label class="text-text-primary text-sm block mb-1">OpenAI API Key</label>
 
         <Show
-          when={!editing() && (settingsStore.settings().openai_api_key ?? "").length > 0}
+          when={!editing() && hasSavedKey()}
           fallback={
             <div class="flex gap-2">
               <input
                 type="password"
-                placeholder="sk-..."
+                placeholder={hasSavedKey() ? "Paste a new key to replace the saved one" : "sk-..."}
                 value={keyInput()}
                 onInput={(e) => setKeyInput(e.currentTarget.value)}
                 onKeyDown={(e) => {
@@ -97,18 +116,30 @@ export default function OpenAiProvider() {
               />
               <button
                 onClick={handleSave}
-                class="px-4 py-2 bg-accent text-bg-primary rounded-lg text-sm font-medium hover:opacity-90 transition-opacity"
+                disabled={!keyInput().trim()}
+                class="px-4 py-2 bg-accent text-bg-primary rounded-lg text-sm font-medium hover:opacity-90 disabled:opacity-50 disabled:cursor-not-allowed transition-opacity"
               >
                 Save
               </button>
               <button
                 onClick={handleTest}
-                disabled={testing()}
-                class="px-3 py-2 border border-border bg-bg-secondary text-text-primary rounded-lg text-sm hover:bg-bg-hover disabled:opacity-50 disabled:cursor-wait transition-colors"
+                disabled={testing() || !canTest()}
+                class="px-3 py-2 border border-border bg-bg-secondary text-text-primary rounded-lg text-sm hover:bg-bg-hover disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
                 title="Verify the key against OpenAI's models endpoint"
               >
                 {testing() ? "Testing…" : "Test"}
               </button>
+              <Show when={editing()}>
+                <button
+                  onClick={() => {
+                    setKeyInput("");
+                    setEditing(false);
+                  }}
+                  class="px-3 py-2 border border-border bg-bg-secondary text-text-secondary rounded-lg text-sm hover:bg-bg-hover transition-colors"
+                >
+                  Cancel
+                </button>
+              </Show>
             </div>
           }
         >
@@ -128,20 +159,18 @@ export default function OpenAiProvider() {
               <path d="M20 6L9 17l-5-5" />
             </svg>
             <span class="flex-1 text-sm text-text-primary truncate min-w-0">
-              Saved · ends in{" "}
-              <span class="font-mono text-text-secondary">
-                •••{last4(settingsStore.settings().openai_api_key)}
-              </span>
+              Key saved
             </span>
             <button
               onClick={() => {
-                setKeyInput(settingsStore.settings().openai_api_key ?? "");
+                // Start empty — the saved key can't be shown or prefilled.
+                setKeyInput("");
                 setEditing(true);
                 setTest(null);
               }}
               class="px-2 py-1 text-xs rounded border border-border text-text-secondary hover:bg-bg-hover hover:text-text-primary transition-colors"
             >
-              Edit
+              Replace
             </button>
             <button
               onClick={handleTest}
@@ -149,6 +178,12 @@ export default function OpenAiProvider() {
               class="px-2 py-1 text-xs rounded border border-border text-text-secondary hover:bg-bg-hover hover:text-text-primary disabled:opacity-50 disabled:cursor-wait transition-colors"
             >
               {testing() ? "Testing…" : "Test"}
+            </button>
+            <button
+              onClick={() => void handleRemoveKey()}
+              class="px-2 py-1 text-xs rounded border border-border text-text-secondary hover:bg-bg-hover hover:text-red transition-colors"
+            >
+              Remove
             </button>
           </div>
         </Show>

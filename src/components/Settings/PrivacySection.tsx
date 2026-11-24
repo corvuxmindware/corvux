@@ -92,10 +92,12 @@ export default function PrivacySection() {
         return settings().model;
     }
   };
-  const hasGeminiKey = () => !!settings().gemini_api_key;
-  const hasOpenrouterKey = () => !!settings().openrouter_api_key;
-  const hasOpenaiKey = () => !!settings().openai_api_key;
-  const hasAnthropicKey = () => !!settings().anthropic_api_key;
+  // Key presence comes from the backend's saved/not-saved status — the
+  // webview never holds the key strings themselves.
+  const hasGeminiKey = () => settingsStore.keyStatus().gemini;
+  const hasOpenrouterKey = () => settingsStore.keyStatus().openrouter;
+  const hasOpenaiKey = () => settingsStore.keyStatus().openai;
+  const hasAnthropicKey = () => settingsStore.keyStatus().anthropic;
 
   // AUDIT-047: every `LlmProvider` variant must have an arm. The prior
   // switch covered gemini + openrouter only; ollama fell through to

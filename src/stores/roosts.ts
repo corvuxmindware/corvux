@@ -2,6 +2,8 @@ import { createSignal, createMemo, createRoot } from "solid-js";
 import { lsGet, lsSet, lsRemove } from "../lib/storage";
 import { commands } from "../lib/invoke";
 import { log } from "../lib/log";
+import { isSecurityCancel } from "../lib/error";
+import { toastStore } from "../components/Toast/Toast";
 
 // Roost registry — the list of known roosts the user has opened or added.
 // Separate from `roostStore` (the *active* roost's files/content). Persisted
@@ -124,11 +126,20 @@ function inferType(path: string): RoostType {
 // is the recovery source if the webview store is ever cleared/corrupted. Never
 // throws — a failed mirror just falls back to localStorage-only (prior
 // behavior). Fire-and-forget so registry writes stay synchronous.
-function mirrorToManifest(entries: RoostEntry[]) {
+//
+// F10: a write that DROPS a roost makes the backend ask the user in a native
+// OS dialog. If they decline, the manifest keeps the roost — and so would the
+// next launch's recovery, resurrecting an entry the list just stopped showing.
+// `onDeclined` lets the caller put the list back in step with the manifest.
+function mirrorToManifest(entries: RoostEntry[], onDeclined?: () => void) {
   void commands
     .writeRoostManifest(JSON.stringify(entries))
     .then((r) => {
       if (r.status === "error") {
+        if (isSecurityCancel(r.error)) {
+          onDeclined?.();
+          return;
+        }
         log.error("roosts", "roost manifest mirror failed", r.error);
       }
     })
@@ -148,9 +159,30 @@ function createRoostRegistry() {
   });
 
   function persist(next: RoostEntry[]) {
+    // Roosts this write takes off the list — put back if the backend's
+    // removal confirmation is declined (see `mirrorToManifest`).
+    const dropped = roosts().filter((e) => !next.some((n) => n.path === e.path));
     setRoosts(next);
     lsSet(STORAGE_KEY, JSON.stringify(next));
-    mirrorToManifest(next);
+    mirrorToManifest(next, dropped.length > 0 ? () => restoreDeclined(dropped) : undefined);
+  }
+
+  /** The user declined the native "remove roost" confirmation: the manifest
+   *  still lists these roosts, so list them again. The manifest is NOT
+   *  rewritten — it was never changed. */
+  function restoreDeclined(dropped: RoostEntry[]) {
+    const current = roosts();
+    const missing = dropped.filter((d) => !current.some((c) => c.path === d.path));
+    if (missing.length === 0) return;
+    const restored = [...current, ...missing];
+    setRoosts(restored);
+    lsSet(STORAGE_KEY, JSON.stringify(restored));
+    toastStore.show(
+      missing.length === 1
+        ? `"${missing[0].displayName}" was not removed. You cancelled the confirmation.`
+        : `${missing.length} roosts were not removed. You cancelled the confirmation.`,
+      "info",
+    );
   }
 
   // MR-B1 / NEW-M2: reconcile the roost list with the on-disk manifest. Recovers

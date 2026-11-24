@@ -2378,10 +2378,15 @@ pub async fn sync_set_queue_endpoint(
     refresh_queue_client(&state, &prefs).await
 }
 
-/// Pin a custom queue host (e.g. a self-hosted Corvux queue). The user
-/// must type the host twice to confirm — this is a defense against a
-/// compromised renderer silently rerouting queue traffic. Pass an empty
+/// Pin a custom queue host (e.g. a self-hosted Corvux queue). Pass an empty
 /// `host` to clear an existing pin.
+///
+/// The host must be typed twice, but that only catches a human typo: both
+/// strings arrive in the same IPC message, so a compromised renderer supplies
+/// both (F3, sharp-edges 2026-11-11). The control is a native OS dialog the
+/// webview cannot click, shown whenever a NEW host would be trusted
+/// (`authorize_pin_change`). Prefs are loaded AFTER the dialog so a settings
+/// change made while it was open is not overwritten with a stale copy.
 #[tauri::command]
 #[specta::specta]
 pub async fn sync_pin_custom_queue_host(
@@ -2389,21 +2394,14 @@ pub async fn sync_pin_custom_queue_host(
     host: String,
     host_confirm: String,
 ) -> Result<(), String> {
-    let host = host.trim().to_ascii_lowercase();
-    let confirm = host_confirm.trim().to_ascii_lowercase();
-    if host != confirm {
-        return Err("host and confirmation must match exactly".into());
-    }
-    if !host.is_empty() {
-        // Sanity: host should not include a scheme or path. We accept hostnames
-        // only (`example.com`, `queue.example.com:8443` allowed).
-        if host.contains("://") || host.contains('/') {
-            return Err("pinned host must be a bare hostname, no scheme or path".into());
-        }
-        if host.chars().any(|c| c.is_whitespace()) {
-            return Err("pinned host must not contain whitespace".into());
-        }
-    }
+    let host = super::sync_endpoint::normalize_pin_host(&host, &host_confirm)?;
+    let current = load_sync_prefs(&app)?.pinned_queue_host;
+    super::sync_endpoint::authorize_pin_change(
+        &current,
+        &host,
+        &super::native_confirm::OsDialog(app.clone()),
+    )
+    .await?;
     let mut prefs = load_sync_prefs(&app)?;
     prefs.pinned_queue_host = host;
     save_sync_prefs(&app, &prefs)?;

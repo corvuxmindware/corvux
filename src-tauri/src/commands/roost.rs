@@ -709,20 +709,218 @@ pub fn create_named_roost(name: String, app: tauri::AppHandle) -> Result<String,
 /// on-disk roosts invisible. The frontend owns the JSON shape (a `RoostEntry[]`
 /// blob) — we just store it, written atomically (tmp + rename) so a crash
 /// mid-write can't truncate the manifest.
+///
+/// F10 (sharp-edges 2026-11-11): this blob is also the AUTHORITY for a
+/// destructive startup decision — `paths::gc_orphaned_index_dirs` deletes the
+/// index dir and scoped sync credentials of every roost the manifest does not
+/// list. So the backend no longer trusts it blindly:
+///
+/// * the shape is validated (array, bounded size/count, every entry has a real
+///   `path`) — garbage is rejected, never stored;
+/// * a write that DROPS a previously listed roost needs the user's answer in a
+///   native OS dialog the webview cannot click, unless they already confirmed
+///   that roost's removal there through [`delete_roost_index`].
 #[tauri::command]
 #[specta::specta]
-pub fn write_roost_manifest(app: tauri::AppHandle, json: String) -> Result<(), String> {
+pub async fn write_roost_manifest(app: tauri::AppHandle, json: String) -> Result<(), String> {
     use tauri::Manager;
+    let next = manifest_paths_checked(&json)?;
     let dir = app
         .path()
         .app_data_dir()
         .map_err(|e| format!("app_data_dir: {e}"))?;
     fs::create_dir_all(&dir).map_err(|e| format!("mkdir {}: {e}", dir.display()))?;
     let path = dir.join("roosts.json");
+
+    // One lane for the WHOLE read-previous → confirm → write sequence, held
+    // across the dialog. Without it, a write that landed while the dialog was
+    // open (a roost added meanwhile) would be overwritten by this one's
+    // snapshot, and the next start's GC would delete that roost's index and
+    // sync credentials (reviewer finding #7).
+    let _lane = MANIFEST_WRITE.lock().await;
+
+    let prev = match read_manifest_file(path.clone()) {
+        Ok(None) => PrevManifest::Absent,
+        Ok(Some(text)) => match crate::paths::manifest_paths(&text) {
+            Some(paths) => PrevManifest::Listed(paths),
+            None => PrevManifest::Unreadable,
+        },
+        Err(_) => PrevManifest::Unreadable,
+    };
+    let confirmed_snapshot = CONFIRMED_REMOVALS
+        .lock()
+        .map_err(|e| format!("Lock error: {e}"))?
+        .clone();
+    authorize_manifest_write(
+        &prev,
+        &next,
+        &confirmed_snapshot,
+        &super::native_confirm::OsDialog(app.clone()),
+    )
+    .await?;
+
     let tmp = dir.join("roosts.json.tmp");
     fs::write(&tmp, json.as_bytes()).map_err(|e| format!("write manifest tmp: {e}"))?;
     fs::rename(&tmp, &path).map_err(|e| format!("rename manifest: {e}"))?;
+
+    // A confirmed removal is single-use: once the manifest no longer lists the
+    // roost, the confirmation is spent, so removing it again after a later
+    // re-add asks again.
+    if let Ok(mut confirmed) = CONFIRMED_REMOVALS.lock() {
+        let still_listed: std::collections::BTreeSet<String> = next
+            .iter()
+            .map(|p| crate::paths::normalize_key(p))
+            .collect();
+        confirmed.retain(|k| still_listed.contains(k));
+    }
     Ok(())
+}
+
+/// Serializes `write_roost_manifest` end to end (see its comment).
+static MANIFEST_WRITE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// What the manifest on disk looked like before this write.
+enum PrevManifest {
+    /// No file: a first write (or an install that predates MR-B1).
+    Absent,
+    Listed(Vec<String>),
+    /// The file exists but cannot be read or parsed. Nothing can be compared, so
+    /// "no removals" would be a lie — a hostile replacement list would then
+    /// authorize GC of every roost it omits with no prompt.
+    Unreadable,
+}
+
+/// Decide whether this write needs the user, and ask. Pure policy + the dialog;
+/// no filesystem.
+async fn authorize_manifest_write(
+    prev: &PrevManifest,
+    next: &[String],
+    confirmed: &std::collections::BTreeSet<String>,
+    confirm: &(impl super::native_confirm::NativeConfirm + ?Sized),
+) -> Result<(), String> {
+    match prev {
+        PrevManifest::Absent => Ok(()),
+        PrevManifest::Listed(prev) => {
+            authorize_removals(&unconfirmed_removals(prev, next, confirmed), confirm).await
+        }
+        PrevManifest::Unreadable => {
+            let body = "Corvux's saved list of roosts could not be read, so it cannot tell \
+                        which roosts this change would stop tracking.\n\n\
+                        Replace it with the list the app just sent? Roosts missing from the \
+                        new list lose their search index and sync pairing the next time \
+                        Corvux starts. Your notes are NOT deleted.\n\n\
+                        If you did not just change roosts in Corvux, choose Cancel.";
+            if confirm
+                .confirm("Replace the saved roost list?", body, "Replace")
+                .await
+            {
+                Ok(())
+            } else {
+                Err("Roost removal was cancelled.".to_string())
+            }
+        }
+    }
+}
+
+/// Largest manifest the backend will store. A real registry is a few KB.
+const MAX_MANIFEST_BYTES: usize = 1 << 20;
+const MAX_MANIFEST_ROOSTS: usize = 512;
+
+/// Roost paths whose removal the user already confirmed natively through
+/// [`delete_roost_index`] this session — so the manifest write that follows in
+/// the same "Remove roost" flow does not ask a second time.
+static CONFIRMED_REMOVALS: std::sync::Mutex<std::collections::BTreeSet<String>> =
+    std::sync::Mutex::new(std::collections::BTreeSet::new());
+
+/// Validate a manifest the webview wants stored and return its roost paths.
+fn manifest_paths_checked(json: &str) -> Result<Vec<String>, String> {
+    if json.len() > MAX_MANIFEST_BYTES {
+        return Err("roost manifest is too large".into());
+    }
+    let v: serde_json::Value =
+        serde_json::from_str(json).map_err(|e| format!("roost manifest is not valid JSON: {e}"))?;
+    let arr = v
+        .as_array()
+        .ok_or_else(|| "roost manifest must be a JSON array".to_string())?;
+    if arr.len() > MAX_MANIFEST_ROOSTS {
+        return Err(format!(
+            "roost manifest lists too many roosts (max {MAX_MANIFEST_ROOSTS})"
+        ));
+    }
+    arr.iter()
+        .enumerate()
+        .map(|(i, e)| {
+            e.get("path")
+                .and_then(|p| p.as_str())
+                .filter(|p| !p.trim().is_empty() && p.len() <= 4096 && !p.contains('\0'))
+                .map(str::to_string)
+                .ok_or_else(|| format!("roost manifest entry {i} has no usable path"))
+        })
+        .collect()
+}
+
+/// Paths listed in `prev` but absent from `next` whose removal the user has not
+/// already confirmed. Compared by `normalize_key` (case/slash-insensitive on
+/// Windows), so re-spelling a path is not a removal.
+fn unconfirmed_removals(
+    prev: &[String],
+    next: &[String],
+    confirmed: &std::collections::BTreeSet<String>,
+) -> Vec<String> {
+    let keep: std::collections::BTreeSet<String> = next
+        .iter()
+        .map(|p| crate::paths::normalize_key(p))
+        .collect();
+    let mut seen = std::collections::BTreeSet::new();
+    prev.iter()
+        .filter(|p| {
+            let k = crate::paths::normalize_key(p);
+            !keep.contains(&k) && !confirmed.contains(&k) && seen.insert(k)
+        })
+        .cloned()
+        .collect()
+}
+
+/// Ask for the removal in a native dialog. No-op when nothing is removed.
+async fn authorize_removals(
+    removed: &[String],
+    confirm: &(impl super::native_confirm::NativeConfirm + ?Sized),
+) -> Result<(), String> {
+    use super::native_confirm::dialog_safe;
+    if removed.is_empty() {
+        return Ok(());
+    }
+    let (noun, pronoun) = if removed.len() == 1 {
+        ("roost", "it")
+    } else {
+        ("roosts", "them")
+    };
+    let mut body = format!(
+        "Corvux is about to stop tracking {} {noun}:\n\n",
+        removed.len()
+    );
+    for p in removed.iter().take(6) {
+        body.push_str(&format!("\u{2022} {}\n", dialog_safe(p, 90)));
+    }
+    if removed.len() > 6 {
+        body.push_str(&format!(
+            "\u{2022} \u{2026}and {} more\n",
+            removed.len() - 6
+        ));
+    }
+    body.push_str(&format!(
+        "\nYour notes are NOT deleted. Corvux will delete its own search index and sync \
+         pairing for {pronoun} the next time it starts.\n\n\
+         If you did not just remove this in Manage Roosts, choose Cancel."
+    ));
+    if confirm
+        .confirm("Confirm roost removal", &body, "Remove")
+        .await
+    {
+        Ok(())
+    } else {
+        Err("Roost removal was cancelled.".to_string())
+    }
 }
 
 /// MR-B1: read back the roost manifest written by [`write_roost_manifest`].
@@ -737,7 +935,13 @@ pub fn read_roost_manifest(app: tauri::AppHandle) -> Result<Option<String>, Stri
         .path()
         .app_data_dir()
         .map_err(|e| format!("app_data_dir: {e}"))?;
-    let path = dir.join("roosts.json");
+    read_manifest_file(dir.join("roosts.json"))
+}
+
+/// The one raw read of `roosts.json` (app-data, not note content), shared by
+/// [`read_roost_manifest`] and [`write_roost_manifest`]'s removal check so the
+/// AUDIT-033 read lint keeps a single pinned exception for it.
+fn read_manifest_file(path: PathBuf) -> Result<Option<String>, String> {
     match fs::read_to_string(&path) {
         Ok(s) => Ok(Some(s)),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
@@ -755,21 +959,37 @@ pub fn read_roost_manifest(app: tauri::AppHandle) -> Result<Option<String>, Stri
 /// is success. Intended for roosts that aren't currently open (an open roost
 /// holds its DB files, which can block deletion on Windows); the caller
 /// tolerates an error and still drops the registry entry.
+///
+/// F10: this also deletes the roost's scoped sync credentials, so it needs the
+/// same out-of-band confirmation as dropping the roost from the manifest. On
+/// success the path is remembered as confirmed, so the manifest write that
+/// completes the "Remove roost" flow does not ask again.
 #[tauri::command]
 #[specta::specta]
-pub fn delete_roost_index(app: tauri::AppHandle, roost_path: String) -> Result<(), String> {
+pub async fn delete_roost_index(app: tauri::AppHandle, roost_path: String) -> Result<(), String> {
+    authorize_removals(
+        std::slice::from_ref(&roost_path),
+        &super::native_confirm::OsDialog(app.clone()),
+    )
+    .await?;
     let dir = crate::paths::roost_db_dir(&app, &roost_path)?;
     // SYN-I11: this roost's sync credentials live in the keychain under a
     // scope only its `sync/peers.bin` knows — delete them before the file goes.
     crate::sync::store::peer_store::purge_registry_secrets(&dir.join("sync"));
-    match fs::remove_dir_all(&dir) {
+    let result = match fs::remove_dir_all(&dir) {
         Ok(()) => {
             tracing::info!(dir = %dir.display(), "roost: deleted local index dir");
             Ok(())
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(format!("delete index dir {}: {e}", dir.display())),
+    };
+    if result.is_ok() {
+        if let Ok(mut confirmed) = CONFIRMED_REMOVALS.lock() {
+            confirmed.insert(crate::paths::normalize_key(&roost_path));
+        }
     }
+    result
 }
 
 /// Recursively scan a native filesystem directory into `FileEntry`. Hidden
@@ -1264,5 +1484,203 @@ mod scan_failure_tests {
             names.contains(&"top.md") && names.contains(&"Work"),
             "{names:?}"
         );
+    }
+}
+
+/// F10 (sharp-edges 2026-11-11): a renderer-supplied manifest authorizes a
+/// startup `remove_dir_all`, so it is validated and a removal needs a native
+/// confirmation. Pure policy + scripted dialog — no window, no app data dir.
+#[cfg(test)]
+mod manifest_authority_tests {
+    use super::super::native_confirm::test_support::Scripted;
+    use super::*;
+    use std::collections::BTreeSet;
+
+    fn paths(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn a_normal_registry_validates() {
+        let json = r#"[{"id":"v_1","path":"C:/Notes","displayName":"Notes"},
+                       {"id":"v_2","path":"content://tree/x","type":"saf"}]"#;
+        assert_eq!(
+            manifest_paths_checked(json).unwrap(),
+            paths(&["C:/Notes", "content://tree/x"])
+        );
+        assert_eq!(manifest_paths_checked("[]").unwrap(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn garbage_is_rejected_not_stored() {
+        for bad in [
+            "",
+            "not json",
+            "{}",
+            "null",
+            r#"{"path":"C:/x"}"#,       // object, not array
+            r#"[{"id":"x"}]"#,          // no path
+            r#"[{"path":""}]"#,         // empty path
+            r#"[{"path":"   "}]"#,      // blank path
+            r#"[{"path":5}]"#,          // wrong type
+            r#"["C:/x"]"#,              // entry is not an object
+            r#"[{"path":"a\u0000b"}]"#, // NUL
+        ] {
+            assert!(manifest_paths_checked(bad).is_err(), "{bad:?} should fail");
+        }
+    }
+
+    #[test]
+    fn size_and_count_are_bounded() {
+        let huge = format!(r#"[{{"path":"{}"}}]"#, "a".repeat(MAX_MANIFEST_BYTES));
+        assert!(manifest_paths_checked(&huge).is_err());
+        let long_path = format!(r#"[{{"path":"{}"}}]"#, "a".repeat(5000));
+        assert!(manifest_paths_checked(&long_path).is_err());
+        let many = format!(
+            "[{}]",
+            (0..=MAX_MANIFEST_ROOSTS)
+                .map(|i| format!(r#"{{"path":"/r/{i}"}}"#))
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        assert!(manifest_paths_checked(&many).is_err());
+    }
+
+    #[test]
+    fn dropping_a_listed_roost_is_a_removal_but_adding_or_keeping_is_not() {
+        let none = BTreeSet::new();
+        assert_eq!(
+            unconfirmed_removals(&paths(&["/a", "/b"]), &paths(&["/a"]), &none),
+            paths(&["/b"])
+        );
+        assert!(unconfirmed_removals(&paths(&["/a"]), &paths(&["/a", "/b"]), &none).is_empty());
+        assert!(unconfirmed_removals(&paths(&["/a"]), &paths(&["/a"]), &none).is_empty());
+        // First-ever write: nothing to compare against, nothing removed.
+        assert!(unconfirmed_removals(&[], &paths(&["/a"]), &none).is_empty());
+    }
+
+    #[test]
+    fn replacing_the_whole_list_is_a_removal_of_everything_it_dropped() {
+        // The audit's attack: one manifest naming a single roost.
+        let none = BTreeSet::new();
+        assert_eq!(
+            unconfirmed_removals(&paths(&["/a", "/b", "/c"]), &paths(&["/keep"]), &none),
+            paths(&["/a", "/b", "/c"])
+        );
+    }
+
+    #[test]
+    fn a_previously_confirmed_removal_is_not_asked_again() {
+        let mut confirmed = BTreeSet::new();
+        confirmed.insert(crate::paths::normalize_key("/b"));
+        assert_eq!(
+            unconfirmed_removals(&paths(&["/a", "/b"]), &paths(&[]), &confirmed),
+            paths(&["/a"])
+        );
+    }
+
+    #[test]
+    fn duplicate_previous_entries_are_reported_once() {
+        let none = BTreeSet::new();
+        assert_eq!(
+            unconfirmed_removals(&paths(&["/a", "/a"]), &paths(&[]), &none),
+            paths(&["/a"])
+        );
+    }
+
+    #[tokio::test]
+    async fn nothing_removed_never_prompts() {
+        let dialog = Scripted::deny();
+        authorize_removals(&[], &dialog).await.unwrap();
+        assert_eq!(dialog.times_asked(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_declined_removal_is_refused() {
+        let dialog = Scripted::deny();
+        let err = authorize_removals(&paths(&["/a", "/b"]), &dialog)
+            .await
+            .unwrap_err();
+        assert!(err.contains("cancelled"), "{err}");
+        assert_eq!(dialog.times_asked(), 1, "one prompt for the whole batch");
+    }
+
+    #[tokio::test]
+    async fn an_allowed_removal_proceeds() {
+        let dialog = Scripted::allow();
+        authorize_removals(&paths(&["/a"]), &dialog).await.unwrap();
+        assert_eq!(dialog.times_asked(), 1);
+    }
+
+    // ── write policy over the previous file's state (reviewer #7) ───────
+
+    #[tokio::test]
+    async fn a_first_write_never_prompts() {
+        let dialog = Scripted::deny();
+        authorize_manifest_write(
+            &PrevManifest::Absent,
+            &paths(&["/a"]),
+            &BTreeSet::new(),
+            &dialog,
+        )
+        .await
+        .unwrap();
+        assert_eq!(dialog.times_asked(), 0);
+    }
+
+    #[tokio::test]
+    async fn adding_or_keeping_roosts_never_prompts() {
+        let dialog = Scripted::deny();
+        authorize_manifest_write(
+            &PrevManifest::Listed(paths(&["/a"])),
+            &paths(&["/a", "/b"]),
+            &BTreeSet::new(),
+            &dialog,
+        )
+        .await
+        .unwrap();
+        assert_eq!(dialog.times_asked(), 0);
+    }
+
+    #[tokio::test]
+    async fn dropping_a_listed_roost_prompts_and_a_decline_refuses() {
+        let dialog = Scripted::deny();
+        let err = authorize_manifest_write(
+            &PrevManifest::Listed(paths(&["/a", "/b"])),
+            &paths(&["/a"]),
+            &BTreeSet::new(),
+            &dialog,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("cancelled"), "{err}");
+        assert_eq!(dialog.times_asked(), 1);
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_previous_manifest_fails_closed_not_open() {
+        // The old code treated this as "nothing to compare" = no prompt, so a
+        // hostile replacement list authorized GC of everything it omitted.
+        let denied = Scripted::deny();
+        let err = authorize_manifest_write(
+            &PrevManifest::Unreadable,
+            &paths(&["/only-this"]),
+            &BTreeSet::new(),
+            &denied,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("cancelled"), "{err}");
+        assert_eq!(denied.times_asked(), 1);
+
+        let allowed = Scripted::allow();
+        authorize_manifest_write(
+            &PrevManifest::Unreadable,
+            &paths(&["/only-this"]),
+            &BTreeSet::new(),
+            &allowed,
+        )
+        .await
+        .unwrap();
     }
 }

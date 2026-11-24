@@ -312,16 +312,47 @@ pub async fn request<R: tauri::Runtime + 'static>(
     match decision {
         ToolDecision::Approve => Ok(()),
         ToolDecision::AlwaysApprove => {
-            // Add to the in-loop snapshot so further calls in THIS
-            // agent loop skip the gate immediately.
-            if !autonomy.auto_approve_tools.iter().any(|n| n == tool_name) {
-                autonomy.auto_approve_tools.push(tool_name.to_string());
-            }
-            // Persist to settings so future sessions inherit the choice.
-            // Failure here is non-fatal — the in-loop snapshot still
-            // benefits the rest of this session.
-            if let Err(e) = persist_always_approve(app, tool_name) {
-                warn!(error = %e, tool = tool_name, "approval: could not persist always-approve");
+            // Pinning a tool is a PERSISTENT privilege change, and this
+            // decision arrives over a webview-callable command (`decide_tool`),
+            // so a hijacked webview could pin any tool the agent proposes
+            // (sharp-edges F1 follow-up, reviewer #2). The pin therefore needs
+            // the same out-of-band answer as enabling auto-approve in Settings.
+            // Declined (or unanswered) = this ONE call is approved, nothing is
+            // pinned.
+            let pin = authorize_always_approve(
+                &crate::commands::native_confirm::OsDialog(app.clone()),
+                tool_name,
+            )
+            .await;
+            if pin {
+                // Add to the in-loop snapshot so further calls in THIS
+                // agent loop skip the gate immediately.
+                if !autonomy.auto_approve_tools.iter().any(|n| n == tool_name) {
+                    autonomy.auto_approve_tools.push(tool_name.to_string());
+                }
+                // Persist to settings so future sessions inherit the choice.
+                // Failure here is non-fatal — the in-loop snapshot still
+                // benefits the rest of this session.
+                if let Err(e) = persist_always_approve(app, tool_name) {
+                    warn!(error = %e, tool = tool_name, "approval: could not persist always-approve");
+                }
+            } else {
+                warn!(
+                    tool = tool_name,
+                    "approval: always-approve not confirmed natively; approving this call only"
+                );
+                // The row above was written BEFORE the dialog and says
+                // `always_approve`. What actually happened is a one-off approve;
+                // `:put` keeps the LAST row for a request id, so correct it.
+                record_audit(
+                    app,
+                    &request_id,
+                    tool_name,
+                    tier,
+                    approval_log::DecisionKind::Approve,
+                    args,
+                    &payload.summary,
+                );
             }
             Ok(())
         }
@@ -491,6 +522,23 @@ fn normalize_signal_path(path: &str) -> String {
     p.to_lowercase()
 }
 
+/// Ask, in a native OS dialog, whether the user really wants `tool_name` to run
+/// without asking from now on. `true` only on an explicit "Always allow".
+async fn authorize_always_approve(
+    confirm: &(impl crate::commands::native_confirm::NativeConfirm + ?Sized),
+    tool_name: &str,
+) -> bool {
+    let body = format!(
+        "You chose \"Always approve\" for the agent tool \"{}\".\n\n\
+         From now on Corvux will run this tool without asking you each time.\n\n\
+         If you did not just click that, choose Cancel.",
+        crate::commands::native_confirm::dialog_safe(tool_name, 60)
+    );
+    confirm
+        .confirm("Always allow this tool?", &body, "Always allow")
+        .await
+}
+
 /// Append `tool_name` to the persisted `agent_autonomy.auto_approve_tools`.
 /// Idempotent: a no-op if the name is already in the list. Goes through
 /// the same `SettingsState` mutex + on-disk file the existing
@@ -536,6 +584,18 @@ mod tests {
 
     fn autonomy_default() -> AgentAutonomy {
         AgentAutonomy::default()
+    }
+
+    /// Reviewer #2: `decide_tool(AlwaysApprove)` is a webview command, so a pin
+    /// must not take effect on the webview's say-so alone.
+    #[tokio::test]
+    async fn always_approve_pins_only_after_a_native_yes() {
+        use crate::commands::native_confirm::test_support::Scripted;
+        let no = Scripted::deny();
+        assert!(!authorize_always_approve(&no, "roost_write").await);
+        assert_eq!(no.times_asked(), 1);
+        let yes = Scripted::allow();
+        assert!(authorize_always_approve(&yes, "roost_write").await);
     }
 
     #[test]

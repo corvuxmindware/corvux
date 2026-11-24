@@ -20,6 +20,7 @@ use thiserror::Error;
 pub(crate) mod atomic;
 pub mod native;
 pub mod trash;
+pub mod validated;
 pub mod walk;
 
 // Roost-level advisory file lock. Desktop only — mobile roosts live in
@@ -220,10 +221,47 @@ pub(crate) fn is_incomplete_listing(message: &str) -> bool {
     message.contains(INCOMPLETE_LISTING_PREFIX)
 }
 
+/// A single path segment that Windows does NOT treat as the plain file name it
+/// looks like (reviewer finding #10). Called from [`validate_rel`] on Windows
+/// only, but kept platform-independent so it is unit-tested everywhere.
+///
+/// * `:` — `note.md:stream` is an NTFS alternate data stream: hidden content
+///   attached to a visible note;
+/// * a trailing `.` or space — Windows strips it, so `Journal./x.md` IS
+///   `Journal\x.md` and would dodge any textual path rule;
+/// * DOS device names (`CON`, `NUL`, `COM1`, `LPT3`, …), with or without an
+///   extension — they open devices, not files;
+/// * `< > " | ? *` — not valid in a Windows file name.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn windows_hostile_segment(seg: &str) -> bool {
+    if seg.is_empty() {
+        return false; // a trailing slash, not a name
+    }
+    if seg.contains([':', '<', '>', '"', '|', '?', '*']) {
+        return true;
+    }
+    if seg.ends_with('.') || seg.ends_with(' ') {
+        return true;
+    }
+    let stem = seg.split('.').next().unwrap_or(seg).trim_end_matches(' ');
+    let up = stem.to_ascii_uppercase();
+    matches!(up.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || ((up.starts_with("COM") || up.starts_with("LPT"))
+            && up.len() == 4
+            && up.as_bytes()[3].is_ascii_digit()
+            && up.as_bytes()[3] != b'0')
+}
+
 /// Validate a roost-relative path. Rejects `..`, absolute paths, Windows
 /// drive prefixes, and verbatim/device prefixes. Returns the cleaned
 /// (forward-slash) form.
 pub(crate) fn validate_rel(rel: &str) -> Result<String, RoostError> {
+    // A NUL byte is never part of a legitimate roost path. Native fs calls
+    // reject it with an opaque OS error and a SAF provider may truncate at it,
+    // so refuse it here, once, with the same error as every other escape.
+    if rel.contains('\0') {
+        return Err(RoostError::OutsideRoost(rel.replace('\0', "\\0")));
+    }
     // Reject Windows verbatim/device path prefixes before slash normalization
     // collapses them. `PathBuf::push` on Windows would *replace* the root when
     // joined with one of these.
@@ -242,6 +280,12 @@ pub(crate) fn validate_rel(rel: &str) -> Result<String, RoostError> {
         // segment shaped like a drive letter is hostile.
         let bytes = seg.as_bytes();
         if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+            return Err(RoostError::OutsideRoost(rel.to_string()));
+        }
+        // Names Windows reinterprets (ADS, trailing dot/space, devices). Only
+        // on Windows: on Linux/macOS/Android a `:` is a legal filename
+        // character and users do title notes "Meeting: notes".
+        if cfg!(windows) && windows_hostile_segment(seg) {
             return Err(RoostError::OutsideRoost(rel.to_string()));
         }
     }
@@ -355,6 +399,76 @@ mod validate_rel_tests {
         ));
         assert!(matches!(
             validate_rel(r"\\.\COM1"),
+            Err(RoostError::OutsideRoost(_))
+        ));
+    }
+
+    #[test]
+    fn windows_hostile_segments_are_recognized_on_every_platform() {
+        for bad in [
+            "note.md:stream", // NTFS alternate data stream
+            "ab:c",
+            "Journal.", // Windows strips the trailing dot
+            "Journal ",
+            "CON",
+            "con.md",
+            "Nul.txt",
+            "COM1",
+            "lpt9.md",
+            "a<b",
+            "a|b",
+            "what?.md",
+            "star*.md",
+            "q\"uote",
+        ] {
+            assert!(windows_hostile_segment(bad), "{bad:?}");
+        }
+        for ok in [
+            "",
+            "Journal",
+            "note.md",
+            ".hidden.md",
+            "console.md", // starts with CON but is not CON
+            "COM",
+            "COM0", // not a device
+            "COMX",
+            "LPT10",
+            "资料",
+            "a b.md",
+        ] {
+            assert!(!windows_hostile_segment(ok), "{ok:?}");
+        }
+    }
+
+    /// On Windows `validate_rel` applies it; elsewhere a colon in a note title is
+    /// legitimate and must keep working.
+    #[test]
+    fn colon_titles_are_only_refused_where_windows_would_misread_them() {
+        let r = validate_rel("Meeting: notes.md");
+        if cfg!(windows) {
+            assert!(matches!(r, Err(RoostError::OutsideRoost(_))));
+            assert!(matches!(
+                validate_rel("Journal./x.md"),
+                Err(RoostError::OutsideRoost(_))
+            ));
+            assert!(matches!(
+                validate_rel("a/NUL.md"),
+                Err(RoostError::OutsideRoost(_))
+            ));
+        } else {
+            assert_eq!(r.unwrap(), "Meeting: notes.md");
+            assert_eq!(validate_rel("Journal./x.md").unwrap(), "Journal./x.md");
+        }
+    }
+
+    #[test]
+    fn nul_byte_blocked() {
+        assert!(matches!(
+            validate_rel("a\0b.md"),
+            Err(RoostError::OutsideRoost(_))
+        ));
+        assert!(matches!(
+            validate_rel("dir/\0"),
             Err(RoostError::OutsideRoost(_))
         ));
     }

@@ -67,9 +67,18 @@ impl RoostFsState {
     }
 
     /// Install a new active backend and return its generation token.
+    ///
+    /// The backend is wrapped in [`crate::roostfs::validated::ValidatedFs`], so
+    /// the path contract (no `..`, no absolute/drive/device paths, no NUL) is
+    /// enforced HERE, once, for every backend — native, SAF and any future one —
+    /// instead of by each impl remembering to (sharp-edges F5: `SafFs` validated
+    /// only `trash`). This is the only place a backend becomes THE roost
+    /// backend; `tests` in `roostfs::validated` pin that installing wraps.
     pub async fn install(&self, backend: Arc<dyn RoostFs>) -> u64 {
         let mut guard = self.backend.lock().await;
-        *guard = Some(backend);
+        *guard = Some(Arc::new(crate::roostfs::validated::ValidatedFs::new(
+            backend,
+        )));
         let generation = self.generation.fetch_add(1, Ordering::AcqRel) + 1;
         drop(guard);
         generation

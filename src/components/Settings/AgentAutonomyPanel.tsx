@@ -1,5 +1,34 @@
 import { createSignal, For, Show, type JSX } from "solid-js";
-import { settingsStore } from "../../stores/settings";
+import { settingsStore, type Settings } from "../../stores/settings";
+import { isSecurityCancel } from "../../lib/error";
+import { reportActionError } from "../../lib/action-error";
+import { toastStore } from "../Toast/Toast";
+
+/** Persist an autonomy change. Resolves `true` when it was saved.
+ *
+ *  Loosening a safety setting (auto-approve writes, auto-approving a tool,
+ *  un-blocking a path) makes the backend show a native OS confirmation the
+ *  webview cannot click. Saying no there is a choice, not a fault: we show a
+ *  calm notice, and because the store only changes on a successful save,
+ *  the panel keeps showing the real stored value. Any other failure is a
+ *  real error and is toasted as one. */
+async function saveAutonomy(updates: Partial<Settings>, failMessage: string): Promise<boolean> {
+  try {
+    await settingsStore.save(updates);
+    return true;
+  } catch (e) {
+    if (isSecurityCancel(e)) {
+      toastStore.show("Cancelled. Nothing was changed.", "info");
+    } else {
+      reportActionError(failMessage, e, {
+        code: "AGENT_AUTONOMY_SAVE_FAIL",
+        module: "ai",
+        showReason: true,
+      });
+    }
+    return false;
+  }
+}
 
 /** Settings → Corvux Agent → Agent Autonomy panel.
  *
@@ -17,21 +46,27 @@ export default function AgentAutonomyPanel() {
   const autonomy = () => settingsStore.settings().agent_autonomy;
 
   const setAutoApproveWrites = async (enabled: boolean) => {
-    await settingsStore.save({
-      agent_autonomy: {
-        ...autonomy(),
-        auto_approve_writes: enabled,
+    await saveAutonomy(
+      {
+        agent_autonomy: {
+          ...autonomy(),
+          auto_approve_writes: enabled,
+        },
       },
-    });
+      "Couldn't change auto-save for edits",
+    );
   };
 
   const removeTool = async (tool: string) => {
-    await settingsStore.save({
-      agent_autonomy: {
-        ...autonomy(),
-        auto_approve_tools: autonomy().auto_approve_tools.filter((t) => t !== tool),
+    await saveAutonomy(
+      {
+        agent_autonomy: {
+          ...autonomy(),
+          auto_approve_tools: autonomy().auto_approve_tools.filter((t) => t !== tool),
+        },
       },
-    });
+      "Couldn't update trusted tools",
+    );
   };
 
   const [pendingPattern, setPendingPattern] = createSignal("");
@@ -44,24 +79,31 @@ export default function AgentAutonomyPanel() {
       setPendingPattern("");
       return;
     }
-    await settingsStore.save({
-      agent_autonomy: {
-        ...autonomy(),
-        agent_blocked_paths: [...existing, next],
+    const saved = await saveAutonomy(
+      {
+        agent_autonomy: {
+          ...autonomy(),
+          agent_blocked_paths: [...existing, next],
+        },
       },
-    });
-    setPendingPattern("");
+      "Couldn't block that path",
+    );
+    // Keep the typed pattern if the save failed so it isn't lost.
+    if (saved) setPendingPattern("");
   };
 
   const removeBlockedPath = async (pattern: string) => {
-    await settingsStore.save({
-      agent_autonomy: {
-        ...autonomy(),
-        agent_blocked_paths: (autonomy().agent_blocked_paths ?? []).filter(
-          (p) => p !== pattern,
-        ),
+    await saveAutonomy(
+      {
+        agent_autonomy: {
+          ...autonomy(),
+          agent_blocked_paths: (autonomy().agent_blocked_paths ?? []).filter(
+            (p) => p !== pattern,
+          ),
+        },
       },
-    });
+      "Couldn't unblock that path",
+    );
   };
 
   return (
@@ -78,7 +120,7 @@ export default function AgentAutonomyPanel() {
 
       <ToggleRow
         checked={autonomy().auto_approve_writes}
-        onChange={(v) => void setAutoApproveWrites(v)}
+        onChange={setAutoApproveWrites}
         title="Let Corvux save edits without asking"
         description="It can create and update notes on its own. Deleting still asks every time."
       />
@@ -175,7 +217,7 @@ export default function AgentAutonomyPanel() {
         <ToggleRow
           checked={!!settingsStore.settings().use_native_tools}
           onChange={(v) =>
-            void settingsStore.save({ use_native_tools: v })
+            saveAutonomy({ use_native_tools: v }, "Couldn't change the tool engine").then(() => undefined)
           }
           title="Use the new tool engine"
           description="Faster and fewer mistakes. Recommended. Restart the chat after switching."
@@ -190,9 +232,15 @@ export default function AgentAutonomyPanel() {
 /// matching the visual language of macOS / Notion / Slack settings.
 /// The whole row is the click target (label-wrapped); keyboard users
 /// get the native focus ring on the underlying checkbox.
+///
+/// `onChange` may return a promise (a save). The row is controlled by
+/// `checked`: once the handler settles we put the native checkbox back to
+/// `props.checked`. If the save was declined or failed, the stored value did
+/// not change, so Solid would never re-sync the DOM on its own and the
+/// hidden checkbox would keep claiming the new state.
 function ToggleRow(props: {
   checked: boolean;
-  onChange: (v: boolean) => void;
+  onChange: (v: boolean) => void | Promise<void>;
   title: string;
   description: string;
   badge?: string;
@@ -203,7 +251,12 @@ function ToggleRow(props: {
         <input
           type="checkbox"
           checked={props.checked}
-          onChange={(e) => props.onChange(e.currentTarget.checked)}
+          onChange={(e) => {
+            const el = e.currentTarget;
+            void Promise.resolve(props.onChange(el.checked)).finally(() => {
+              el.checked = props.checked;
+            });
+          }}
           class="sr-only peer"
         />
         <span

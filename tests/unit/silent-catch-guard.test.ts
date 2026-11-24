@@ -51,7 +51,7 @@ const BASELINE: Record<string, number> = {
   "stores/bugReport.ts": 2,
   "stores/graph.ts": 3,
   "stores/roosts.ts": 2,
-  "stores/settings.ts": 5, // loads/probes
+  "stores/settings.ts": 6, // loads/probes (+ the saved-key status refresh: background, never fails a save)
   "stores/sync.ts": 4, // listeners + status seed
   "stores/tabs.ts": 2,
   "stores/tasks.ts": 1,

@@ -15,8 +15,12 @@
 import { For, Show, createSignal, onMount } from "solid-js";
 import { commands, unwrap } from "../../../lib/invoke";
 import type { ConnectionTestResult, OllamaModelInfo } from "../../../lib/bindings";
-import { errMsg } from "../../../lib/error";
+import { errMsg, isSecurityCancel } from "../../../lib/error";
+import { confirmDialog } from "../../../lib/confirm";
 import { settingsStore } from "../../../stores/settings";
+import { toastStore } from "../../Toast/Toast";
+
+const DEFAULT_BASE_URL = "http://localhost:11434";
 
 function formatBytes(bytes: number): string {
   if (bytes === 0) return "0 B";
@@ -39,14 +43,19 @@ export default function OllamaProvider() {
   const [ollamaModelsError, setOllamaModelsError] = createSignal<string | null>(null);
   const [showOllamaAdvanced, setShowOllamaAdvanced] = createSignal(false);
 
+  // The saved bearer token never reaches the webview — only "is one saved?".
+  const hasSavedToken = () => settingsStore.keyStatus().ollama;
+
   /** Fetch the installed-model list from the user's Ollama server.
-   *  Errors are non-fatal — the freeform input still works as a fallback. */
+   *  Errors are non-fatal — the freeform input still works as a fallback.
+   *  A typed token is sent as-is; with none typed we send `null` and the
+   *  backend attaches the SAVED token only if the address is the saved one. */
   async function refreshOllamaModels() {
     setOllamaModelsLoading(true);
     setOllamaModelsError(null);
     try {
       const base = ollamaBaseInput().trim() || settingsStore.settings().ollama_base_url;
-      const apiKey = ollamaKeyInput().trim() || settingsStore.settings().ollama_api_key;
+      const apiKey = ollamaKeyInput().trim();
       const result = await unwrap(commands.listOllamaModels(base, apiKey || null));
       setOllamaModels(result);
     } catch (e) {
@@ -63,7 +72,7 @@ export default function OllamaProvider() {
     setOllamaTest(null);
     try {
       const base = ollamaBaseInput().trim() || settingsStore.settings().ollama_base_url;
-      const apiKey = ollamaKeyInput().trim() || settingsStore.settings().ollama_api_key;
+      const apiKey = ollamaKeyInput().trim();
       const result = await unwrap(commands.testOllamaConnection(base, apiKey || null));
       setOllamaTest(result);
       // A successful test is a great moment to refresh the model list —
@@ -82,11 +91,28 @@ export default function OllamaProvider() {
     }
   }
 
-  /** Save the Ollama config (base URL, model, optional key) in one
+  /** Put the address + model boxes back to what is actually stored. Used
+   *  when a save was declined, so the form never shows a value the backend
+   *  did not accept. */
+  function revertInputsToStored() {
+    const s = settingsStore.settings();
+    setOllamaBaseInput(s.ollama_base_url || DEFAULT_BASE_URL);
+    setOllamaModelInput(s.ollama_model || "");
+  }
+
+  /** Save the Ollama config (base URL, model, optional token) in one
    *  shot. Together because they're meaningless apart — wrong host
-   *  with the right model still doesn't work. */
+   *  with the right model still doesn't work. An empty token box leaves
+   *  the saved token alone (`null` = unchanged); removing it is the
+   *  explicit Remove action.
+   *
+   *  Pointing Ollama at an internet host makes the backend ask for a native
+   *  OS confirmation. If the user says no, that is a choice: show a calm
+   *  notice and snap the form back — not a red error. A bad address (plain
+   *  http:// to an internet host, credentials in the URL, bad scheme) comes
+   *  back as "The Ollama server address …" and is shown inline. */
   async function handleSaveOllama() {
-    const base = ollamaBaseInput().trim() || "http://localhost:11434";
+    const base = ollamaBaseInput().trim() || DEFAULT_BASE_URL;
     const model = ollamaModelInput().trim();
     const key = ollamaKeyInput().trim();
     setOllamaSaveError(null);
@@ -94,14 +120,34 @@ export default function OllamaProvider() {
       await settingsStore.save({
         ollama_base_url: base,
         ollama_model: model,
-        ollama_api_key: key || null,
+        ...(key ? { ollama_api_key: key } : {}),
       });
+      // Don't keep the token in the component once the backend has it.
+      setOllamaKeyInput("");
       setOllamaSaved(true);
       setOllamaTest(null);
       setTimeout(() => setOllamaSaved(false), 2000);
     } catch (e) {
+      if (isSecurityCancel(e)) {
+        revertInputsToStored();
+        toastStore.show("Cancelled. Nothing was changed.", "info");
+        return;
+      }
       const msg = errMsg(e);
       setOllamaSaveError(msg);
+    }
+  }
+
+  /** Delete the saved bearer token. Sends `""` — `null` now means "leave it alone". */
+  async function handleRemoveToken() {
+    if (!(await confirmDialog("Remove the saved Ollama token from this device?"))) return;
+    setOllamaSaveError(null);
+    try {
+      await settingsStore.save({ ollama_api_key: "" });
+      setOllamaKeyInput("");
+      setOllamaTest(null);
+    } catch (e) {
+      setOllamaSaveError(errMsg(e));
     }
   }
 
@@ -110,10 +156,8 @@ export default function OllamaProvider() {
     // because parent's onMount already awaited settingsStore.load()
     // before mounting any provider component (this child only renders
     // when llm_provider === "ollama", which can't be true pre-load).
-    const s = settingsStore.settings();
-    setOllamaBaseInput(s.ollama_base_url || "http://localhost:11434");
-    setOllamaModelInput(s.ollama_model || "");
-    if (s.ollama_api_key) setOllamaKeyInput(s.ollama_api_key);
+    // The token box always starts empty: the saved token is never in the webview.
+    revertInputsToStored();
     // Eager-fetch the installed-model list — this fires on initial
     // load AND whenever the user switches BACK to Ollama (because
     // the parent's Show clause re-mounts us). Same UX as before.
@@ -291,10 +335,21 @@ export default function OllamaProvider() {
             <label class="text-text-muted text-xs block">
               Bearer token — only needed if you front Ollama with an auth proxy.
             </label>
+            <Show when={hasSavedToken()}>
+              <div class="flex items-center gap-2 text-xs text-text-secondary">
+                <span class="flex-1">Token saved</span>
+                <button
+                  onClick={() => void handleRemoveToken()}
+                  class="px-2 py-1 rounded border border-border hover:bg-bg-hover hover:text-red transition-colors"
+                >
+                  Remove
+                </button>
+              </div>
+            </Show>
             <div class="flex gap-2">
               <input
                 type="password"
-                placeholder="(none)"
+                placeholder={hasSavedToken() ? "Paste a new token to replace the saved one" : "(none)"}
                 value={ollamaKeyInput()}
                 onInput={(e) => setOllamaKeyInput(e.currentTarget.value)}
                 onKeyDown={(e) => {

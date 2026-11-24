@@ -206,6 +206,8 @@ export const mockCommands: typeof RealCommands = {
   getSettings: () => envelope(mockInvoke("get_settings")),
   saveSettings: (settings) =>
     envelope(mockInvoke("save_settings", { settings })),
+  // F11: which providers have a saved key — booleans only, never the key.
+  getProviderKeyStatus: () => envelope(mockInvoke("get_provider_key_status")),
   listAgentProfiles: () => envelope(mockInvoke("list_agent_profiles")),
   getDeviceProfile: () => envelope(mockInvoke("get_device_profile")),
   decideTool: (requestId, decision) =>

@@ -15,16 +15,20 @@
 //! `error_message` + a small descriptive `summary`. Frontend renders
 //! green/red inline, doesn't try to parse the summary.
 //!
-//! Privacy: the IPC takes the key directly from the frontend (it's
-//! already in memory there from the input field). No persistence, no
-//! logging — `tracing::debug!` only logs the latency + status, never
-//! the key or response body.
+//! Privacy: the IPC takes the key the user just typed. When that field is
+//! empty ("test the key I already saved") the backend substitutes the saved
+//! key itself — the webview never holds a saved key (sharp-edges F11). A saved
+//! key is only ever sent to the provider's own fixed host, or, for Ollama, to
+//! the saved server address. No persistence, no logging —
+//! `tracing::debug!` only logs the latency + status, never the key or
+//! response body.
 
 use serde::Serialize;
 use std::time::Instant;
 use tauri::State;
 
-use super::types::HttpClient;
+use super::settings::effective_probe_key;
+use super::types::{HttpClient, SettingsState};
 
 #[derive(Debug, Clone, Serialize, specta::Type)]
 pub struct ConnectionTestResult {
@@ -75,8 +79,15 @@ impl ConnectionTestResult {
 pub async fn test_gemini_connection(
     api_key: String,
     http_state: State<'_, HttpClient>,
+    settings_state: State<'_, SettingsState>,
 ) -> Result<ConnectionTestResult, String> {
-    let key = api_key.trim();
+    let saved = settings_state
+        .settings
+        .lock()
+        .map(|g| g.gemini_api_key.clone())
+        .unwrap_or(None);
+    let key = effective_probe_key(&api_key, &saved);
+    let key = key.as_str();
     if key.is_empty() {
         return Ok(ConnectionTestResult::fail(
             0,
@@ -141,8 +152,15 @@ pub async fn test_gemini_connection(
 pub async fn test_openrouter_connection(
     api_key: String,
     http_state: State<'_, HttpClient>,
+    settings_state: State<'_, SettingsState>,
 ) -> Result<ConnectionTestResult, String> {
-    let key = api_key.trim();
+    let saved = settings_state
+        .settings
+        .lock()
+        .map(|g| g.openrouter_api_key.clone())
+        .unwrap_or(None);
+    let key = effective_probe_key(&api_key, &saved);
+    let key = key.as_str();
     if key.is_empty() {
         return Ok(ConnectionTestResult::fail(
             0,
@@ -224,13 +242,25 @@ pub async fn test_ollama_connection(
     base_url: String,
     api_key: Option<String>,
     http_state: State<'_, HttpClient>,
+    settings_state: State<'_, SettingsState>,
 ) -> Result<ConnectionTestResult, String> {
-    let base = base_url.trim().trim_end_matches('/');
-    let base = if base.is_empty() {
-        crate::ai::ollama::OLLAMA_DEFAULT_BASE
-    } else {
-        base
+    // Same address policy as save_settings; the saved token only ever goes to
+    // the saved server (see `resolve_ollama_probe`).
+    let (base, key) = match super::ollama_models::resolve_ollama_probe(
+        &base_url,
+        api_key.as_deref(),
+        &super::ollama_models::saved_settings(&settings_state),
+    ) {
+        Ok(v) => v,
+        Err(e) => {
+            return Ok(ConnectionTestResult::fail(
+                0,
+                "Server address can't be used".into(),
+                e,
+            ))
+        }
     };
+    let base = base.as_str();
     let url = format!("{}/api/version", base);
 
     let started = Instant::now();
@@ -238,11 +268,8 @@ pub async fn test_ollama_connection(
         .0
         .get(&url)
         .timeout(std::time::Duration::from_secs(3));
-    if let Some(key) = api_key.as_deref() {
-        let trimmed = key.trim();
-        if !trimmed.is_empty() {
-            req = req.bearer_auth(trimmed);
-        }
+    if let Some(key) = key.as_deref() {
+        req = req.bearer_auth(key);
     }
 
     match req.send().await {
@@ -295,8 +322,15 @@ pub async fn test_ollama_connection(
 pub async fn test_openai_connection(
     api_key: String,
     http_state: State<'_, HttpClient>,
+    settings_state: State<'_, SettingsState>,
 ) -> Result<ConnectionTestResult, String> {
-    let key = api_key.trim();
+    let saved = settings_state
+        .settings
+        .lock()
+        .map(|g| g.openai_api_key.clone())
+        .unwrap_or(None);
+    let key = effective_probe_key(&api_key, &saved);
+    let key = key.as_str();
     if key.is_empty() {
         return Ok(ConnectionTestResult::fail(
             0,
@@ -361,8 +395,15 @@ pub async fn test_openai_connection(
 pub async fn test_anthropic_connection(
     api_key: String,
     http_state: State<'_, HttpClient>,
+    settings_state: State<'_, SettingsState>,
 ) -> Result<ConnectionTestResult, String> {
-    let key = api_key.trim();
+    let saved = settings_state
+        .settings
+        .lock()
+        .map(|g| g.anthropic_api_key.clone())
+        .unwrap_or(None);
+    let key = effective_probe_key(&api_key, &saved);
+    let key = key.as_str();
     if key.is_empty() {
         return Ok(ConnectionTestResult::fail(
             0,
@@ -441,9 +482,7 @@ fn truncate(mut s: String, max: usize) -> String {
     if s.len() <= max {
         return s;
     }
-    let cut = crate::ai::tools::utf8_prefix(&s, max).len();
-    s.truncate(cut);
-    s.push('…');
+    crate::ai::tools::truncate_utf8_with(&mut s, max, "…");
     s
 }
 

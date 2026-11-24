@@ -12,9 +12,13 @@ use crate::ai::tools::approval::{PendingApprovals, ToolDecision};
 use crate::ai::tools::AgentProfile;
 use crate::commands::files::RoostFsState;
 use crate::commands::graph::GraphDb;
+use crate::commands::native_confirm::{NativeConfirm, OsDialog};
 use crate::db::queries::{ai_signals, approval_log};
 use crate::secret_store;
 
+use super::settings_guard::{
+    covered_by, plan_settings_update, Escalation, KeyUpdate, SettingsPlan,
+};
 use super::types::{Settings, SettingsState};
 
 /// Wire shape for the agent-profile picker. Mirrors the
@@ -27,6 +31,29 @@ pub struct AgentProfileInfo {
     pub summary: String,
 }
 
+/// The settings as the webview may see them: everything EXCEPT the live
+/// provider API keys, which stay in the OS keychain / backend memory.
+///
+/// Sharp-edges F11: `get_settings` used to return the in-memory struct whose
+/// five key fields are hydrated from the keychain, so any script in the
+/// webview could read every provider key in one call and, combined with the
+/// (now closed) unvalidated base URL, spend or exfiltrate them. The UI only
+/// ever needs to know *whether* a key is set — see [`get_provider_key_status`].
+///
+/// Round-trip contract with `save_settings`: a key field of `None` means
+/// "unchanged", `Some("")` means "remove", `Some(k)` means "replace"
+/// (`settings_guard::plan_settings_update`).
+pub(crate) fn redacted_for_renderer(settings: &Settings) -> Settings {
+    Settings {
+        gemini_api_key: None,
+        openrouter_api_key: None,
+        ollama_api_key: None,
+        openai_api_key: None,
+        anthropic_api_key: None,
+        ..settings.clone()
+    }
+}
+
 #[tauri::command]
 #[specta::specta]
 pub fn get_settings(state: State<'_, SettingsState>) -> Result<Settings, String> {
@@ -34,35 +61,60 @@ pub fn get_settings(state: State<'_, SettingsState>) -> Result<Settings, String>
         .settings
         .lock()
         .map_err(|e| format!("Lock error: {e}"))?;
-    Ok(guard.clone())
+    Ok(redacted_for_renderer(&guard))
 }
 
-/// Provider API keys lifted out of `Settings` before serialization so
-/// they can be written to the OS keychain rather than disk. Each field
-/// is `None` if the source struct had no key set OR if we're on a
-/// platform without a keychain (in which case the caller never strips,
-/// see `take_provider_keys`).
-struct ProviderKeys {
-    gemini: Option<crate::sensitive::SecretString>,
-    openrouter: Option<crate::sensitive::SecretString>,
-    ollama: Option<crate::sensitive::SecretString>,
-    openai: Option<crate::sensitive::SecretString>,
-    anthropic: Option<crate::sensitive::SecretString>,
+/// Which provider keys are configured — the only thing the Settings UI needs.
+/// Booleans, never key material (not even a last-4 hint).
+#[derive(Debug, Serialize, Clone, Copy, PartialEq, Eq, specta::Type)]
+pub struct ProviderKeyStatus {
+    pub gemini: bool,
+    pub openrouter: bool,
+    pub ollama: bool,
+    pub openai: bool,
+    pub anthropic: bool,
 }
 
-/// S-03: lift the three provider API keys out of `settings` so the
-/// on-disk JSON never carries plaintext credentials on a platform that
-/// has somewhere safer. Mutates `settings` in place, returning the
-/// keys for the caller to either write to the keychain or hand back
-/// to the in-memory copy. Pure (no I/O) — unit-testable.
-fn take_provider_keys(settings: &mut Settings) -> ProviderKeys {
-    ProviderKeys {
-        gemini: settings.gemini_api_key.take(),
-        openrouter: settings.openrouter_api_key.take(),
-        ollama: settings.ollama_api_key.take(),
-        openai: settings.openai_api_key.take(),
-        anthropic: settings.anthropic_api_key.take(),
+pub(crate) fn provider_key_status(settings: &Settings) -> ProviderKeyStatus {
+    let set = |k: &Option<crate::sensitive::SecretString>| {
+        k.as_deref().is_some_and(|k| !k.trim().is_empty())
+    };
+    ProviderKeyStatus {
+        gemini: set(&settings.gemini_api_key),
+        openrouter: set(&settings.openrouter_api_key),
+        ollama: set(&settings.ollama_api_key),
+        openai: set(&settings.openai_api_key),
+        anthropic: set(&settings.anthropic_api_key),
     }
+}
+
+#[tauri::command]
+#[specta::specta]
+pub fn get_provider_key_status(
+    state: State<'_, SettingsState>,
+) -> Result<ProviderKeyStatus, String> {
+    let guard = state
+        .settings
+        .lock()
+        .map_err(|e| format!("Lock error: {e}"))?;
+    Ok(provider_key_status(&guard))
+}
+
+/// The key a connection probe should use: what the user just typed, or — when
+/// the field was left empty — the saved key. Resolved in the backend so the
+/// webview never has to hold a saved key to "test the saved key".
+pub(crate) fn effective_probe_key(
+    typed: &str,
+    saved: &Option<crate::sensitive::SecretString>,
+) -> String {
+    let typed = typed.trim();
+    if !typed.is_empty() {
+        return typed.to_string();
+    }
+    saved
+        .as_deref()
+        .map(|k| k.trim().to_string())
+        .unwrap_or_default()
 }
 
 /// R-02 (2026-05-24 re-audit): canonical on-disk shape for the
@@ -189,102 +241,199 @@ pub(crate) fn atomic_replace(from: &Path, to: &Path) -> Result<(), String> {
     }
 }
 
-fn write_provider_keys(
-    keys: &ProviderKeys,
+/// Apply the planned per-provider key changes to secret storage. Only `Set`
+/// and `Clear` touch the keychain; `Keep` (the renderer sent no key) never
+/// does — previously every save rewrote or DELETED all five slots from
+/// whatever the renderer held.
+fn apply_key_updates(
+    updates: &[KeyUpdate; 5],
     mut set: impl FnMut(&str, &str) -> Result<(), String>,
     mut delete: impl FnMut(&str) -> Result<(), String>,
 ) -> Result<(), String> {
-    for (key, slot) in [
-        (keys.gemini.as_deref(), secret_store::keys::GEMINI_API_KEY),
-        (
-            keys.openrouter.as_deref(),
-            secret_store::keys::OPENROUTER_API_KEY,
-        ),
-        (keys.ollama.as_deref(), secret_store::keys::OLLAMA_API_KEY),
-        (keys.openai.as_deref(), secret_store::keys::OPENAI_API_KEY),
-        (
-            keys.anthropic.as_deref(),
-            secret_store::keys::ANTHROPIC_API_KEY,
-        ),
-    ] {
-        match key {
-            Some(k) if !k.is_empty() => {
-                set(slot, k)?;
-            }
-            _ => {
-                delete(slot)?;
-            }
+    // Same order as `SettingsPlan::key_updates`.
+    const SLOTS: [&str; 5] = [
+        secret_store::keys::GEMINI_API_KEY,
+        secret_store::keys::OPENROUTER_API_KEY,
+        secret_store::keys::OLLAMA_API_KEY,
+        secret_store::keys::OPENAI_API_KEY,
+        secret_store::keys::ANTHROPIC_API_KEY,
+    ];
+    for (update, slot) in updates.iter().zip(SLOTS) {
+        match update {
+            KeyUpdate::Keep => {}
+            KeyUpdate::Set(k) => set(slot, k)?,
+            KeyUpdate::Clear => delete(slot)?,
         }
     }
     Ok(())
 }
 
-/// Persist settings. On platforms with a keychain the Gemini,
-/// OpenRouter, and Ollama API keys are pulled out of the struct,
-/// written to the OS keychain, and the on-disk settings.json keeps
-/// the fields as `null`. The in-memory copy still holds the real keys
-/// so subsequent `get_settings` calls return them.
-#[tauri::command]
-#[specta::specta]
-pub fn save_settings(
-    app: tauri::AppHandle,
-    mut settings: Settings,
-    state: State<'_, SettingsState>,
-) -> Result<(), String> {
-    // Captured before `settings` is consumed below so we can reconcile
-    // the OS "launch at login" registration after the write succeeds.
-    // `app: AppHandle` is a runtime-injected Tauri arg, not part of the
-    // serialized command payload, so the generated bindings signature
-    // (saveSettings(settings)) is unchanged.
-    let launch_at_startup = settings.launch_at_startup;
-    let keys = if secret_store::is_supported() {
-        let keys = take_provider_keys(&mut settings);
-        write_provider_keys(&keys, secret_store::set, secret_store::delete)?;
-        keys
-    } else {
-        // No keychain — leave the keys on disk. Clone so we can still
-        // restore them into the in-memory copy below.
-        ProviderKeys {
-            gemini: settings.gemini_api_key.clone(),
-            openrouter: settings.openrouter_api_key.clone(),
-            ollama: settings.ollama_api_key.clone(),
-            openai: settings.openai_api_key.clone(),
-            anthropic: settings.anthropic_api_key.clone(),
-        }
-    };
+/// What a completed save tells its caller.
+pub(crate) struct SaveOutcome {
+    pub launch_at_startup: bool,
+}
 
-    // R-02: route through the shared redacted-JSON helper. With
-    // keychain support, `settings` here already has provider keys
-    // stripped (we called `take_provider_keys` above). The helper is
-    // idempotent — it re-NULLs the fields if anyone calls it with a
-    // hydrated struct, which is the contract `persist_always_approve`
-    // relies on.
-    // Re-hydrate the in-memory copy with the live keys so handlers that
-    // read `state.settings` after save see the values the user just set.
-    settings.gemini_api_key = keys.gemini;
-    settings.openrouter_api_key = keys.openrouter;
-    settings.ollama_api_key = keys.ollama;
-    settings.openai_api_key = keys.openai;
-    settings.anthropic_api_key = keys.anthropic;
+/// Shown to the user (via the webview's error toast) when they decline the
+/// native confirmation. The save is dropped as a whole: applying the
+/// non-escalating half would make the UI show state the backend does not hold.
+pub(crate) const SAVE_DECLINED: &str =
+    "Not saved: the security confirmation was cancelled, so nothing was changed.";
 
-    // Serialize disk + memory behind the same mutex used by internal settings
-    // mutations (for example "Always approve"). Writing before acquiring the
-    // mutex allowed two successful calls to leave disk and memory representing
-    // different snapshots.
-    let mut guard = state
+fn confirmation_body(escalations: &[Escalation]) -> String {
+    let mut body = String::from("Corvux is about to loosen a safety setting:\n\n");
+    // EVERY escalation is listed — the planner refuses a save with more than
+    // `MAX_ESCALATIONS_PER_SAVE`, so there is never a fold to hide one behind.
+    for e in escalations {
+        body.push_str("\u{2022} ");
+        body.push_str(&e.describe());
+        body.push('\n');
+    }
+    body.push_str("\nIf you did not just change this in Settings, choose Cancel.");
+    body
+}
+
+fn lock_settings(state: &SettingsState) -> Result<std::sync::MutexGuard<'_, Settings>, String> {
+    state
         .settings
         .lock()
-        .map_err(|e| format!("Lock error: {e}"))?;
-    persist_settings_file(&state.path, &settings)?;
-    *guard = settings;
-    drop(guard);
+        .map_err(|e| format!("Lock error: {e}"))
+}
+
+/// Everything `save_settings` does except talk to Tauri: plan against the
+/// current settings, ask for an out-of-band confirmation when the plan
+/// escalates, then — under the settings lock — re-plan, apply keychain changes,
+/// persist and install. `confirm`, the keychain closures and `audit` are
+/// injected so the whole policy is testable without a window, an OS keychain
+/// or a database.
+///
+/// The settings lock is never held across the confirmation `await`: the dialog
+/// can stay open for minutes and chat reads settings on every turn.
+pub(crate) async fn save_settings_core<C: NativeConfirm + ?Sized>(
+    state: &SettingsState,
+    incoming: Settings,
+    confirm: &C,
+    set_key: impl FnMut(&str, &str) -> Result<(), String>,
+    del_key: impl FnMut(&str) -> Result<(), String>,
+    mut audit: impl FnMut(&[Escalation], bool),
+) -> Result<SaveOutcome, String> {
+    let launch_at_startup = incoming.launch_at_startup;
+
+    // 1. Plan against a snapshot (lock released before any await).
+    let snapshot = lock_settings(state)?.clone();
+    let first = plan_settings_update(&snapshot, incoming.clone())?;
+
+    // 2. Out-of-band confirmation, only when something escalates.
+    let mut shown: Vec<Escalation> = Vec::new();
+    if !first.escalations.is_empty() {
+        let allowed = confirm
+            .confirm(
+                "Confirm security change",
+                &confirmation_body(&first.escalations),
+                "Allow change",
+            )
+            .await;
+        audit(&first.escalations, allowed);
+        if !allowed {
+            return Err(SAVE_DECLINED.to_string());
+        }
+        shown = first.escalations;
+    }
+
+    // 3. Apply under the lock. Re-plan: another save may have landed while the
+    //    dialog was open, and a confirmation only covers what it showed.
+    let mut guard = lock_settings(state)?;
+    let plan = plan_settings_update(&guard, incoming)?;
+    if !covered_by(&shown, &plan.escalations) {
+        return Err(
+            "Settings changed while the confirmation was open. Review them and save again."
+                .to_string(),
+        );
+    }
+    let SettingsPlan {
+        merged,
+        key_updates,
+        escalations: _,
+    } = plan;
+    apply_key_updates(&key_updates, set_key, del_key)?;
+    // Serialize disk + memory behind the same mutex used by internal settings
+    // mutations (for example "Always approve"). `persist_settings_file` strips
+    // the provider keys from the JSON (R-02); memory keeps them for chat.
+    persist_settings_file(&state.path, &merged)?;
+    *guard = merged;
+    Ok(SaveOutcome { launch_at_startup })
+}
+
+/// Persist settings.
+///
+/// Provider API keys follow `settings_guard`'s contract: a key field of `None`
+/// leaves the stored key alone, `Some("")` removes it, `Some(k)` replaces it.
+/// Keys live in the OS keychain; settings.json keeps them as `null`; the
+/// in-memory copy holds the live values for chat. `get_settings` never returns
+/// them (F11).
+///
+/// Changes that loosen a safety setting — enabling agent auto-approve, pinning
+/// a tool, un-blocking a path, pointing Ollama at an internet host — need the
+/// user to confirm in a native OS dialog the webview cannot click (F1/F2). The
+/// decision and the answer are written to the approval log.
+#[tauri::command]
+#[specta::specta]
+pub async fn save_settings(
+    app: tauri::AppHandle,
+    settings: Settings,
+    state: State<'_, SettingsState>,
+    graph: State<'_, GraphDb>,
+) -> Result<(), String> {
+    let dialog = OsDialog(app.clone());
+    let outcome = save_settings_core(
+        &state,
+        settings,
+        &dialog,
+        secret_store::set,
+        secret_store::delete,
+        |escalations, allowed| record_escalations(&graph, escalations, allowed),
+    )
+    .await?;
 
     // Sync the OS autostart registration with the saved choice. Failures
     // are logged inside the helper, not surfaced — the setting is already
     // persisted, and a flaky registry/LaunchAgent write shouldn't fail the
     // whole save. The next launch's startup reconcile will retry anyway.
-    crate::reconcile_autostart(&app, launch_at_startup);
+    crate::reconcile_autostart(&app, outcome.launch_at_startup);
     Ok(())
+}
+
+/// Write one approval-log row per escalation the user was asked about, whatever
+/// they answered, so a disarmed approval gate is never silent. Best-effort like
+/// every approval-log write (no roost open ⇒ no DB ⇒ the tracing line below is
+/// the record).
+fn record_escalations(graph: &GraphDb, escalations: &[Escalation], allowed: bool) {
+    let decision = if allowed {
+        "escalation_confirmed"
+    } else {
+        "escalation_declined"
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0);
+    for (i, e) in escalations.iter().enumerate() {
+        let summary = e.describe();
+        tracing::warn!(decision, change = %summary, "settings: security-relevant change");
+        let Ok(guard) = graph.db.lock() else { continue };
+        let Some(db) = guard.as_ref() else { continue };
+        let entry = approval_log::ApprovalLogEntry {
+            request_id: format!("settings-{now:.3}-{i}"),
+            timestamp: now,
+            tool: e.audit_tool().to_string(),
+            tier: "settings".to_string(),
+            decision: decision.to_string(),
+            args_hash: approval_log::hash_args(&summary),
+            args_summary: summary,
+        };
+        if let Err(err) = approval_log::record_decision(db, &entry) {
+            tracing::warn!(error = %err, "settings: approval-log write failed");
+        }
+    }
 }
 
 /// List the available agent profiles for the settings UI. Driven by
@@ -670,54 +819,67 @@ mod tests {
     }
     use super::*;
 
-    /// S-03: after lifting provider keys, the on-disk JSON shape must
-    /// not contain any of the secret values. This is the regression
-    /// test that catches "someone added a fourth provider key and
-    /// forgot to wire it through `take_provider_keys`."
-    #[test]
-    fn take_provider_keys_strips_all_three_from_serialized_json() {
-        let mut settings = Settings {
+    pub(super) fn hydrated() -> Settings {
+        Settings {
             gemini_api_key: Some("GEMINI-SENTINEL".into()),
             openrouter_api_key: Some("OPENROUTER-SENTINEL".into()),
             ollama_api_key: Some("OLLAMA-SENTINEL".into()),
             openai_api_key: Some("OPENAI-SENTINEL".into()),
             anthropic_api_key: Some("ANTHROPIC-SENTINEL".into()),
             ..Settings::default()
+        }
+    }
+
+    const SENTINELS: [&str; 5] = [
+        "GEMINI-SENTINEL",
+        "OPENROUTER-SENTINEL",
+        "OLLAMA-SENTINEL",
+        "OPENAI-SENTINEL",
+        "ANTHROPIC-SENTINEL",
+    ];
+
+    /// F11 (sharp-edges 2026-11-11): the wire form handed to the webview must
+    /// not carry ANY provider key. A "fourth provider key someone forgot to
+    /// wire through" shows up here as a leaked sentinel.
+    #[test]
+    fn the_renderer_view_of_settings_carries_no_provider_key() {
+        let view = redacted_for_renderer(&hydrated());
+        let json = serde_json::to_string(&view).expect("serialize");
+        for s in SENTINELS {
+            assert!(!json.contains(s), "{s} leaked to the webview: {json}");
+        }
+        // Everything else survives, so the UI still has its settings.
+        assert_eq!(view.model, Settings::default().model);
+        assert!(view.agent_autonomy.auto_approve_reads);
+    }
+
+    #[test]
+    fn key_status_reports_booleans_only() {
+        let s = provider_key_status(&hydrated());
+        assert!(s.gemini && s.openrouter && s.ollama && s.openai && s.anthropic);
+        let none = provider_key_status(&Settings::default());
+        assert!(
+            !none.gemini && !none.openrouter && !none.ollama && !none.openai && !none.anthropic
+        );
+        // A whitespace-only key is not "set".
+        let blank = Settings {
+            gemini_api_key: Some("  ".into()),
+            ..Settings::default()
         };
+        assert!(!provider_key_status(&blank).gemini);
+        let json = serde_json::to_string(&s).unwrap();
+        for sentinel in SENTINELS {
+            assert!(!json.contains(sentinel));
+        }
+    }
 
-        let keys = take_provider_keys(&mut settings);
-
-        // The returned `ProviderKeys` carries the originals so the
-        // caller can write them to the keychain.
-        assert_eq!(keys.gemini.as_deref(), Some("GEMINI-SENTINEL"));
-        assert_eq!(keys.openrouter.as_deref(), Some("OPENROUTER-SENTINEL"));
-        assert_eq!(keys.ollama.as_deref(), Some("OLLAMA-SENTINEL"));
-        assert_eq!(keys.openai.as_deref(), Some("OPENAI-SENTINEL"));
-        assert_eq!(keys.anthropic.as_deref(), Some("ANTHROPIC-SENTINEL"));
-
-        // The struct that gets serialized to disk now has None for all
-        // three. Serialize and assert none of the sentinels appear.
-        let json = serde_json::to_string(&settings).expect("serialize");
-        assert!(
-            !json.contains("GEMINI-SENTINEL"),
-            "gemini key leaked to disk JSON: {json}"
-        );
-        assert!(
-            !json.contains("OPENROUTER-SENTINEL"),
-            "openrouter key leaked to disk JSON: {json}"
-        );
-        assert!(
-            !json.contains("OLLAMA-SENTINEL"),
-            "ollama key leaked to disk JSON: {json}"
-        );
-        assert!(
-            !json.contains("OPENAI-SENTINEL"),
-            "openai key leaked to disk JSON: {json}"
-        );
-        assert!(
-            !json.contains("ANTHROPIC-SENTINEL"),
-            "anthropic key leaked to disk JSON: {json}"
-        );
+    #[test]
+    fn probe_key_prefers_typed_then_falls_back_to_saved() {
+        let saved = Some(crate::sensitive::SecretString::from("saved-key"));
+        assert_eq!(effective_probe_key("  typed ", &saved), "typed");
+        assert_eq!(effective_probe_key("", &saved), "saved-key");
+        assert_eq!(effective_probe_key("   ", &saved), "saved-key");
+        assert_eq!(effective_probe_key("", &None), "");
     }
 
     /// R-02 (2026-05-24 re-audit): the shared `redacted_settings_json`
@@ -764,40 +926,376 @@ mod tests {
             "redacted JSON must still include non-secret fields"
         );
     }
-
-    /// `take_provider_keys` on a struct with no keys set must produce
-    /// an all-None bundle — important because the keychain delete path
-    /// runs based on `Some(empty)` vs `None`.
-    #[test]
-    fn take_provider_keys_returns_none_for_unset_fields() {
-        // Default has no provider keys configured.
-        let mut settings = Settings {
-            gemini_api_key: None,
-            openrouter_api_key: None,
-            ollama_api_key: None,
-            openai_api_key: None,
-            anthropic_api_key: None,
-            ..Settings::default()
-        };
-
-        let keys = take_provider_keys(&mut settings);
-        assert!(keys.gemini.is_none());
-        assert!(keys.openrouter.is_none());
-        assert!(keys.ollama.is_none());
-        assert!(keys.openai.is_none());
-        assert!(keys.anthropic.is_none());
-    }
 }
 
 #[cfg(test)]
 mod credential_deletion_tests {
     use super::*;
+
+    fn all_keep() -> [KeyUpdate; 5] {
+        [
+            KeyUpdate::Keep,
+            KeyUpdate::Keep,
+            KeyUpdate::Keep,
+            KeyUpdate::Keep,
+            KeyUpdate::Keep,
+        ]
+    }
+
     #[test]
     fn clearing_a_provider_key_surfaces_deletion_failure() {
-        let mut settings = Settings::default();
-        let keys = take_provider_keys(&mut settings);
-        let err = write_provider_keys(&keys, |_, _| Ok(()), |_| Err("keychain locked".into()))
+        let mut updates = all_keep();
+        updates[0] = KeyUpdate::Clear;
+        let err = apply_key_updates(&updates, |_, _| Ok(()), |_| Err("keychain locked".into()))
             .unwrap_err();
         assert_eq!(err, "keychain locked");
+    }
+
+    #[test]
+    fn keep_never_touches_the_keychain() {
+        // Before F11 every save rewrote or deleted all five slots from whatever
+        // the webview held; a redacted round-trip would have wiped every key.
+        apply_key_updates(
+            &all_keep(),
+            |slot, _| panic!("set({slot}) must not run for Keep"),
+            |slot| panic!("delete({slot}) must not run for Keep"),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn set_and_clear_hit_the_right_slots() {
+        let mut updates = all_keep();
+        updates[1] = KeyUpdate::Set("or".into());
+        updates[3] = KeyUpdate::Clear;
+        let mut sets = Vec::new();
+        let mut dels = Vec::new();
+        apply_key_updates(
+            &updates,
+            |slot, v| {
+                sets.push((slot.to_string(), v.to_string()));
+                Ok(())
+            },
+            |slot| {
+                dels.push(slot.to_string());
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            sets,
+            vec![(
+                secret_store::keys::OPENROUTER_API_KEY.to_string(),
+                "or".to_string()
+            )]
+        );
+        assert_eq!(dels, vec![secret_store::keys::OPENAI_API_KEY.to_string()]);
+    }
+}
+
+#[cfg(test)]
+mod save_core_tests {
+    //! The whole `save_settings` policy — plan → native confirm → apply — run
+    //! against a real settings file with a scripted dialog and recording
+    //! keychain closures. No window, no OS keychain, no database.
+    #![allow(clippy::field_reassign_with_default)]
+    use super::tests::hydrated;
+    use super::*;
+    use crate::commands::native_confirm::test_support::Scripted;
+    use std::sync::Mutex;
+
+    fn state_with(settings: Settings) -> (tempfile::TempDir, SettingsState) {
+        let dir = tempfile::tempdir().unwrap();
+        let state = SettingsState {
+            path: dir.path().join("settings.json"),
+            settings: Mutex::new(settings),
+        };
+        (dir, state)
+    }
+
+    #[derive(Default)]
+    struct Keychain {
+        sets: Vec<(String, String)>,
+        dels: Vec<String>,
+    }
+
+    async fn save(
+        state: &SettingsState,
+        incoming: Settings,
+        confirm: &(impl NativeConfirm + ?Sized),
+        kc: &mut Keychain,
+        audit: &mut Vec<(usize, bool)>,
+    ) -> Result<SaveOutcome, String> {
+        let kc = Mutex::new(kc);
+        save_settings_core(
+            state,
+            incoming,
+            confirm,
+            |slot, v| {
+                kc.lock().unwrap().sets.push((slot.into(), v.into()));
+                Ok(())
+            },
+            |slot| {
+                kc.lock().unwrap().dels.push(slot.into());
+                Ok(())
+            },
+            |esc, allowed| audit.push((esc.len(), allowed)),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn an_ordinary_save_never_prompts_and_persists() {
+        let (_d, state) = state_with(Settings::default());
+        let mut inc = Settings::default();
+        inc.model = "gemini-x".into();
+        inc.gemini_api_key = Some("GEMINI-SENTINEL".into());
+        let dialog = Scripted::deny(); // would fail the save if asked
+        let (mut kc, mut audit) = (Keychain::default(), Vec::new());
+
+        save(&state, inc, &dialog, &mut kc, &mut audit)
+            .await
+            .unwrap();
+
+        assert_eq!(dialog.times_asked(), 0);
+        assert!(audit.is_empty());
+        let mem = state.settings.lock().unwrap();
+        assert_eq!(mem.model, "gemini-x");
+        assert_eq!(mem.gemini_api_key.as_deref(), Some("GEMINI-SENTINEL"));
+        assert_eq!(kc.sets.len(), 1);
+        // The secret reached the keychain closure but never the file.
+        let on_disk = std::fs::read_to_string(&state.path).unwrap();
+        assert!(on_disk.contains("gemini-x"));
+        assert!(!on_disk.contains("GEMINI-SENTINEL"), "{on_disk}");
+    }
+
+    #[tokio::test]
+    async fn declining_the_dialog_changes_nothing() {
+        let (_d, state) = state_with(Settings::default());
+        let mut inc = Settings::default();
+        inc.model = "would-be-saved".into(); // rides along with the escalation
+        inc.agent_autonomy.auto_approve_writes = true;
+        inc.openai_api_key = Some("OPENAI-SENTINEL".into());
+        let dialog = Scripted::deny();
+        let (mut kc, mut audit) = (Keychain::default(), Vec::new());
+
+        let err = save(&state, inc, &dialog, &mut kc, &mut audit)
+            .await
+            .err()
+            .expect("must be refused");
+
+        assert_eq!(err, SAVE_DECLINED);
+        assert_eq!(dialog.times_asked(), 1);
+        assert_eq!(audit, vec![(1, false)]);
+        let mem = state.settings.lock().unwrap();
+        assert!(!mem.agent_autonomy.auto_approve_writes);
+        assert_eq!(mem.model, Settings::default().model);
+        assert!(mem.openai_api_key.is_none());
+        assert!(
+            kc.sets.is_empty() && kc.dels.is_empty(),
+            "no keychain writes"
+        );
+        assert!(!state.path.exists(), "nothing was persisted");
+    }
+
+    #[tokio::test]
+    async fn allowing_the_dialog_applies_the_escalation_and_logs_it() {
+        let (_d, state) = state_with(Settings::default());
+        let mut inc = Settings::default();
+        inc.agent_autonomy.auto_approve_writes = true;
+        let dialog = Scripted::allow();
+        let (mut kc, mut audit) = (Keychain::default(), Vec::new());
+
+        save(&state, inc, &dialog, &mut kc, &mut audit)
+            .await
+            .unwrap();
+
+        assert_eq!(dialog.times_asked(), 1);
+        assert_eq!(audit, vec![(1, true)]);
+        assert!(
+            state
+                .settings
+                .lock()
+                .unwrap()
+                .agent_autonomy
+                .auto_approve_writes
+        );
+        assert!(std::fs::read_to_string(&state.path)
+            .unwrap()
+            .contains("\"auto_approve_writes\": true"));
+    }
+
+    #[tokio::test]
+    async fn the_audit_misuse_example_is_stopped_by_a_declined_dialog() {
+        // get → spread → save, exactly as the sharp-edges report shows.
+        let mut cur = Settings::default();
+        cur.agent_autonomy.agent_blocked_paths = vec!["Journal/".into(), "Finance/".into()];
+        let (_d, state) = state_with(cur.clone());
+        let mut inc = redacted_for_renderer(&cur);
+        inc.agent_autonomy.auto_approve_writes = true;
+        inc.agent_autonomy.auto_approve_tools = vec!["roost_write".into()];
+        inc.agent_autonomy.agent_blocked_paths.clear();
+        let dialog = Scripted::deny();
+        let (mut kc, mut audit) = (Keychain::default(), Vec::new());
+
+        assert!(save(&state, inc, &dialog, &mut kc, &mut audit)
+            .await
+            .is_err());
+        let mem = state.settings.lock().unwrap();
+        assert!(!mem.agent_autonomy.auto_approve_writes);
+        assert_eq!(mem.agent_autonomy.agent_blocked_paths.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_redacted_round_trip_does_not_wipe_stored_keys() {
+        let (_d, state) = state_with(hydrated());
+        // The webview did get_settings (keys = None) and saves one tweak back.
+        let mut inc = redacted_for_renderer(&hydrated());
+        inc.model = "tweak".into();
+        let dialog = Scripted::deny();
+        let (mut kc, mut audit) = (Keychain::default(), Vec::new());
+
+        save(&state, inc, &dialog, &mut kc, &mut audit)
+            .await
+            .unwrap();
+
+        assert!(
+            kc.sets.is_empty() && kc.dels.is_empty(),
+            "keychain untouched"
+        );
+        let mem = state.settings.lock().unwrap();
+        assert_eq!(mem.model, "tweak");
+        assert_eq!(mem.gemini_api_key.as_deref(), Some("GEMINI-SENTINEL"));
+        assert_eq!(mem.anthropic_api_key.as_deref(), Some("ANTHROPIC-SENTINEL"));
+    }
+
+    #[tokio::test]
+    async fn an_empty_key_removes_exactly_that_key() {
+        let (_d, state) = state_with(hydrated());
+        let mut inc = redacted_for_renderer(&hydrated());
+        inc.openrouter_api_key = Some("".into());
+        let dialog = Scripted::deny();
+        let (mut kc, mut audit) = (Keychain::default(), Vec::new());
+
+        save(&state, inc, &dialog, &mut kc, &mut audit)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            kc.dels,
+            vec![secret_store::keys::OPENROUTER_API_KEY.to_string()]
+        );
+        let mem = state.settings.lock().unwrap();
+        assert!(mem.openrouter_api_key.is_none());
+        assert!(mem.gemini_api_key.is_some());
+    }
+
+    #[tokio::test]
+    async fn an_invalid_ollama_url_is_rejected_before_anything_is_written() {
+        let (_d, state) = state_with(Settings::default());
+        let mut inc = Settings::default();
+        inc.ollama_base_url = "http://localhost:11434@attacker.example".into();
+        let dialog = Scripted::allow();
+        let (mut kc, mut audit) = (Keychain::default(), Vec::new());
+
+        let err = save(&state, inc, &dialog, &mut kc, &mut audit)
+            .await
+            .err()
+            .expect("userinfo is the S-02 bypass shape");
+        assert!(err.contains("user:password@"), "{err}");
+        assert_eq!(
+            dialog.times_asked(),
+            0,
+            "no point asking about an invalid value"
+        );
+        assert!(!state.path.exists());
+    }
+
+    #[tokio::test]
+    async fn plain_http_to_the_internet_asks_and_a_decline_changes_nothing() {
+        let (_d, state) = state_with(Settings::default());
+        let mut inc = Settings::default();
+        inc.ollama_base_url = "http://attacker.example:11434".into();
+        let dialog = Scripted::deny();
+        let (mut kc, mut audit) = (Keychain::default(), Vec::new());
+
+        let err = save(&state, inc, &dialog, &mut kc, &mut audit)
+            .await
+            .err()
+            .expect("declined");
+        assert_eq!(err, SAVE_DECLINED);
+        assert_eq!(dialog.times_asked(), 1);
+        assert_eq!(
+            state.settings.lock().unwrap().ollama_base_url,
+            "http://localhost:11434"
+        );
+    }
+
+    #[tokio::test]
+    async fn changing_the_ollama_server_removes_its_saved_token_from_the_keychain() {
+        let mut cur = Settings::default();
+        cur.ollama_base_url = "https://ollama.mine.example".into();
+        cur.ollama_api_key = Some("TOKEN-FOR-OLD-SERVER".into());
+        let (_d, state) = state_with(cur.clone());
+        let mut inc = redacted_for_renderer(&cur); // token field None = "unchanged"
+        inc.ollama_base_url = "https://attacker.example".into();
+        let dialog = Scripted::allow();
+        let (mut kc, mut audit) = (Keychain::default(), Vec::new());
+
+        save(&state, inc, &dialog, &mut kc, &mut audit)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            kc.dels,
+            vec![secret_store::keys::OLLAMA_API_KEY.to_string()]
+        );
+        assert!(state.settings.lock().unwrap().ollama_api_key.is_none());
+    }
+
+    /// Answers "allow" but, while the dialog is "open", lets another save land.
+    struct RacingDialog<'a> {
+        state: &'a SettingsState,
+    }
+
+    #[async_trait::async_trait]
+    impl NativeConfirm for RacingDialog<'_> {
+        async fn confirm(&self, _t: &str, _b: &str, _a: &str) -> bool {
+            self.state
+                .settings
+                .lock()
+                .unwrap()
+                .agent_autonomy
+                .agent_blocked_paths
+                .push("B/".into());
+            true
+        }
+    }
+
+    #[tokio::test]
+    async fn a_confirmation_does_not_cover_a_change_it_never_showed() {
+        let mut cur = Settings::default();
+        cur.agent_autonomy.agent_blocked_paths = vec!["A/".into()];
+        let (_d, state) = state_with(cur);
+        let mut inc = Settings::default();
+        inc.agent_autonomy.agent_blocked_paths = vec![]; // un-block A/ (shown)
+        let dialog = RacingDialog { state: &state };
+        let (mut kc, mut audit) = (Keychain::default(), Vec::new());
+
+        let err = save(&state, inc, &dialog, &mut kc, &mut audit)
+            .await
+            .err()
+            .expect("B/ was never shown");
+        assert!(err.contains("changed while"), "{err}");
+        // Nothing from the refused save was applied.
+        assert_eq!(
+            state
+                .settings
+                .lock()
+                .unwrap()
+                .agent_autonomy
+                .agent_blocked_paths,
+            vec!["A/".to_string(), "B/".to_string()]
+        );
     }
 }

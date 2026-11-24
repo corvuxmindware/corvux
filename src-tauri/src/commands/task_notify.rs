@@ -130,18 +130,8 @@ fn anchor_for(text: &str) -> String {
     // Strip leading whitespace; cap to a length that's unambiguous in
     // most roosts but not so long it hits the OS notification's
     // payload cap on Android.
-    let trimmed = text.trim_start();
-    let cap = 64usize;
-    if trimmed.len() <= cap {
-        trimmed.to_string()
-    } else {
-        // Cut at a char boundary so we never split a UTF-8 sequence.
-        let mut end = cap;
-        while end > 0 && !trimmed.is_char_boundary(end) {
-            end -= 1;
-        }
-        trimmed[..end].to_string()
-    }
+    // Cut at a char boundary so we never split a UTF-8 sequence.
+    crate::ai::tools::utf8_prefix(text.trim_start(), 64).to_string()
 }
 
 /// Platform-specific handle for an enrolled timer:

@@ -98,9 +98,9 @@ pub use registry::{SafetyTier, Tool, ToolError, ToolRegistry};
 pub use result::{emit_tool_result, SecretWarningEvent, ToolResult};
 #[allow(unused_imports)] // first consumers are the Default profile + chat.rs wiring
 pub use task::SubagentBundle;
-pub(crate) use truncate::utf8_prefix;
 #[allow(unused_imports)]
 pub use truncate::{truncate_tool_result, MAX_TOOL_RESULT_BYTES};
+pub(crate) use truncate::{truncate_utf8_with, utf8_prefix};
 
 /// Default registry — kept for callers that want every tool without
 /// caring about profiles. Internally just `AgentProfile::Default`'s
@@ -253,7 +253,7 @@ mod no_raw_fs_writes_test {
                 "graph.rs",
                 "let content = std::fs::read_to_string(abs_path)",
                 2,
-                "unused legacy index_roost_two_pass helper; active indexer uses RoostFs",
+                "test-only (#[cfg(test)]) index_roost_two_pass fixture; the shipped indexer uses RoostFs",
             ),
             (
                 "roost.rs",

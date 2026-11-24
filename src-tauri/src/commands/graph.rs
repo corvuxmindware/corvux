@@ -1706,7 +1706,15 @@ pub async fn get_graph_window(
 /// This is the only reliable way to resolve `[[shared-meals]]` when a roost
 /// contains many files with the same basename across daily folders — the
 /// resolver needs to see every candidate before it can pick the closest one.
-#[allow(dead_code)] // future bulk re-index entry point; kept beside the helper
+///
+/// TEST-ONLY (sharp-edges F6, 2026-11-11). This was `#[allow(dead_code)]`
+/// "future bulk re-index entry point": a complete raw-`std::fs` walker +
+/// reader sitting in `commands/`, one `git revert` away from reintroducing
+/// unchecked reads on desktop and a hard break on Android SAF. The shipped
+/// indexer goes through `RoostFs`; this remains only as the disk-backed
+/// fixture its tests round-trip through, where raw `std::fs` on a `TempDir`
+/// is fine and cannot reach production.
+#[cfg(test)]
 fn index_roost_two_pass(db: &DbInstance, roost_root: &str) -> Result<(), String> {
     let mut md_files: Vec<String> = Vec::new();
     collect_md_files(roost_root, &mut md_files)?;
@@ -1841,7 +1849,8 @@ pub async fn rebuild_database(
 
 /// Collect all `.md` files under the roost, recursing into subdirectories.
 /// Skips hidden entries (anything starting with `.`).
-#[allow(dead_code)] // companion to index_roost_two_pass; shares its lifecycle
+/// Test-only, like `index_roost_two_pass` (its only caller).
+#[cfg(test)]
 fn collect_md_files(dir: &str, out: &mut Vec<String>) -> Result<(), String> {
     let entries = std::fs::read_dir(dir).map_err(|e| format!("Read dir error: {e}"))?;
     for entry in entries.flatten() {

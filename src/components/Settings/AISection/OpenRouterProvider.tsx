@@ -15,6 +15,7 @@ import { For, Show, createSignal, onMount } from "solid-js";
 import { commands, unwrap } from "../../../lib/invoke";
 import type { ConnectionTestResult } from "../../../lib/bindings";
 import { errMsg } from "../../../lib/error";
+import { confirmDialog } from "../../../lib/confirm";
 import { settingsStore } from "../../../stores/settings";
 
 /** Curated suggestions for the picker; users can paste any
@@ -42,16 +43,6 @@ const OPENROUTER_MODELS: { id: string; label: string; hint: string }[] = [
   },
 ];
 
-/** Last-4 helper. Returns "•••" for keys shorter than 4 chars.
- *  Duplicated from index.tsx (also used by GeminiProvider); will
- *  consolidate in A3. */
-function last4(key: string | null | undefined): string {
-  if (!key) return "";
-  const trimmed = key.trim();
-  if (trimmed.length <= 4) return "•••";
-  return trimmed.slice(-4);
-}
-
 export default function OpenRouterProvider() {
   const [orKeyInput, setOrKeyInput] = createSignal("");
   const [orModelInput, setOrModelInput] = createSignal("");
@@ -61,15 +52,26 @@ export default function OpenRouterProvider() {
   const [orTest, setOrTest] = createSignal<ConnectionTestResult | null>(null);
   const [orSaveError, setOrSaveError] = createSignal<string | null>(null);
 
+  // The saved key never reaches the webview — only "is one saved?" does.
+  const hasSavedKey = () => settingsStore.keyStatus().openrouter;
+  // Test is meaningful with a typed key, or with a saved one (the backend
+  // falls back to the saved key when we send an empty string).
+  const canTest = () => orKeyInput().trim().length > 0 || hasSavedKey();
+
+  /** Saves the model, and the key too when one was typed. An empty key box
+   *  leaves the saved key alone (`null` = unchanged) — removing a key is the
+   *  explicit Remove action. */
   async function handleSaveOpenRouter() {
     const key = orKeyInput().trim();
     const model = orModelInput().trim() || "anthropic/claude-sonnet-4.6";
     setOrSaveError(null);
     try {
       await settingsStore.save({
-        openrouter_api_key: key || null,
+        ...(key ? { openrouter_api_key: key } : {}),
         openrouter_model: model,
       });
+      // Don't keep the key in the component once the backend has it.
+      setOrKeyInput("");
       setOrSaved(true);
       setEditingOR(false);
       setOrTest(null);
@@ -84,9 +86,8 @@ export default function OpenRouterProvider() {
     setOrTesting(true);
     setOrTest(null);
     try {
-      const candidate =
-        orKeyInput().trim() || (settingsStore.settings().openrouter_api_key ?? "");
-      const result = await unwrap(commands.testOpenrouterConnection(candidate));
+      // Empty input => `""` => the backend tests the SAVED key.
+      const result = await unwrap(commands.testOpenrouterConnection(orKeyInput().trim()));
       setOrTest(result);
     } catch (e) {
       const msg = errMsg(e);
@@ -101,11 +102,25 @@ export default function OpenRouterProvider() {
     }
   }
 
+  /** Delete the saved key. Sends `""` — `null` now means "leave it alone". */
+  async function handleRemoveKey() {
+    if (!(await confirmDialog("Remove the saved OpenRouter API key from this device?"))) return;
+    setOrSaveError(null);
+    try {
+      await settingsStore.save({ openrouter_api_key: "" });
+      setOrKeyInput("");
+      setEditingOR(false);
+      setOrTest(null);
+    } catch (e) {
+      setOrSaveError(errMsg(e));
+    }
+  }
+
   onMount(() => {
-    // Seed from current settings — parent's onMount already loaded them
-    // before we mounted (Show gates us on llm_provider === "openrouter").
+    // Seed the model from current settings — parent's onMount already loaded
+    // them before we mounted (Show gates us on llm_provider === "openrouter").
+    // The key box always starts empty: the saved key is never in the webview.
     const s = settingsStore.settings();
-    if (s.openrouter_api_key) setOrKeyInput(s.openrouter_api_key);
     setOrModelInput(s.openrouter_model || "anthropic/claude-sonnet-4.6");
   });
 
@@ -115,15 +130,12 @@ export default function OpenRouterProvider() {
         <label class="text-text-primary text-sm block mb-1">OpenRouter API Key</label>
 
         <Show
-          when={
-            !editingOR() &&
-            (settingsStore.settings().openrouter_api_key ?? "").length > 0
-          }
+          when={!editingOR() && hasSavedKey()}
           fallback={
             <div class="flex gap-2">
               <input
                 type="password"
-                placeholder="sk-or-v1-..."
+                placeholder={hasSavedKey() ? "Paste a new key to replace the saved one" : "sk-or-v1-..."}
                 value={orKeyInput()}
                 onInput={(e) => setOrKeyInput(e.currentTarget.value)}
                 onKeyDown={(e) => {
@@ -133,18 +145,30 @@ export default function OpenRouterProvider() {
               />
               <button
                 onClick={handleSaveOpenRouter}
-                class="px-4 py-2 bg-accent text-bg-primary rounded-lg text-sm font-medium hover:opacity-90 transition-opacity"
+                disabled={!orKeyInput().trim()}
+                class="px-4 py-2 bg-accent text-bg-primary rounded-lg text-sm font-medium hover:opacity-90 disabled:opacity-50 disabled:cursor-not-allowed transition-opacity"
               >
                 Save
               </button>
               <button
                 onClick={handleTestOpenRouter}
-                disabled={orTesting()}
-                class="px-3 py-2 border border-border bg-bg-secondary text-text-primary rounded-lg text-sm hover:bg-bg-hover disabled:opacity-50 disabled:cursor-wait transition-colors"
+                disabled={orTesting() || !canTest()}
+                class="px-3 py-2 border border-border bg-bg-secondary text-text-primary rounded-lg text-sm hover:bg-bg-hover disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
                 title="Verify the key against OpenRouter's models endpoint"
               >
                 {orTesting() ? "Testing…" : "Test"}
               </button>
+              <Show when={editingOR()}>
+                <button
+                  onClick={() => {
+                    setOrKeyInput("");
+                    setEditingOR(false);
+                  }}
+                  class="px-3 py-2 border border-border bg-bg-secondary text-text-secondary rounded-lg text-sm hover:bg-bg-hover transition-colors"
+                >
+                  Cancel
+                </button>
+              </Show>
             </div>
           }
         >
@@ -164,20 +188,18 @@ export default function OpenRouterProvider() {
               <path d="M20 6L9 17l-5-5" />
             </svg>
             <span class="flex-1 text-sm text-text-primary truncate min-w-0">
-              Saved · ends in{" "}
-              <span class="font-mono text-text-secondary">
-                •••{last4(settingsStore.settings().openrouter_api_key)}
-              </span>
+              Key saved
             </span>
             <button
               onClick={() => {
-                setOrKeyInput(settingsStore.settings().openrouter_api_key ?? "");
+                // Start empty — the saved key can't be shown or prefilled.
+                setOrKeyInput("");
                 setEditingOR(true);
                 setOrTest(null);
               }}
               class="px-2 py-1 text-xs rounded border border-border text-text-secondary hover:bg-bg-hover hover:text-text-primary transition-colors"
             >
-              Edit
+              Replace
             </button>
             <button
               onClick={handleTestOpenRouter}
@@ -185,6 +207,12 @@ export default function OpenRouterProvider() {
               class="px-2 py-1 text-xs rounded border border-border text-text-secondary hover:bg-bg-hover hover:text-text-primary disabled:opacity-50 disabled:cursor-wait transition-colors"
             >
               {orTesting() ? "Testing…" : "Test"}
+            </button>
+            <button
+              onClick={() => void handleRemoveKey()}
+              class="px-2 py-1 text-xs rounded border border-border text-text-secondary hover:bg-bg-hover hover:text-red transition-colors"
+            >
+              Remove
             </button>
           </div>
         </Show>
@@ -234,19 +262,21 @@ export default function OpenRouterProvider() {
         </Show>
 
         {/* Structural validator — catches paste-truncation and missing
-            prefix before paying a network round-trip. */}
+            prefix before paying a network round-trip. It checks the key being
+            TYPED: the saved key is never in the webview, so it can't be
+            re-checked after the fact. */}
         {(() => {
-          const saved = settingsStore.settings().openrouter_api_key ?? "";
-          if (!saved) return null;
-          const looksValid = /^sk-or-v1-[a-zA-Z0-9_-]{40,}$/.test(saved);
+          const typed = orKeyInput().trim();
+          if (!typed) return null;
+          const looksValid = /^sk-or-v1-[a-zA-Z0-9_-]{40,}$/.test(typed);
           if (looksValid) return null;
           return (
             <div class="mt-1.5 text-xs text-red-400">
-              Saved key is {saved.length} chars and{" "}
-              {saved.startsWith("sk-or-v1-")
+              This key is {typed.length} chars and{" "}
+              {typed.startsWith("sk-or-v1-")
                 ? "looks too short."
                 : "is missing the `sk-or-v1-` prefix."}{" "}
-              Re-paste the FULL key from openrouter.ai/keys.
+              Paste the FULL key from openrouter.ai/keys.
             </div>
           );
         })()}

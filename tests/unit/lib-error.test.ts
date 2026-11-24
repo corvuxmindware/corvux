@@ -8,7 +8,7 @@
  */
 
 import { describe, it, expect } from "vitest";
-import { errMsg } from "../../src/lib/error";
+import { errMsg, isSecurityCancel } from "../../src/lib/error";
 
 describe("errMsg", () => {
   it("returns the message of a native Error", () => {
@@ -49,5 +49,43 @@ describe("errMsg", () => {
 
   it("handles thrown objects with toString", () => {
     expect(errMsg({ toString: () => "obj-str" })).toBe("obj-str");
+  });
+});
+
+describe("isSecurityCancel", () => {
+  // The exact sentences the backend uses when the user says "no" in a native
+  // OS confirmation dialog.
+  const DECLINES = [
+    "Not saved: the security confirmation was cancelled, so nothing was changed.",
+    "Not trusted: the confirmation was cancelled, so the host was not pinned.",
+    "Roost removal was cancelled.",
+  ];
+
+  it("recognises every backend decline message", () => {
+    for (const msg of DECLINES) expect(isSecurityCancel(msg), msg).toBe(true);
+  });
+
+  it("recognises a decline wrapped in an Error or an 'Error: ' prefix", () => {
+    expect(isSecurityCancel(new Error(DECLINES[0]))).toBe(true);
+    expect(isSecurityCancel(`Error: ${DECLINES[2]}`)).toBe(true);
+  });
+
+  it("is case-insensitive", () => {
+    expect(isSecurityCancel("NOT SAVED: THE SECURITY CONFIRMATION WAS CANCELLED")).toBe(true);
+  });
+
+  it("does not hide real failures", () => {
+    expect(
+      isSecurityCancel("The Ollama server address must use https:// for a non-local host"),
+    ).toBe(false);
+    expect(isSecurityCancel("Lock error: poisoned")).toBe(false);
+    expect(isSecurityCancel("Couldn't delete local index: access denied")).toBe(false);
+    expect(isSecurityCancel("Add roost cancelled")).toBe(false);
+  });
+
+  it("is false for non-error values", () => {
+    expect(isSecurityCancel(null)).toBe(false);
+    expect(isSecurityCancel(undefined)).toBe(false);
+    expect(isSecurityCancel(42)).toBe(false);
   });
 });
