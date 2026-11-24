@@ -26,50 +26,6 @@ where
     .map_err(|error| std::io::Error::other(format!("sync storage task failed: {error}")))?
 }
 
-#[cfg(test)]
-mod storage_task_tests {
-    use super::*;
-    use std::sync::Arc;
-    use std::time::Duration;
-
-    #[tokio::test]
-    async fn cancelled_waiter_keeps_reset_barrier_until_storage_job_finishes() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = Arc::new(tokio::sync::Mutex::new(
-            crate::sync::store::doc_store::DocStore::new(
-                dir.path().to_path_buf(),
-                crate::sync::identity::DeviceId([1; 16]),
-            ),
-        ));
-        let locks = Arc::new(super::super::note_locks::NoteLocks::new());
-        let guard = Arc::new(
-            locks
-                .lock(&crate::sync::protocol::NotePath("note.md".into()))
-                .await,
-        );
-        let (started, ready) = tokio::sync::oneshot::channel();
-        let (release, wait) = std::sync::mpsc::channel();
-        let task = tokio::spawn(store_task(store, guard, move |_| {
-            let _ = started.send(());
-            wait.recv_timeout(Duration::from_secs(2))
-                .map_err(|e| std::io::Error::other(e.to_string()))?;
-            Ok(())
-        }));
-        ready.await.unwrap();
-        task.abort();
-        let _ = task.await;
-        let mut reset = tokio::spawn(async move { locks.block_all().await });
-        assert!(tokio::time::timeout(Duration::from_millis(25), &mut reset)
-            .await
-            .is_err());
-        release.send(()).unwrap();
-        let _guard = tokio::time::timeout(Duration::from_secs(1), reset)
-            .await
-            .unwrap()
-            .unwrap();
-    }
-}
-
 pub(super) fn now_millis() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -131,11 +87,55 @@ pub(super) fn clone_handle(handle: &PeerHandle) -> PeerHandle {
     PeerHandle {
         device_id: handle.device_id,
         display_name: handle.display_name.clone(),
-        queue_pair_key: handle.queue_pair_key,
+        queue_pair_key: handle.queue_pair_key.clone(),
         peer_vault_id: handle.peer_vault_id,
         control: handle.control_clone(),
         generation: handle.generation,
         peer_reconnect: handle.peer_reconnect.clone(),
-        resumption_token: handle.resumption_token,
+        resumption_token: handle.resumption_token.clone(),
+    }
+}
+
+#[cfg(test)]
+mod storage_task_tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn cancelled_waiter_keeps_reset_barrier_until_storage_job_finishes() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(tokio::sync::Mutex::new(
+            crate::sync::store::doc_store::DocStore::new(
+                dir.path().to_path_buf(),
+                crate::sync::identity::DeviceId([1; 16]),
+            ),
+        ));
+        let locks = Arc::new(super::super::note_locks::NoteLocks::new());
+        let guard = Arc::new(
+            locks
+                .lock(&crate::sync::protocol::NotePath("note.md".into()))
+                .await,
+        );
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let (release, wait) = std::sync::mpsc::channel();
+        let task = tokio::spawn(store_task(store, guard, move |_| {
+            let _ = started.send(());
+            wait.recv_timeout(Duration::from_secs(2))
+                .map_err(|e| std::io::Error::other(e.to_string()))?;
+            Ok(())
+        }));
+        ready.await.unwrap();
+        task.abort();
+        let _ = task.await;
+        let mut reset = tokio::spawn(async move { locks.block_all().await });
+        assert!(tokio::time::timeout(Duration::from_millis(25), &mut reset)
+            .await
+            .is_err());
+        release.send(()).unwrap();
+        let _guard = tokio::time::timeout(Duration::from_secs(1), reset)
+            .await
+            .unwrap()
+            .unwrap();
     }
 }

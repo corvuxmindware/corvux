@@ -278,7 +278,7 @@ impl SyncEngine {
     ///
     /// Errors if the iroh listener hasn't been started — caller should
     /// invoke `start_listening_iroh` first.
-    pub async fn iroh_pairing_ticket(&self) -> SyncResult<String> {
+    pub async fn iroh_pairing_ticket(&self) -> SyncResult<crate::sensitive::SecretString> {
         let endpoint = {
             let guard = self.inner.iroh_listen_state.lock().await;
             guard
@@ -325,7 +325,12 @@ impl SyncEngine {
     /// `iroh_listen_state` and re-derives the ticket from the current endpoint,
     /// so the offer always reflects our *present* address — this is what lets a
     /// peer's stored ticket for us stay fresh across our address changes.
-    pub(super) async fn build_own_reconnect_offer(&self) -> Option<(String, String)> {
+    pub(super) async fn build_own_reconnect_offer(
+        &self,
+    ) -> Option<(
+        crate::sensitive::SecretString,
+        crate::sensitive::SecretString,
+    )> {
         // Snapshot the current hosting PIN and confirm the accept loop is live.
         // Scope the guard so it's dropped before `iroh_pairing_ticket` (which
         // re-locks `iroh_listen_state`) — holding it across that call would
@@ -337,7 +342,7 @@ impl SyncEngine {
                 return None;
             }
             let pin = state.incoming_pin.read().await;
-            pin.as_str().to_string()
+            crate::sensitive::SecretString::from(pin.as_str())
         };
         match self.iroh_pairing_ticket().await {
             Ok(ticket) => Some((ticket, pin_str)),
@@ -369,7 +374,7 @@ impl SyncEngine {
         pin: Pin,
         pinned: Fingerprint,
     ) -> SyncResult<DeviceId> {
-        let pin_str = pin.as_str().to_string();
+        let pin_str = crate::sensitive::SecretString::from(pin.as_str());
 
         // The dial is always against a known fingerprint now (AUDIT-003b),
         // so the corresponding device_id is in peer_store. Attach the
@@ -450,7 +455,7 @@ impl SyncEngine {
         };
         let peer_device = handle.device_id;
         let peer_name = handle.display_name.clone();
-        let queue_pair_key = handle.queue_pair_key;
+        let queue_pair_key = handle.queue_pair_key.clone();
         let peer_vault_id = handle.peer_vault_id;
         // AUDIT-015: client-side mirror of the accept-side check. Same peer
         // device, different roost id since first pair → drop.
@@ -530,8 +535,11 @@ impl SyncEngine {
         &self,
         peer: NodeAddr,
         pin: Pin,
-        reconnect_offer: Option<(String, String)>,
-        resumption_token: Option<[u8; 32]>,
+        reconnect_offer: Option<(
+            crate::sensitive::SecretString,
+            crate::sensitive::SecretString,
+        )>,
+        resumption_token: Option<crate::sensitive::SecretBytes>,
         pairing_secret: Option<crate::sync::crypto::pairing::PairingSecret>,
     ) -> SyncResult<DeviceId> {
         // Bail if the engine was stopped (roost switch / shutdown): a redial
@@ -649,7 +657,7 @@ impl SyncEngine {
         }
         // SEC-2: if we hold a resumption token for this peer, authenticate with
         // it (reconnect) rather than re-proving the human PIN.
-        if let Some(tok) = resumption_token {
+        if let Some(tok) = resumption_token.clone() {
             handshake = handshake.with_resumption_token(tok);
         }
         // SRX layer 3: on a first pair, bind the one-time secret we extracted
@@ -701,13 +709,13 @@ impl SyncEngine {
         };
         let peer_device = handle.device_id;
         let peer_name = handle.display_name.clone();
-        let queue_pair_key = handle.queue_pair_key;
+        let queue_pair_key = handle.queue_pair_key.clone();
         let peer_vault_id = handle.peer_vault_id;
         // SEC-2: on a FIRST pair (we authenticated via PIN — no token was
         // supplied) persist the derived resumption token for future reconnects.
         // A token-authenticated reconnect keeps the existing one.
         let store_resumption_token = resumption_token.is_none();
-        let derived_resumption_token = handle.resumption_token;
+        let derived_resumption_token = handle.resumption_token.clone();
         // AUDIT-081: weld the peer's self-asserted handshake device_id to
         // the iroh NodeId that QUIC authenticated (rationale + shared check
         // in transport::iroh::verify_node_device_binding). A mismatch means
@@ -1079,11 +1087,12 @@ impl SyncEngine {
     /// caller resolved a fingerprint that isn't in `peer_store` (rare —
     /// e.g. cross-process race between unpair and reconnect).
     async fn expected_device_for_fingerprint(&self, pinned: Fingerprint) -> Option<DeviceId> {
+        use subtle::ConstantTimeEq;
         let store = self.inner.peer_store.lock().await;
         store
             .list()
             .into_iter()
-            .find(|r| r.fingerprint == pinned.0)
+            .find(|r| bool::from(r.fingerprint.ct_eq(&pinned.0)))
             .map(|r| DeviceId(r.device_id))
     }
 

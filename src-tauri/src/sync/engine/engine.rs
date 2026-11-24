@@ -1960,7 +1960,7 @@ mod tests {
             let mut ps = a.inner.peer_store.lock().await;
             ps.upsert(PeerRecord::new(b_device, [0xBB; 32], "phone".into()))
                 .unwrap();
-            ps.remember_queue_pair(b_device, Some([0xCD; 32]), Some([0xEF; 32]))
+            ps.remember_queue_pair(b_device, Some([0xCD; 32]), Some([0xEF; 32].into()))
                 .unwrap();
             ps.remember_peer_vault_id(b_device, [0xBB; 16]).unwrap();
         }
@@ -2004,7 +2004,7 @@ mod tests {
             ps.upsert(PeerRecord::new(b_device, [0xBB; 32], "phone".into()))
                 .unwrap();
             // NodeId + pair key, but deliberately NO pinned peer vault id.
-            ps.remember_queue_pair(b_device, Some([0xCD; 32]), Some([0xEF; 32]))
+            ps.remember_queue_pair(b_device, Some([0xCD; 32]), Some([0xEF; 32].into()))
                 .unwrap();
             assert!(ps.get(b_device).unwrap().queue_route().is_none());
         }
@@ -2042,7 +2042,7 @@ mod tests {
             let mut ps = a.inner.peer_store.lock().await;
             ps.upsert(PeerRecord::new(b_device, [0xBB; 32], "phone".into()))
                 .unwrap();
-            ps.remember_queue_pair(b_device, Some([0xCD; 32]), Some([0xEF; 32]))
+            ps.remember_queue_pair(b_device, Some([0xCD; 32]), Some([0xEF; 32].into()))
                 .unwrap();
             ps.remember_peer_vault_id(b_device, [0xBB; 16]).unwrap();
         }
@@ -2692,12 +2692,12 @@ mod tests {
             PeerHandle {
                 device_id: device,
                 display_name: name.into(),
-                queue_pair_key: [0u8; 32],
+                queue_pair_key: [0u8; 32].into(),
                 peer_vault_id: [0u8; 16],
                 control: tx,
                 generation: 0,
                 peer_reconnect: None,
-                resumption_token: [0u8; 32],
+                resumption_token: [0u8; 32].into(),
             },
             rx,
         )
@@ -3455,7 +3455,7 @@ mod tests {
             if let Ok(ticket) = engine.iroh_pairing_ticket().await {
                 if let Ok(addr) = crate::sync::transport::iroh::decode_ticket(&ticket) {
                     if addr.ip_addrs().next().is_some() {
-                        return ticket;
+                        return ticket.to_string();
                     }
                 }
             }
@@ -3681,7 +3681,7 @@ mod tests {
             .peer_store
             .lock()
             .await
-            .remember_connection(b_device, Some(ticket), Some(pin.as_str().to_string()))
+            .remember_connection(b_device, Some(ticket), Some(pin.as_str().into()))
             .unwrap();
         let a_device = a.identity().device_id();
 
@@ -3804,7 +3804,7 @@ mod tests {
             .peer_store
             .lock()
             .await
-            .remember_connection(b_device, Some(ticket), Some(pin.as_str().to_string()))
+            .remember_connection(b_device, Some(ticket), Some(pin.as_str().into()))
             .unwrap();
 
         // Abort almost immediately — the 60-note FullDoc backfill cannot

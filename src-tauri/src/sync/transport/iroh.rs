@@ -197,8 +197,9 @@ impl IrohTransport {
 #[async_trait]
 impl Transport for IrohTransport {
     async fn send(&mut self, msg: &Message) -> Result<(), TransportError> {
-        let bytes =
-            protocol::encode(msg).map_err(|e| TransportError::Iroh(format!("encode: {e}")))?;
+        let bytes = zeroize::Zeroizing::new(
+            protocol::encode(msg).map_err(|e| TransportError::Iroh(format!("encode: {e}")))?,
+        );
         write_frame(&mut self.send, PROTOCOL_VERSION, &bytes).await
     }
 
@@ -346,7 +347,7 @@ struct TicketWire {
     /// on non-QR listeners that never minted one. `#[serde(default)]` keeps old
     /// tickets decodable and old decoders tolerant of the new field.
     #[serde(default)]
-    s: Option<String>,
+    s: Option<crate::sensitive::SecretString>,
 }
 
 /// Encode a `NodeAddr` to the pairing-ticket string format, optionally carrying
@@ -354,7 +355,7 @@ struct TicketWire {
 pub fn encode_ticket(
     addr: &NodeAddr,
     secret: Option<&crate::sync::crypto::pairing::PairingSecret>,
-) -> Result<String, TransportError> {
+) -> Result<crate::sensitive::SecretString, TransportError> {
     use base64::Engine;
     // iroh 1.x EndpointAddr fields/methods used here:
     //   .id          — EndpointId (field)
@@ -368,10 +369,14 @@ pub fn encode_ticket(
         r: addr.relay_urls().next().map(|u| u.to_string()),
         s: secret.map(|sec| sec.to_b64()),
     };
-    let json = serde_json::to_string(&wire)
-        .map_err(|e| TransportError::Iroh(format!("ticket encode: {e}")))?;
-    let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(json.as_bytes());
-    Ok(format!("corvux1:{encoded}"))
+    let json = zeroize::Zeroizing::new(
+        serde_json::to_string(&wire)
+            .map_err(|e| TransportError::Iroh(format!("ticket encode: {e}")))?,
+    );
+    let encoded = zeroize::Zeroizing::new(
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(json.as_bytes()),
+    );
+    Ok(format!("corvux1:{}", &*encoded).into())
 }
 
 /// SRX layer 3: extract just the one-time [`PairingSecret`] from a ticket, if it
@@ -383,9 +388,11 @@ pub fn decode_ticket_secret(s: &str) -> Option<crate::sync::crypto::pairing::Pai
     use base64::Engine;
     let s = s.trim();
     let body = s.strip_prefix("corvux1:")?;
-    let json = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(body.as_bytes())
-        .ok()?;
+    let json = zeroize::Zeroizing::new(
+        base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(body.as_bytes())
+            .ok()?,
+    );
     let wire: TicketWire = serde_json::from_slice(&json).ok()?;
     wire.s
         .as_deref()
@@ -416,9 +423,11 @@ pub fn decode_ticket(s: &str) -> Result<NodeAddr, TransportError> {
     }
 
     let body = &s["corvux1:".len()..];
-    let json = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(body.as_bytes())
-        .map_err(|e| TransportError::Iroh(format!("ticket b64: {e}")))?;
+    let json = zeroize::Zeroizing::new(
+        base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(body.as_bytes())
+            .map_err(|e| TransportError::Iroh(format!("ticket b64: {e}")))?,
+    );
     let wire: TicketWire = serde_json::from_slice(&json)
         .map_err(|e| TransportError::Iroh(format!("ticket json: {e}")))?;
 

@@ -83,7 +83,9 @@ pub struct LlamaCppModel {
 // inference lock, and the rest is read-only by construction. Any future
 // API addition that takes `&mut self` or bypasses `inference_lock` must
 // re-audit this invariant before the unsafe impls remain sound.
+// SAFETY: inference_lock serializes all C++ mutation; see invariants above.
 unsafe impl Send for LlamaCppModel {}
+// SAFETY: shared access uses the same inference_lock and immutable backend.
 unsafe impl Sync for LlamaCppModel {}
 
 impl LlamaCppModel {

@@ -73,7 +73,9 @@ pub async fn write_frame<W: AsyncWrite + Unpin>(
 
 /// Read one frame from the stream. Returns `(version, payload_bytes)`.
 /// Guarantees payload.len() <= MAX_FRAME_BYTES - 2.
-pub async fn read_frame<R: AsyncRead + Unpin>(mut r: R) -> Result<(u16, Vec<u8>), TransportError> {
+pub async fn read_frame<R: AsyncRead + Unpin>(
+    mut r: R,
+) -> Result<(u16, zeroize::Zeroizing<Vec<u8>>), TransportError> {
     let len = r.read_u32().await.map_err(|e| {
         // A clean EOF shows up as `UnexpectedEof`; surface as `Closed` so
         // the engine can distinguish "peer left" from real I/O failure.
@@ -92,7 +94,7 @@ pub async fn read_frame<R: AsyncRead + Unpin>(mut r: R) -> Result<(u16, Vec<u8>)
     }
     let version = r.read_u16().await?;
     let payload_len = (len - 2) as usize;
-    let mut buf = vec![0u8; payload_len];
+    let mut buf = zeroize::Zeroizing::new(vec![0u8; payload_len]);
     r.read_exact(&mut buf).await?;
     Ok((version, buf))
 }
@@ -116,7 +118,7 @@ mod tests {
 
         let (ver, payload) = read_frame(&mut a_r).await.unwrap();
         assert_eq!(ver, PROTOCOL_VERSION);
-        assert_eq!(payload, b"hello");
+        assert_eq!(payload.as_slice(), b"hello");
         drop(a_w);
     }
 

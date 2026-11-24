@@ -149,7 +149,7 @@ impl Identity {
     }
 
     fn load(path: &Path) -> SyncResult<Self> {
-        let bytes = fs::read(path)?;
+        let bytes = zeroize::Zeroizing::new(fs::read(path)?);
         let disk: DiskIdentity =
             postcard::from_bytes(&bytes).map_err(|_| IdentityError::Corrupt)?;
         if disk.version != IDENTITY_VERSION {
@@ -169,8 +169,7 @@ impl Identity {
         let device_id = DeviceId::from_pubkey(&verifying_key);
         // Scrub the signing-key bytes we decoded; the `SigningKey` holds its
         // own copy internally.
-        let mut zero = disk.signing_key;
-        zero.zeroize();
+        // DiskIdentity wipes its decoded signing key on every exit, including errors.
         Ok(Self {
             signing_key,
             verifying_key,
@@ -184,7 +183,9 @@ impl Identity {
             signing_key: self.signing_key.to_bytes(),
             verifying_key: self.verifying_key.to_bytes(),
         };
-        let bytes = postcard::to_allocvec(&disk).map_err(|_| IdentityError::Corrupt)?;
+        let bytes = zeroize::Zeroizing::new(
+            postcard::to_allocvec(&disk).map_err(|_| IdentityError::Corrupt)?,
+        );
         // Atomic write: temp file + rename. Identity loss is catastrophic
         // (orphans all history), so we accept the extra syscall.
         let tmp = path.with_extension("bin.tmp");
@@ -208,6 +209,12 @@ struct DiskIdentity {
     version: u16,
     signing_key: [u8; 32],
     verifying_key: [u8; 32],
+}
+
+impl Drop for DiskIdentity {
+    fn drop(&mut self) {
+        self.signing_key.zeroize();
+    }
 }
 
 #[cfg(test)]

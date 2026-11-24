@@ -150,7 +150,7 @@ impl SyncEngine {
                         Ok(d) => d,
                         Err(e) => {
                             warn!(error = %e, note = %note, "scan_roost: seed_from_markdown failed");
-                            return Err(e.into());
+                            return Err(e);
                         }
                     }
                 };
@@ -167,12 +167,12 @@ impl SyncEngine {
                     Ok(false) => {}
                     Err(e) => {
                         warn!(error = %e, note = %note, "scan_roost: is_deleted check failed");
-                        return Err(e.into());
+                        return Err(e);
                     }
                 }
                 if let Err(e) = doc.apply_markdown(&text) {
                     warn!(error = %e, note = %note, "scan_roost: apply_markdown failed");
-                    return Err(e.into());
+                    return Err(e);
                 }
                 if let Err(e) = store.save(&note, &mut doc) {
                     warn!(error = %e, note = %note, "scan_roost: save failed");

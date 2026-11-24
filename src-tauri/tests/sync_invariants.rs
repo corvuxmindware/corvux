@@ -222,7 +222,8 @@ fn syn_i1_no_new_raw_fs_on_sync_surface() {
     // resolve_fs → RoostFs. The entries below are legitimate APP-PRIVATE state
     // (app_data_dir, never the roost).
     let baseline: BTreeMap<&str, usize> = BTreeMap::from([
-        ("src/commands/sync.rs", 8), // APP-PRIVATE — prefs.json + tls.bin under app_data_dir/sync
+        // Shared atomic preference persistence removed the local write + rename.
+        ("src/commands/sync.rs", 6), // APP-PRIVATE — prefs.json + tls.bin under app_data_dir/sync
         ("src/sync/engine/engine.rs", 1), // APP-PRIVATE — DocStore/PeerStore state_dir (never the roost)
     ]);
     run_ratchet(

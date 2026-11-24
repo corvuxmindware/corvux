@@ -683,26 +683,15 @@ mod tests {
     fn enabled_via_env_reads_var() {
         let key = ENV_VAR;
         let prior = std::env::var(key).ok();
-        // SAFETY: tests in Rust 1.95 mark set_var as unsafe because it
-        // mutates a process-wide value. We accept it for this single
-        // test and restore the prior value after.
-        unsafe {
-            std::env::set_var(key, "1");
-        }
+        // Edition 2021 exposes these as safe functions; restore the test override.
+        std::env::set_var(key, "1");
         assert!(RecordingProvider::<tauri::Wry>::enabled_via_env());
-        unsafe {
-            std::env::set_var(key, "0");
-        }
+        std::env::set_var(key, "0");
         assert!(!RecordingProvider::<tauri::Wry>::enabled_via_env());
-        unsafe {
-            std::env::remove_var(key);
-        }
+        std::env::remove_var(key);
         assert!(!RecordingProvider::<tauri::Wry>::enabled_via_env());
-        // Restore.
         if let Some(v) = prior {
-            unsafe {
-                std::env::set_var(key, v);
-            }
+            std::env::set_var(key, v);
         }
     }
 }

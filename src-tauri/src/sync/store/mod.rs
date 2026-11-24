@@ -110,7 +110,7 @@ pub fn to_note_path(roost: &Path, abs: &Path) -> Result<NotePath, StoreError> {
                 // (reserved device name, reserved char, trailing/leading dot or
                 // space). No-op off Windows, where such names are legal.
                 #[cfg(windows)]
-                if is_windows_unsafe_component(&s) {
+                if is_windows_unsafe_component(s) {
                     return Err(StoreError::InvalidPath(s.into()));
                 }
                 parts.push(s.to_owned());

@@ -153,7 +153,7 @@ async fn handle_iroh_incoming(
     // misses). Built under the same store lock as the resumption tokens.
     let mut resumption_tokens: std::collections::HashMap<
         crate::sync::identity::DeviceId,
-        [u8; 32],
+        crate::sensitive::SecretBytes,
     > = std::collections::HashMap::new();
     let mut expected_peer_vault_ids: std::collections::HashMap<
         crate::sync::identity::DeviceId,
@@ -172,7 +172,7 @@ async fn handle_iroh_incoming(
     {
         let store = engine.peer_store_lock().await;
         for r in store.list() {
-            if let Some(t) = r.resumption_token {
+            if let Some(t) = r.resumption_token.clone() {
                 resumption_tokens.insert(r.device(), t);
             }
             if let Some(v) = r.peer_vault_id {
@@ -222,7 +222,7 @@ async fn handle_iroh_incoming(
     .await?;
     let peer_device = handle.device_id;
     let peer_name = handle.display_name.clone();
-    let queue_pair_key = handle.queue_pair_key;
+    let queue_pair_key = handle.queue_pair_key.clone();
     let peer_vault_id = handle.peer_vault_id;
     // Symmetric pairing: the dialer may have offered its own redial
     // credentials in the handshake so WE (the host) can dial it back after a
@@ -232,7 +232,7 @@ async fn handle_iroh_incoming(
     // freshly-derived resumption token; a reconnect already had one and must
     // not overwrite it.
     let is_first_pair = !resumption_tokens.contains_key(&peer_device);
-    let resumption_token = handle.resumption_token;
+    let resumption_token = handle.resumption_token.clone();
     // AUDIT-081: weld the peer's self-asserted handshake device_id to the
     // iroh NodeId QUIC authenticated (rationale + shared check in
     // transport::iroh::verify_node_device_binding). Reject a mismatch before
@@ -295,7 +295,9 @@ async fn handle_iroh_incoming(
         // reconnect, so a host restart left the link down until the dialer
         // happened to redial).
         if let Some((ticket, pin)) = peer_reconnect {
-            if let Err(e) = store.remember_connection(peer_device, Some(ticket), Some(pin)) {
+            if let Err(e) =
+                store.remember_connection(peer_device, Some(ticket.to_string()), Some(pin))
+            {
                 tracing::warn!(error = %e, "accept: failed to persist peer redial credentials");
             }
         }
@@ -350,7 +352,7 @@ async fn handle_incoming(
     .await?;
     let peer_device = handle.device_id;
     let peer_name = handle.display_name.clone();
-    let queue_pair_key = handle.queue_pair_key;
+    let queue_pair_key = handle.queue_pair_key.clone();
     let peer_vault_id = handle.peer_vault_id;
     {
         let store = engine.peer_store_lock().await;

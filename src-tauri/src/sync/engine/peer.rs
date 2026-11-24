@@ -132,7 +132,7 @@ pub struct PeerHandle {
     /// encrypt without a fresh handshake. Zeroed copy of the buffer
     /// stays in the running peer task; this one is for the engine's
     /// one-time persistence on connect.
-    pub queue_pair_key: [u8; 32],
+    pub queue_pair_key: crate::sensitive::SecretBytes,
     /// AUDIT-015: peer's roost id from the just-completed handshake.
     /// Engine persists this with the `PeerRecord` so the next handshake
     /// from this device can be validated against the same roost.
@@ -148,12 +148,15 @@ pub struct PeerHandle {
     /// Symmetric pairing: the dialer's offered redial credentials (ticket,
     /// pin), populated on the SERVER/accept side so the engine can persist
     /// them and dial the dialer back. `None` on the dialer side / legacy.
-    pub peer_reconnect: Option<(String, String)>,
+    pub peer_reconnect: Option<(
+        crate::sensitive::SecretString,
+        crate::sensitive::SecretString,
+    )>,
     /// SEC-2: the resumption token derived from this handshake's session. The
     /// engine persists it ONLY after a first pair (see peer_store); on
     /// reconnect it's re-derived here but must not be stored (would differ from
     /// the first-pair value both sides agreed on).
-    pub resumption_token: [u8; 32],
+    pub resumption_token: crate::sensitive::SecretBytes,
 }
 
 impl PeerHandle {
@@ -283,7 +286,7 @@ where
     // are re-wrapped via `from_derived_bytes` at the cipher boundary
     // (see queue_ops.rs).
     let queue_pair_key_wrapped = derive_subkey(&session, b"corvux-queue-pair-v1")?;
-    let queue_pair_key: [u8; 32] = *queue_pair_key_wrapped.expose();
+    let queue_pair_key = crate::sensitive::SecretBytes::from(*queue_pair_key_wrapped.expose());
     drop(queue_pair_key_wrapped);
     // SEC-2: derive the per-peer resumption token the same way (off the same
     // shared `SessionSecret`, so both ends compute identical bytes without
@@ -294,7 +297,7 @@ where
         &session,
         crate::sync::crypto::pairing::RESUMPTION_TOKEN_LABEL,
     )?;
-    let resumption_token: [u8; 32] = *resumption_token_wrapped.expose();
+    let resumption_token = crate::sensitive::SecretBytes::from(*resumption_token_wrapped.expose());
     drop(resumption_token_wrapped);
     drop(session); // Subkeys + cipher already captured; scrub the master.
     let encrypted_transport = EncryptedTransport::new(transport, cipher, is_client);
@@ -379,7 +382,10 @@ async fn run_handshake<T: Transport>(
     String,
     SessionSecret,
     [u8; 16],
-    Option<(String, String)>,
+    Option<(
+        crate::sensitive::SecretString,
+        crate::sensitive::SecretString,
+    )>,
 )> {
     match role {
         Role::Client { mut handshake } => {
@@ -2792,12 +2798,12 @@ mod tests {
         let handle = PeerHandle {
             device_id: dev(9),
             display_name: "wedged".into(),
-            queue_pair_key: [0u8; 32],
+            queue_pair_key: [0u8; 32].into(),
             peer_vault_id: [0u8; 16],
             control: tx,
             generation: 0,
             peer_reconnect: None,
-            resumption_token: [0u8; 32],
+            resumption_token: [0u8; 32].into(),
         };
         // Fill the single buffered slot.
         handle

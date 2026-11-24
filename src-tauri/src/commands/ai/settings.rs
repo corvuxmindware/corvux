@@ -43,11 +43,11 @@ pub fn get_settings(state: State<'_, SettingsState>) -> Result<Settings, String>
 /// platform without a keychain (in which case the caller never strips,
 /// see `take_provider_keys`).
 struct ProviderKeys {
-    gemini: Option<String>,
-    openrouter: Option<String>,
-    ollama: Option<String>,
-    openai: Option<String>,
-    anthropic: Option<String>,
+    gemini: Option<crate::sensitive::SecretString>,
+    openrouter: Option<crate::sensitive::SecretString>,
+    ollama: Option<crate::sensitive::SecretString>,
+    openai: Option<crate::sensitive::SecretString>,
+    anthropic: Option<crate::sensitive::SecretString>,
 }
 
 /// S-03: lift the three provider API keys out of `settings` so the
@@ -103,7 +103,7 @@ pub(crate) fn persist_settings_file(path: &Path, settings: &Settings) -> Result<
     persist_settings_json(path, &json)
 }
 
-fn persist_settings_json(path: &Path, json: &str) -> Result<(), String> {
+pub(crate) fn persist_settings_json(path: &Path, json: &str) -> Result<(), String> {
     let tmp = path.with_extension("json.tmp");
     let mut file = std::fs::OpenOptions::new()
         .create(true)
@@ -127,14 +127,15 @@ fn persist_settings_json(path: &Path, json: &str) -> Result<(), String> {
 /// retried on every launch even when key hydration took the keychain-hit arm.
 pub(crate) fn cleanup_migrated_keys(path: &Path, original: &Settings) -> Result<(), String> {
     cleanup_migrated_keys_with(original, secret_store::get, |disk| {
-        let json = serde_json::to_string_pretty(disk).map_err(|e| e.to_string())?;
+        let json =
+            zeroize::Zeroizing::new(serde_json::to_string_pretty(disk).map_err(|e| e.to_string())?);
         persist_settings_json(path, &json)
     })
 }
 
 fn cleanup_migrated_keys_with(
     original: &Settings,
-    mut get: impl FnMut(&str) -> Result<Option<String>, String>,
+    mut get: impl FnMut(&str) -> Result<Option<crate::sensitive::SecretString>, String>,
     persist: impl FnOnce(&Settings) -> Result<(), String>,
 ) -> Result<(), String> {
     let mut disk = original.clone();
@@ -176,6 +177,8 @@ pub(crate) fn atomic_replace(from: &Path, to: &Path) -> Result<(), String> {
     };
     let from = HSTRING::from(from.as_os_str());
     let to = HSTRING::from(to.as_os_str());
+    // SAFETY: both HSTRINGs own NUL-terminated UTF-16 paths that remain alive
+    // throughout the call. MoveFileExW does not retain these pointers.
     unsafe {
         MoveFileExW(
             &from,
@@ -184,6 +187,36 @@ pub(crate) fn atomic_replace(from: &Path, to: &Path) -> Result<(), String> {
         )
         .map_err(|e| e.to_string())
     }
+}
+
+fn write_provider_keys(
+    keys: &ProviderKeys,
+    mut set: impl FnMut(&str, &str) -> Result<(), String>,
+    mut delete: impl FnMut(&str) -> Result<(), String>,
+) -> Result<(), String> {
+    for (key, slot) in [
+        (keys.gemini.as_deref(), secret_store::keys::GEMINI_API_KEY),
+        (
+            keys.openrouter.as_deref(),
+            secret_store::keys::OPENROUTER_API_KEY,
+        ),
+        (keys.ollama.as_deref(), secret_store::keys::OLLAMA_API_KEY),
+        (keys.openai.as_deref(), secret_store::keys::OPENAI_API_KEY),
+        (
+            keys.anthropic.as_deref(),
+            secret_store::keys::ANTHROPIC_API_KEY,
+        ),
+    ] {
+        match key {
+            Some(k) if !k.is_empty() => {
+                set(slot, k)?;
+            }
+            _ => {
+                delete(slot)?;
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Persist settings. On platforms with a keychain the Gemini,
@@ -206,28 +239,7 @@ pub fn save_settings(
     let launch_at_startup = settings.launch_at_startup;
     let keys = if secret_store::is_supported() {
         let keys = take_provider_keys(&mut settings);
-        for (key, slot) in [
-            (keys.gemini.as_deref(), secret_store::keys::GEMINI_API_KEY),
-            (
-                keys.openrouter.as_deref(),
-                secret_store::keys::OPENROUTER_API_KEY,
-            ),
-            (keys.ollama.as_deref(), secret_store::keys::OLLAMA_API_KEY),
-            (keys.openai.as_deref(), secret_store::keys::OPENAI_API_KEY),
-            (
-                keys.anthropic.as_deref(),
-                secret_store::keys::ANTHROPIC_API_KEY,
-            ),
-        ] {
-            match key {
-                Some(k) if !k.is_empty() => {
-                    secret_store::set(slot, k)?;
-                }
-                _ => {
-                    let _ = secret_store::delete(slot);
-                }
-            }
-        }
+        write_provider_keys(&keys, secret_store::set, secret_store::delete)?;
         keys
     } else {
         // No keychain — leave the keys on disk. Clone so we can still
@@ -774,5 +786,18 @@ mod tests {
         assert!(keys.ollama.is_none());
         assert!(keys.openai.is_none());
         assert!(keys.anthropic.is_none());
+    }
+}
+
+#[cfg(test)]
+mod credential_deletion_tests {
+    use super::*;
+    #[test]
+    fn clearing_a_provider_key_surfaces_deletion_failure() {
+        let mut settings = Settings::default();
+        let keys = take_provider_keys(&mut settings);
+        let err = write_provider_keys(&keys, |_, _| Ok(()), |_| Err("keychain locked".into()))
+            .unwrap_err();
+        assert_eq!(err, "keychain locked");
     }
 }

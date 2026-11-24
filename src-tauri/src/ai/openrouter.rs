@@ -53,12 +53,16 @@ const ATTRIBUTION_TITLE: &str = "Corvux";
 
 pub struct OpenRouterChat {
     client: Arc<Client>,
-    api_key: String,
+    api_key: crate::sensitive::SecretString,
     model: String,
 }
 
 impl OpenRouterChat {
-    pub fn new(client: Arc<Client>, api_key: String, model: String) -> Self {
+    pub fn new(
+        client: Arc<Client>,
+        api_key: crate::sensitive::SecretString,
+        model: String,
+    ) -> Self {
         Self {
             client,
             api_key,
@@ -360,7 +364,7 @@ async fn stream_chat_impl<R: tauri::Runtime>(
 async fn stream_chat_with_tools_impl<R: tauri::Runtime + 'static>(
     client: Arc<Client>,
     app: tauri::AppHandle<R>,
-    api_key: String,
+    api_key: crate::sensitive::SecretString,
     model: String,
     messages: Vec<ChatMessage>,
     system_context: Option<String>,
@@ -390,7 +394,7 @@ async fn stream_chat_with_tools_impl<R: tauri::Runtime + 'static>(
 
     let response = client
         .post(&url)
-        .header("Authorization", format!("Bearer {}", api_key))
+        .bearer_auth(api_key.as_ref())
         .header("HTTP-Referer", ATTRIBUTION_REFERER)
         .header("X-Title", ATTRIBUTION_TITLE)
         .json(&body)

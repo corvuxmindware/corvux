@@ -963,6 +963,8 @@ pub fn running_from_store_package() -> bool {
     use windows::Win32::Storage::Packaging::Appx::GetCurrentPackageFullName;
 
     let mut len: u32 = 0;
+    // SAFETY: the documented sizing probe takes a null buffer with len = 0;
+    // `len` is a live writable u32 and no output buffer is dereferenced.
     let rc = unsafe { GetCurrentPackageFullName(&mut len, PWSTR::null()) };
     rc != APPMODEL_ERROR_NO_PACKAGE
 }

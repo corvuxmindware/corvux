@@ -175,19 +175,18 @@ impl From<SyncEvent> for SyncEventPayload {
 /// explicit `sync_stop` (not on window close — we WANT window close to
 /// leave `enabled = true` so next launch resumes).
 ///
-/// Stored as JSON at `app_data/sync/prefs.json`. Contains a PIN, so it
-/// stays in app-private storage only. The PIN itself is a 6-digit pairing
-/// artifact; the real trust root is the pinned TLS fingerprint in
-/// `peer_store`.
+/// Stored as JSON at `app_data/sync/prefs.json`. Hosting PINs are hydrated
+/// from roost-scoped secret-store slots and stripped before writing JSON.
+/// Legacy plaintext PINs migrate only after secret-store writes succeed.
 /// Per-roost hosting config, so switching roosts doesn't lose each roost's
 /// pairing PINs. Snapshotted into `SyncPrefs.per_roost` on every save and
 /// restored by `enable_prefs`.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 struct RoostHosting {
     #[serde(default)]
-    hosting_pin: String,
+    hosting_pin: crate::sensitive::SecretString,
     #[serde(default)]
-    iroh_hosting_pin: String,
+    iroh_hosting_pin: crate::sensitive::SecretString,
     #[serde(default)]
     hosting_port: u16,
 }
@@ -203,14 +202,14 @@ struct SyncPrefs {
     #[serde(default)]
     hosting_port: u16,
     #[serde(default)]
-    hosting_pin: String,
+    hosting_pin: crate::sensitive::SecretString,
     /// PIN the user generated on the iroh "Show pairing code" panel.
     /// Persisted so `sync_try_autostart` can re-bind the iroh listener
     /// with the same PIN — without it, paired peers would dial in but
     /// fail the HMAC handshake on every restart, forcing a fresh QR
     /// pair flow even though the trust relationship survives.
     #[serde(default)]
-    iroh_hosting_pin: String,
+    iroh_hosting_pin: crate::sensitive::SecretString,
     /// Optional store-and-forward queue endpoint, e.g.
     /// `https://queue.meetcorvux.com`. When set + `strict_p2p_only` is
     /// false, the engine installs a `QueueClient` so local writes fan
@@ -257,8 +256,8 @@ impl Default for SyncPrefs {
             roost_path: String::new(),
             device_name: String::new(),
             hosting_port: 0,
-            hosting_pin: String::new(),
-            iroh_hosting_pin: String::new(),
+            hosting_pin: Default::default(),
+            iroh_hosting_pin: Default::default(),
             queue_endpoint: String::new(),
             strict_p2p_only: true,
             pinned_queue_host: String::new(),
@@ -639,15 +638,163 @@ fn sync_prefs_path(app: &AppHandle) -> Result<PathBuf, String> {
     Ok(app_data.join("sync").join("prefs.json"))
 }
 
-fn load_sync_prefs(app: &AppHandle) -> SyncPrefs {
-    let path = match sync_prefs_path(app) {
-        Ok(p) => p,
-        Err(_) => return SyncPrefs::default(),
+fn hosting_secret_slot(roost: &str, transport: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(normalize_roost_key(roost).as_bytes());
+    format!("sync_hosting_pin:v1:{transport}:{}", hex::encode(digest))
+}
+
+fn hydrate_hosting_pins(
+    prefs: &mut SyncPrefs,
+    mut get: impl FnMut(&str) -> Result<Option<crate::sensitive::SecretString>, String>,
+) -> Result<(), String> {
+    let roost = prefs.roost_path.clone();
+    let mut hydrate = |roost: &str,
+                       tls: &mut crate::sensitive::SecretString,
+                       iroh: &mut crate::sensitive::SecretString|
+     -> Result<(), String> {
+        if !roost.is_empty() {
+            for (kind, pin) in [("tls", tls), ("iroh", iroh)] {
+                if let Some(stored) = get(&hosting_secret_slot(roost, kind))? {
+                    *pin = stored;
+                }
+            }
+        }
+        Ok(())
     };
-    let Ok(bytes) = std::fs::read(&path) else {
-        return SyncPrefs::default();
+    hydrate(&roost, &mut prefs.hosting_pin, &mut prefs.iroh_hosting_pin)?;
+    for (roost, hosting) in &mut prefs.per_roost {
+        hydrate(
+            roost,
+            &mut hosting.hosting_pin,
+            &mut hosting.iroh_hosting_pin,
+        )?;
+    }
+    Ok(())
+}
+
+fn load_sync_prefs(app: &AppHandle) -> Result<SyncPrefs, String> {
+    let path = sync_prefs_path(app)?;
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => zeroize::Zeroizing::new(bytes),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(SyncPrefs::default()),
+        Err(e) => return Err(format!("reading sync preferences: {e}")),
     };
-    serde_json::from_slice::<SyncPrefs>(&bytes).unwrap_or_default()
+    let mut prefs: SyncPrefs =
+        serde_json::from_slice(&bytes).map_err(|e| format!("parsing sync preferences: {e}"))?;
+    let legacy = !prefs.hosting_pin.is_empty()
+        || !prefs.iroh_hosting_pin.is_empty()
+        || prefs
+            .per_roost
+            .values()
+            .any(|h| !h.hosting_pin.is_empty() || !h.iroh_hosting_pin.is_empty());
+    hydrate_hosting_pins(&mut prefs, crate::secret_store::get)?;
+    if legacy {
+        // Save credentials first. A failure leaves the original fallback intact;
+        // the next launch retries even if some slots have already migrated.
+        save_sync_prefs(app, &prefs)?;
+    }
+    Ok(prefs)
+}
+
+fn strip_hosting_pins(
+    prefs: &mut SyncPrefs,
+    mut set: impl FnMut(&str, &str) -> Result<(), String>,
+) -> Result<(), String> {
+    let mut strip = |roost: &str,
+                     tls: &mut crate::sensitive::SecretString,
+                     iroh: &mut crate::sensitive::SecretString|
+     -> Result<(), String> {
+        for (kind, pin) in [("tls", tls), ("iroh", iroh)] {
+            if !pin.is_empty() {
+                if roost.is_empty() {
+                    return Err("cannot persist hosting credentials without a roost".into());
+                }
+                set(&hosting_secret_slot(roost, kind), pin)?;
+                *pin = Default::default();
+            }
+        }
+        Ok(())
+    };
+    strip(
+        &prefs.roost_path,
+        &mut prefs.hosting_pin,
+        &mut prefs.iroh_hosting_pin,
+    )?;
+    for (roost, hosting) in &mut prefs.per_roost {
+        strip(
+            roost,
+            &mut hosting.hosting_pin,
+            &mut hosting.iroh_hosting_pin,
+        )?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod hosting_secret_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn legacy() -> SyncPrefs {
+        let mut prefs = SyncPrefs {
+            roost_path: "roost-a".into(),
+            hosting_pin: "123456".into(),
+            iroh_hosting_pin: "654321".into(),
+            ..Default::default()
+        };
+        prefs.per_roost.insert(
+            "roost-b".into(),
+            RoostHosting {
+                hosting_pin: "234567".into(),
+                iroh_hosting_pin: "765432".into(),
+                hosting_port: 42,
+            },
+        );
+        prefs
+    }
+
+    #[test]
+    fn hosting_credentials_leave_json_and_hydrate_per_roost() {
+        let prefs = legacy();
+        let mut disk = prefs.clone();
+        let mut secrets = HashMap::new();
+        strip_hosting_pins(&mut disk, |key, value| {
+            secrets.insert(key.to_owned(), crate::sensitive::SecretString::from(value));
+            Ok(())
+        })
+        .unwrap();
+        let json = serde_json::to_string(&disk).unwrap();
+        for pin in ["123456", "654321", "234567", "765432"] {
+            assert!(!json.contains(pin));
+        }
+        hydrate_hosting_pins(&mut disk, |key| Ok(secrets.get(key).cloned())).unwrap();
+        assert_eq!(disk.hosting_pin, prefs.hosting_pin);
+        assert_eq!(disk.iroh_hosting_pin, prefs.iroh_hosting_pin);
+        assert_eq!(
+            disk.per_roost["roost-b"].iroh_hosting_pin,
+            prefs.per_roost["roost-b"].iroh_hosting_pin
+        );
+        assert_eq!(disk.per_roost["roost-b"].hosting_port, 42);
+        assert_ne!(
+            hosting_secret_slot("roost-a", "iroh"),
+            hosting_secret_slot("roost-b", "iroh")
+        );
+    }
+
+    #[test]
+    fn migration_failure_retains_live_fallback_and_does_not_hide_store_errors() {
+        let prefs = legacy();
+        let original = serde_json::to_string(&prefs).unwrap();
+        let mut disk = prefs.clone();
+        assert_eq!(
+            strip_hosting_pins(&mut disk, |_, _| Err("store locked".into())).unwrap_err(),
+            "store locked"
+        );
+        assert_eq!(serde_json::to_string(&prefs).unwrap(), original);
+        assert!(hydrate_hosting_pins(&mut disk, |_| Err("store locked".into())).is_err());
+        assert!(!format!("{prefs:?}").contains("654321"));
+    }
 }
 
 fn save_sync_prefs(app: &AppHandle, prefs: &SyncPrefs) -> Result<(), String> {
@@ -670,10 +817,12 @@ fn save_sync_prefs(app: &AppHandle, prefs: &SyncPrefs) -> Result<(), String> {
             },
         );
     }
+    strip_hosting_pins(&mut prefs, crate::secret_store::set)?;
     let bytes = serde_json::to_vec_pretty(&prefs).map_err(|e| format!("serializing prefs: {e}"))?;
-    let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, &bytes).map_err(|e| format!("writing prefs: {e}"))?;
-    std::fs::rename(&tmp, &path).map_err(|e| format!("renaming prefs: {e}"))?;
+    crate::commands::ai::settings::persist_settings_json(
+        &path,
+        std::str::from_utf8(&bytes).map_err(|e| e.to_string())?,
+    )?;
     Ok(())
 }
 
@@ -1067,7 +1216,7 @@ async fn sync_init_inner(
     // Honor strict-P2P before any listener binds: no Corvux/Number0 relay in
     // the path. (Discovery still publishes our NodeAddr to the n0 DNS namespace
     // — a smaller, address-only surface — tracked as a separate follow-up.)
-    engine.set_relay_disabled(load_sync_prefs(app).strict_p2p_only);
+    engine.set_relay_disabled(load_sync_prefs(app)?.strict_p2p_only);
     // Attach the event bridge BEFORE starting the watcher. `start_watcher`
     // kicks off a background `scan_roost` that emits `ScanProgress` /
     // `ScanComplete` events; if the bridge isn't already subscribed,
@@ -1089,7 +1238,7 @@ async fn sync_init_inner(
     // Install the queue client if prefs say to. Strict-P2P-only or
     // missing endpoint = no client (engine drops back to live transport
     // only). Periodic pull is spun up by `set_queue_client` itself.
-    let prefs = load_sync_prefs(app);
+    let prefs = load_sync_prefs(app)?;
     if !prefs.strict_p2p_only && !prefs.queue_endpoint.is_empty() {
         match crate::sync::queue::client::QueueClient::new(
             &prefs.queue_endpoint,
@@ -1228,7 +1377,7 @@ pub async fn sync_init(
     // resumes without the user re-clicking "Enable sync". The engine being up
     // isn't enough — `sync_try_autostart` reads prefs, and switching roosts now
     // stops the engine, so the durable flag is what survives the round-trip.
-    let prefs = enable_prefs(load_sync_prefs(&app), &roost_path, &device_name);
+    let prefs = enable_prefs(load_sync_prefs(&app)?, &roost_path, &device_name);
     if let Err(e) = save_sync_prefs(&app, &prefs) {
         tracing::warn!(
             error = %e,
@@ -1284,7 +1433,7 @@ pub async fn sync_try_autostart(
         sync_shutdown_without_disabling(&app, &state).await;
     }
 
-    let prefs = load_sync_prefs(&app);
+    let prefs = load_sync_prefs(&app)?;
     if !should_resume(&prefs, &roost_path) {
         return Ok(SyncStatus {
             running: false,
@@ -1411,7 +1560,7 @@ pub async fn sync_try_autostart(
         }
         // Refresh prefs so a port that was chosen by the OS (port=0) gets
         // remembered. Keep enabled=true.
-        let _ = save_sync_prefs(
+        save_sync_prefs(
             &app,
             &SyncPrefs {
                 enabled: true,
@@ -1425,7 +1574,7 @@ pub async fn sync_try_autostart(
                 pinned_queue_host: prefs.pinned_queue_host,
                 per_roost: prefs.per_roost,
             },
-        );
+        )?;
     }
 
     sync_status(state).await
@@ -1510,6 +1659,7 @@ pub async fn sync_start_listening(
     port: u16,
     pin: String,
 ) -> Result<u16, String> {
+    let pin = crate::sensitive::SecretString::from(pin);
     let guard = state.engine.lock().await;
     let engine = guard.as_ref().ok_or("sync engine not initialized")?;
     let pin_parsed = Pin::parse(&pin).ok_or("invalid PIN — must be 6 digits")?;
@@ -1586,7 +1736,7 @@ pub async fn sync_start_listening(
     // Preserve any existing iroh_hosting_pin — starting the legacy TLS
     // listener shouldn't clobber the iroh autoresume PIN if the user has
     // also been hosting iroh in the same session.
-    let prior = load_sync_prefs(&app);
+    let prior = load_sync_prefs(&app)?;
     if let Err(e) = save_sync_prefs(
         &app,
         &SyncPrefs {
@@ -1631,6 +1781,7 @@ pub async fn sync_connect(
     pin: String,
     pinned_fingerprint_hex: Option<String>,
 ) -> Result<String, String> {
+    let pin = crate::sensitive::SecretString::from(pin);
     let guard = state.engine.lock().await;
     let engine = guard.as_ref().ok_or("sync engine not initialized")?;
     let addr: SocketAddr = addr.parse().map_err(|e| format!("invalid address: {e}"))?;
@@ -1659,7 +1810,7 @@ pub async fn sync_connect(
     let roost_path = engine.roost_path().to_string();
     let display_name = engine.display_name().to_string();
     drop(guard);
-    let mut prefs = load_sync_prefs(&app);
+    let mut prefs = load_sync_prefs(&app)?;
     prefs.enabled = true;
     prefs.roost_path = roost_path;
     if prefs.device_name.is_empty() {
@@ -1685,8 +1836,10 @@ pub async fn sync_connect(
 /// plus the (sticky) hosting PIN to display alongside it.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, specta::Type)]
 pub struct IrohHostingInfo {
-    pub ticket: String,
-    pub pin: String,
+    #[specta(type = String)]
+    pub ticket: crate::sensitive::SecretString,
+    #[specta(type = String)]
+    pub pin: crate::sensitive::SecretString,
 }
 
 #[tauri::command]
@@ -1704,12 +1857,12 @@ pub async fn sync_listen_iroh(
     // (get-or-create), so re-opening the panel shows the SAME code and existing
     // pairings keep working. `rotate: true` is the only way to mint a new PIN
     // (explicit user action, e.g. "the old code leaked").
-    let existing = Pin::parse(&load_sync_prefs(&app).iroh_hosting_pin);
+    let existing = Pin::parse(&load_sync_prefs(&app)?.iroh_hosting_pin);
     let pin = match (rotate, existing) {
         (false, Some(p)) => p,
         _ => Pin::generate(),
     };
-    let pin_str = pin.as_str().to_string();
+    let pin_str = crate::sensitive::SecretString::from(pin.as_str());
 
     let guard = state.engine.lock().await;
     let engine = guard.as_ref().ok_or("sync engine not initialized")?;
@@ -1744,16 +1897,14 @@ pub async fn sync_listen_iroh(
     let roost_path = engine.roost_path().to_string();
     let display_name = engine.display_name().to_string();
     drop(guard);
-    let mut prefs = load_sync_prefs(&app);
+    let mut prefs = load_sync_prefs(&app)?;
     prefs.enabled = true;
     prefs.roost_path = roost_path;
     if prefs.device_name.is_empty() {
         prefs.device_name = display_name;
     }
     prefs.iroh_hosting_pin = pin_str.clone();
-    if let Err(e) = save_sync_prefs(&app, &prefs) {
-        tracing::warn!(error = %e, "sync_listen_iroh: could not persist iroh hosting prefs");
-    }
+    save_sync_prefs(&app, &prefs)?;
     Ok(IrohHostingInfo {
         ticket,
         pin: pin_str,
@@ -1773,6 +1924,8 @@ pub async fn sync_connect_iroh(
     ticket: String,
     pin: String,
 ) -> Result<String, String> {
+    let pin = crate::sensitive::SecretString::from(pin);
+    let ticket = crate::sensitive::SecretString::from(ticket);
     // Clone the engine handle and release the state lock BEFORE dialing.
     // `connect_peer_via_iroh` performs a network dial (bounded by DIAL_TIMEOUT);
     // holding `SyncEngineState.engine` across it would block sync_status and
@@ -1796,18 +1949,21 @@ pub async fn sync_connect_iroh(
     // this, reconnect is one-directional — the QR scanner is the only side that
     // can re-establish. Best-effort: if we can't produce an offer we still pair
     // (falls back to one-directional).
-    let my_offer: Option<(String, String)> = {
+    let my_offer: Option<(
+        crate::sensitive::SecretString,
+        crate::sensitive::SecretString,
+    )> = {
         let my_pin =
-            Pin::parse(&load_sync_prefs(&app).iroh_hosting_pin).unwrap_or_else(Pin::generate);
-        let my_pin_str = my_pin.as_str().to_string();
+            Pin::parse(&load_sync_prefs(&app)?.iroh_hosting_pin).unwrap_or_else(Pin::generate);
+        let my_pin_str = crate::sensitive::SecretString::from(my_pin.as_str());
         match engine.start_listening_iroh(my_pin).await {
             Ok(_) => match engine.iroh_pairing_ticket().await {
                 Ok(my_ticket) => {
                     // Persist our sticky hosting PIN so redials from the host
                     // keep matching across our restarts.
-                    let mut prefs = load_sync_prefs(&app);
+                    let mut prefs = load_sync_prefs(&app)?;
                     prefs.iroh_hosting_pin = my_pin_str.clone();
-                    let _ = save_sync_prefs(&app, &prefs);
+                    save_sync_prefs(&app, &prefs)?;
                     Some((my_ticket, my_pin_str))
                 }
                 Err(e) => {
@@ -1842,7 +1998,7 @@ pub async fn sync_connect_iroh(
     // tickets from legacy `ip:port` strings.
     if let Err(e) = engine.peer_store_lock().await.remember_connection(
         device_id,
-        Some(ticket.clone()),
+        Some(ticket.to_string()),
         Some(pin.clone()),
     ) {
         tracing::warn!(error = %e, "sync_connect_iroh: failed to remember iroh ticket for autoresume");
@@ -1852,7 +2008,7 @@ pub async fn sync_connect_iroh(
     // sync on the dialer side too.
     let roost_path = engine.roost_path().to_string();
     let display_name = engine.display_name().to_string();
-    let mut prefs = load_sync_prefs(&app);
+    let mut prefs = load_sync_prefs(&app)?;
     prefs.enabled = true;
     prefs.roost_path = roost_path;
     if prefs.device_name.is_empty() {
@@ -1995,7 +2151,7 @@ pub async fn sync_stop(
     }
     // User asked to forget — clear the auto-resume flag but keep the rest
     // of prefs so if they re-enable we can pre-fill device name, etc.
-    let mut prefs = load_sync_prefs(&app);
+    let mut prefs = load_sync_prefs(&app)?;
     if prefs.enabled {
         prefs.enabled = false;
         if let Err(e) = save_sync_prefs(&app, &prefs) {
@@ -2052,7 +2208,7 @@ fn load_or_create_tls(dir: &std::path::Path) -> Result<TlsIdentity, crate::sync:
     struct Disk {
         version: u16,
         cert_der: Vec<u8>,
-        key_der: Vec<u8>,
+        key_der: zeroize::Zeroizing<Vec<u8>>,
     }
 
     let path = dir.join(FILE);
@@ -2070,16 +2226,11 @@ fn load_or_create_tls(dir: &std::path::Path) -> Result<TlsIdentity, crate::sync:
     };
 
     if path.exists() {
-        let bytes = std::fs::read(&path)?;
+        let bytes = zeroize::Zeroizing::new(std::fs::read(&path)?);
         if let Ok(disk) = postcard::from_bytes::<Disk>(&bytes) {
             if disk.version == VERSION {
-                let fingerprint = Fingerprint::of_cert_der(&disk.cert_der);
                 restrict(&path);
-                return Ok(TlsIdentity {
-                    cert_der: disk.cert_der,
-                    key_der: disk.key_der,
-                    fingerprint,
-                });
+                return Ok(TlsIdentity::from_der(disk.cert_der, disk.key_der));
             }
         }
         // Unknown/legacy file — regenerate below rather than fail.
@@ -2089,10 +2240,12 @@ fn load_or_create_tls(dir: &std::path::Path) -> Result<TlsIdentity, crate::sync:
     let disk = Disk {
         version: VERSION,
         cert_der: id.cert_der.clone(),
-        key_der: id.key_der.clone(),
+        key_der: zeroize::Zeroizing::new(id.key_der().to_vec()),
     };
-    let bytes = postcard::to_allocvec(&disk)
-        .map_err(|e| crate::sync::error::StoreError::Encode(e.to_string()))?;
+    let bytes = zeroize::Zeroizing::new(
+        postcard::to_allocvec(&disk)
+            .map_err(|e| crate::sync::error::StoreError::Encode(e.to_string()))?,
+    );
     let tmp = path.with_extension("bin.tmp");
     std::fs::write(&tmp, &bytes)?;
     std::fs::rename(&tmp, &path)?;
@@ -2189,7 +2342,7 @@ pub async fn sync_get_queue_settings(
     app: tauri::AppHandle,
     state: State<'_, SyncEngineState>,
 ) -> Result<QueueSettings, String> {
-    let prefs = load_sync_prefs(&app);
+    let prefs = load_sync_prefs(&app)?;
     let active = {
         let guard = state.engine.lock().await;
         match guard.as_ref() {
@@ -2218,7 +2371,7 @@ pub async fn sync_set_queue_endpoint(
     state: State<'_, SyncEngineState>,
     endpoint: String,
 ) -> Result<(), String> {
-    let mut prefs = load_sync_prefs(&app);
+    let mut prefs = load_sync_prefs(&app)?;
     let normalized = validate_queue_endpoint(&endpoint, &prefs.pinned_queue_host)?;
     prefs.queue_endpoint = normalized;
     save_sync_prefs(&app, &prefs)?;
@@ -2251,7 +2404,7 @@ pub async fn sync_pin_custom_queue_host(
             return Err("pinned host must not contain whitespace".into());
         }
     }
-    let mut prefs = load_sync_prefs(&app);
+    let mut prefs = load_sync_prefs(&app)?;
     prefs.pinned_queue_host = host;
     save_sync_prefs(&app, &prefs)?;
     Ok(())
@@ -2266,7 +2419,7 @@ pub async fn sync_set_strict_p2p_only(
     state: State<'_, SyncEngineState>,
     enabled: bool,
 ) -> Result<(), String> {
-    let mut prefs = load_sync_prefs(&app);
+    let mut prefs = load_sync_prefs(&app)?;
     prefs.strict_p2p_only = enabled;
     save_sync_prefs(&app, &prefs)?;
     // Make the toggle take effect on the LIVE endpoint, not just at next

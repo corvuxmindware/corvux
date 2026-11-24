@@ -41,12 +41,12 @@ const SERVICE: &str = "com.corvuxmindware.corvux";
 mod imp {
     use super::SERVICE;
 
-    pub fn get(key: &str) -> Result<Option<String>, String> {
+    pub fn get(key: &str) -> Result<Option<crate::sensitive::SecretString>, String> {
         match keyring::Entry::new(SERVICE, key)
             .map_err(|e| format!("keyring open: {e}"))?
             .get_password()
         {
-            Ok(s) => Ok(Some(s)),
+            Ok(s) => Ok(Some(s.into())),
             Err(keyring::Error::NoEntry) => Ok(None),
             Err(e) => Err(format!("keyring get: {e}")),
         }
@@ -71,7 +71,11 @@ mod imp {
 }
 
 #[cfg(any(target_os = "android", target_os = "ios"))]
-mod imp {
+use mobile as imp;
+
+#[cfg(any(target_os = "android", target_os = "ios", test))]
+#[cfg_attr(test, allow(dead_code))]
+mod mobile {
     use aes_gcm::aead::{Aead, KeyInit, OsRng};
     use aes_gcm::{AeadCore, Aes256Gcm, Nonce};
     use hkdf::Hkdf;
@@ -79,6 +83,7 @@ mod imp {
     use std::collections::HashMap;
     use std::fs;
     use std::path::PathBuf;
+    use zeroize::Zeroizing;
 
     const SEED_FILE: &str = ".corvux/.enc-seed";
     const SECRETS_FILE: &str = ".corvux/encrypted-secrets.json";
@@ -109,10 +114,16 @@ mod imp {
         Ok(roost_data_dir()?.join(SECRETS_FILE))
     }
 
-    fn get_or_create_seed() -> Result<Vec<u8>, String> {
-        let path = seed_path()?;
+    fn get_or_create_seed() -> Result<Zeroizing<Vec<u8>>, String> {
+        get_or_create_seed_at(&seed_path()?, &secrets_path()?)
+    }
+
+    fn get_or_create_seed_at(
+        path: &std::path::Path,
+        secrets: &std::path::Path,
+    ) -> Result<Zeroizing<Vec<u8>>, String> {
         if path.exists() {
-            let seed = fs::read(&path).map_err(|e| format!("read seed: {e}"))?;
+            let seed = Zeroizing::new(fs::read(path).map_err(|e| format!("read seed: {e}"))?);
             if seed.len() == 32 {
                 return Ok(seed);
             }
@@ -124,32 +135,34 @@ mod imp {
             // is a permanent decrypt failure. Wipe it so the next read
             // returns "no entry" instead of a confusing crypto error,
             // and downstream callers prompt the user to re-enter keys.
-            if let Ok(secrets) = secrets_path() {
-                let _ = fs::remove_file(&secrets);
+            match fs::remove_file(secrets) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(format!("remove unrecoverable secrets: {e}")),
             }
         }
-        let seed: [u8; 32] = rand::random();
+        let seed = Zeroizing::new(rand::random::<[u8; 32]>().to_vec());
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).map_err(|e| format!("create seed dir: {e}"))?;
         }
-        write_atomic(&path, &seed)?;
-        Ok(seed.to_vec())
+        write_atomic(path, &seed)?;
+        Ok(seed)
     }
 
     /// Write `data` to `path` atomically: write to `path.tmp` first, then
     /// rename. Power-cut mid-write leaves the destination intact (either
     /// the old contents or nothing — never a truncated half).
-    fn write_atomic(path: &PathBuf, data: &[u8]) -> Result<(), String> {
+    fn write_atomic(path: &std::path::Path, data: &[u8]) -> Result<(), String> {
         let tmp = path.with_extension("tmp");
         fs::write(&tmp, data).map_err(|e| format!("write tmp {}: {e}", tmp.display()))?;
         fs::rename(&tmp, path).map_err(|e| format!("rename {}: {e}", path.display()))?;
         Ok(())
     }
 
-    fn derive_key(seed: &[u8]) -> Result<[u8; 32], String> {
+    fn derive_key(seed: &[u8]) -> Result<Zeroizing<[u8; 32]>, String> {
         let hkdf = Hkdf::<Sha256>::new(None, seed);
-        let mut key = [0u8; 32];
-        hkdf.expand(HKDF_INFO, &mut key)
+        let mut key = Zeroizing::new([0u8; 32]);
+        hkdf.expand(HKDF_INFO, &mut *key)
             .map_err(|e| format!("HKDF expand: {e}"))?;
         Ok(key)
     }
@@ -165,7 +178,7 @@ mod imp {
         Ok(base64_encode(&combined))
     }
 
-    fn decrypt(encoded: &str, key: &[u8; 32]) -> Result<String, String> {
+    fn decrypt(encoded: &str, key: &[u8; 32]) -> Result<crate::sensitive::SecretString, String> {
         let combined = base64_decode(encoded)?;
         if combined.len() < 12 {
             return Err("ciphertext too short".into());
@@ -173,10 +186,14 @@ mod imp {
         let (nonce_bytes, ciphertext) = combined.split_at(12);
         let nonce = Nonce::from_slice(nonce_bytes);
         let cipher = Aes256Gcm::new_from_slice(key).map_err(|e| format!("cipher init: {e}"))?;
-        let plaintext = cipher
-            .decrypt(nonce, ciphertext)
-            .map_err(|e| format!("decrypt: {e}"))?;
-        String::from_utf8(plaintext).map_err(|e| format!("utf8: {e}"))
+        let plaintext = Zeroizing::new(
+            cipher
+                .decrypt(nonce, ciphertext)
+                .map_err(|e| format!("decrypt: {e}"))?,
+        );
+        let text =
+            std::str::from_utf8(&plaintext).map_err(|_| "secret is not UTF-8".to_string())?;
+        Ok(text.into())
     }
 
     fn load_secrets() -> Result<SecretsFile, String> {
@@ -198,13 +215,13 @@ mod imp {
         Ok(())
     }
 
-    pub fn get(key: &str) -> Result<Option<String>, String> {
+    pub fn get(key: &str) -> Result<Option<crate::sensitive::SecretString>, String> {
+        let seed = get_or_create_seed()?;
         let sf = load_secrets()?;
         let encrypted = match sf.entries.get(key) {
             Some(v) => v,
             None => return Ok(None),
         };
-        let seed = get_or_create_seed()?;
         let derived_key = derive_key(&seed)?;
         let plaintext = decrypt(encrypted, &derived_key)?;
         Ok(Some(plaintext))
@@ -238,9 +255,44 @@ mod imp {
             .decode(s)
             .map_err(|e| format!("base64 decode: {e}"))
     }
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        #[test]
+        fn failed_recovery_cleanup_preserves_old_seed() {
+            let dir = tempfile::tempdir().unwrap();
+            let seed = dir.path().join("seed");
+            let secrets = dir.path().join("secrets");
+            fs::write(&seed, b"corrupt").unwrap();
+            fs::create_dir(&secrets).unwrap();
+            assert!(get_or_create_seed_at(&seed, &secrets).is_err());
+            assert_eq!(fs::read(&seed).unwrap(), b"corrupt");
+        }
+        #[test]
+        fn corrupt_seed_recovery_removes_unrecoverable_secrets() {
+            let dir = tempfile::tempdir().unwrap();
+            let seed = dir.path().join("seed");
+            let secrets = dir.path().join("secrets");
+            fs::write(&seed, b"corrupt").unwrap();
+            fs::write(&secrets, b"unrecoverable ciphertext").unwrap();
+            let fresh = get_or_create_seed_at(&seed, &secrets).unwrap();
+            assert_eq!(fresh.len(), 32);
+            assert!(!secrets.exists());
+            assert_eq!(&*get_or_create_seed_at(&seed, &secrets).unwrap(), &*fresh);
+        }
+        #[test]
+        fn mobile_secret_round_trip_and_authentication_failure() {
+            let seed = Zeroizing::new([17u8; 32]);
+            let key = derive_key(&*seed).unwrap();
+            let encoded = encrypt("credential-sentinel", &key).unwrap();
+            assert_eq!(&*decrypt(&encoded, &key).unwrap(), "credential-sentinel");
+            let other = derive_key(&[18; 32]).unwrap();
+            assert!(decrypt(&encoded, &other).is_err());
+        }
+    }
 }
 
-pub fn get(key: &str) -> Result<Option<String>, String> {
+pub fn get(key: &str) -> Result<Option<crate::sensitive::SecretString>, String> {
     imp::get(key)
 }
 
@@ -287,7 +339,7 @@ mod tests {
     #[cfg(any(target_os = "android", target_os = "ios"))]
     #[test]
     fn encrypt_decrypt_roundtrip() {
-        let seed: [u8; 32] = rand::random();
+        let seed = Zeroizing::new(rand::random::<[u8; 32]>().to_vec());
         let key = super::imp::derive_key(&seed).unwrap();
         let plaintext = "AIza-super-secret-key-12345";
         let encrypted = super::imp::encrypt(plaintext, &key).unwrap();

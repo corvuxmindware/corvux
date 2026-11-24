@@ -60,7 +60,7 @@ pub(crate) const fn ollama_supported() -> bool {
 pub struct OllamaChat {
     client: Arc<Client>,
     base_url: String,
-    api_key: Option<String>,
+    api_key: Option<crate::sensitive::SecretString>,
     model: String,
 }
 
@@ -68,7 +68,7 @@ impl OllamaChat {
     pub fn new(
         client: Arc<Client>,
         base_url: String,
-        api_key: Option<String>,
+        api_key: Option<crate::sensitive::SecretString>,
         model: String,
     ) -> Self {
         let base = if base_url.trim().is_empty() {
@@ -347,7 +347,7 @@ async fn stream_chat_with_tools_impl<R: tauri::Runtime + 'static>(
     client: Arc<Client>,
     app: tauri::AppHandle<R>,
     base_url: String,
-    api_key: Option<String>,
+    api_key: Option<crate::sensitive::SecretString>,
     model: String,
     messages: Vec<ChatMessage>,
     system_context: Option<String>,

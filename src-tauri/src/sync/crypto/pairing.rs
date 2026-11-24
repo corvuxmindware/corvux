@@ -76,9 +76,14 @@ impl Pin {
     /// Client-side: accept user input. Strips whitespace, rejects anything
     /// but 6 decimal digits.
     pub fn parse(input: &str) -> Option<Self> {
-        let trimmed: String = input.chars().filter(|c| !c.is_whitespace()).collect();
+        let trimmed = Zeroizing::new(
+            input
+                .chars()
+                .filter(|c| !c.is_whitespace())
+                .collect::<String>(),
+        );
         if trimmed.len() == 6 && trimmed.chars().all(|c| c.is_ascii_digit()) {
-            Some(Self(Zeroizing::new(trimmed)))
+            Some(Self(trimmed))
         } else {
             None
         }
@@ -111,9 +116,9 @@ pub struct PairingSecret(Zeroizing<[u8; 32]>);
 impl PairingSecret {
     /// Mint a fresh secret from the OS CSPRNG. Called once per "Show code".
     pub fn generate() -> Self {
-        let mut b = [0u8; 32];
-        OsRng.fill_bytes(&mut b);
-        Self(Zeroizing::new(b))
+        let mut b = Zeroizing::new([0u8; 32]);
+        OsRng.fill_bytes(&mut *b);
+        Self(b)
     }
 
     pub fn from_bytes(b: [u8; 32]) -> Self {
@@ -125,9 +130,11 @@ impl PairingSecret {
     }
 
     /// URL-safe, unpadded base64 — the form embedded in the ticket JSON.
-    pub fn to_b64(&self) -> String {
+    pub fn to_b64(&self) -> crate::sensitive::SecretString {
         use base64::Engine;
-        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(self.0.as_ref())
+        base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(self.0.as_ref())
+            .into()
     }
 
     /// Parse the ticket-embedded base64 form. `None` on any malformed input or
@@ -135,11 +142,17 @@ impl PairingSecret {
     /// "no secret", i.e. the PIN-only path).
     pub fn from_b64(s: &str) -> Option<Self> {
         use base64::Engine;
-        let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
-            .decode(s.as_bytes())
-            .ok()?;
-        let arr: [u8; 32] = bytes.try_into().ok()?;
-        Some(Self(Zeroizing::new(arr)))
+        let bytes = Zeroizing::new(
+            base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(s.as_bytes())
+                .ok()?,
+        );
+        if bytes.len() != 32 {
+            return None;
+        }
+        let mut arr = Zeroizing::new([0u8; 32]);
+        arr.copy_from_slice(&bytes);
+        Some(Self(arr))
     }
 }
 
@@ -214,13 +227,13 @@ pub fn generate_ephemeral() -> (x25519_dalek::EphemeralSecret, [u8; 32]) {
 pub fn ecdh_shared(
     secret: x25519_dalek::EphemeralSecret,
     peer_public: &[u8; 32],
-) -> SyncResult<[u8; 32]> {
+) -> SyncResult<Zeroizing<[u8; 32]>> {
     let peer = x25519_dalek::PublicKey::from(*peer_public);
     let shared = secret.diffie_hellman(&peer);
     if !shared.was_contributory() {
         return Err(CryptoError::NonContributoryEcdh.into());
     }
-    Ok(*shared.as_bytes())
+    Ok(Zeroizing::new(*shared.as_bytes()))
 }
 
 /// HKDF label for the per-peer resumption token (SEC-2). Both sides derive
@@ -651,7 +664,7 @@ mod tests {
         let a = ecdh_shared(a_secret, &b_pub).unwrap();
         let b = ecdh_shared(b_secret, &a_pub).unwrap();
         assert_eq!(a, b, "both sides must reach the same ECDH secret");
-        assert_ne!(a, [0u8; 32], "a healthy exchange is never all-zero");
+        assert_ne!(*a, [0u8; 32], "a healthy exchange is never all-zero");
     }
 
     #[test]

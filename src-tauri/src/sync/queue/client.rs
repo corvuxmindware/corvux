@@ -98,7 +98,7 @@ struct QueueClientInner {
 }
 
 struct CachedToken {
-    bearer_hex: String,
+    bearer_hex: crate::sensitive::SecretString,
     /// Monotonic expiry deadline. Derived at issue from the token's remaining
     /// lifetime (server expiry minus client-now — both use the client clock so
     /// a constant skew cancels) and then tracked via `Instant`, which is immune
@@ -219,12 +219,7 @@ impl QueueClient {
         // on delete wedged the outbox drain's ACK. Route it through the shared
         // helper — it gets the 401 re-auth retry AND the SYN-M3 bounded body.
         self.send_with_reauth(
-            |token| {
-                self.inner
-                    .http
-                    .delete(&url)
-                    .header(AUTHORIZATION, format!("Bearer {token}"))
-            },
+            |token| self.inner.http.delete(&url).header(AUTHORIZATION, token),
             TINY_RESPONSE_MAX_BYTES,
         )
         .await
@@ -258,7 +253,7 @@ impl QueueClient {
                 self.inner
                     .http
                     .post(&url)
-                    .header(AUTHORIZATION, format!("Bearer {token}"))
+                    .header(AUTHORIZATION, token)
                     .header(CONTENT_TYPE, POSTCARD_MIME)
                     .body(body.clone())
             },
@@ -270,12 +265,7 @@ impl QueueClient {
     async fn authed_get(&self, path: &str, max: usize) -> QueueResult<Vec<u8>> {
         let url = format!("{}{path}", self.inner.base_url);
         self.send_with_reauth(
-            |token| {
-                self.inner
-                    .http
-                    .get(&url)
-                    .header(AUTHORIZATION, format!("Bearer {token}"))
-            },
+            |token| self.inner.http.get(&url).header(AUTHORIZATION, token),
             max,
         )
         .await
@@ -294,14 +284,14 @@ impl QueueClient {
     /// bearer.
     async fn send_with_reauth<F>(&self, build: F, max: usize) -> QueueResult<Vec<u8>>
     where
-        F: Fn(String) -> reqwest::RequestBuilder,
+        F: Fn(reqwest::header::HeaderValue) -> reqwest::RequestBuilder,
     {
         let token = self.token().await?;
-        let resp = build(token).send().await?;
+        let resp = build(sensitive_bearer(&token)?).send().await?;
         if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
             self.forget_token().await;
             let token = self.token().await?;
-            let resp = build(token).send().await?;
+            let resp = build(sensitive_bearer(&token)?).send().await?;
             return consume(resp, max).await;
         }
         consume(resp, max).await
@@ -310,7 +300,7 @@ impl QueueClient {
     /// Returns a fresh bearer token, authenticating if the cache is
     /// empty or expired. Token is held under a mutex so concurrent
     /// callers serialize on a single auth round-trip.
-    async fn token(&self) -> QueueResult<String> {
+    async fn token(&self) -> QueueResult<crate::sensitive::SecretString> {
         let mut guard = self.inner.token.lock().await;
         if let Some(cached) = guard.as_ref() {
             // Refresh a minute early so we don't race the boundary. Measured
@@ -369,14 +359,14 @@ impl QueueClient {
             .body(verify_body)
             .send()
             .await?;
-        let token_bytes = consume(resp, TINY_RESPONSE_MAX_BYTES).await?;
+        let token_bytes = zeroize::Zeroizing::new(consume(resp, TINY_RESPONSE_MAX_BYTES).await?);
         let token: AuthToken = decode(&token_bytes).map_err(QueueClientError::Decode)?;
         // Anchor the server-supplied lifetime *duration* to our own monotonic
         // Instant — no wall clock touches this, so client/server skew can't make
         // us over-hold (spurious 401s) or refresh too eagerly. The absolute
         // `expires_at_unix_secs` is deliberately NOT used here. See L-9.
         Ok(CachedToken {
-            bearer_hex: hex::encode(token.token),
+            bearer_hex: hex::encode(token.token.as_ref()).into(),
             expires_at: std::time::Instant::now()
                 + std::time::Duration::from_secs(token.expires_in_secs),
         })
@@ -393,7 +383,7 @@ impl QueueClient {
     #[cfg(test)]
     async fn poison_token_for_test(&self) {
         *self.inner.token.lock().await = Some(CachedToken {
-            bearer_hex: "de".repeat(32), // 64 hex chars, not a token the server issued
+            bearer_hex: "de".repeat(32).into(), // 64 hex chars, not a token the server issued
             expires_at: std::time::Instant::now() + std::time::Duration::from_secs(3600),
         });
     }
@@ -460,4 +450,12 @@ fn now_unix_secs() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+fn sensitive_bearer(token: &str) -> QueueResult<reqwest::header::HeaderValue> {
+    let text = zeroize::Zeroizing::new(format!("Bearer {token}"));
+    let mut header = reqwest::header::HeaderValue::from_str(&text)
+        .map_err(|_| QueueClientError::Decode("invalid bearer header".into()))?;
+    header.set_sensitive(true);
+    Ok(header)
 }

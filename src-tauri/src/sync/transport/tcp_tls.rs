@@ -59,11 +59,24 @@ use super::Transport;
 /// the derived SPKI fingerprint. Serialized alongside the device identity.
 pub struct TlsIdentity {
     pub cert_der: Vec<u8>,
-    pub key_der: Vec<u8>,
+    key_der: zeroize::Zeroizing<Vec<u8>>,
     pub fingerprint: Fingerprint,
 }
 
 impl TlsIdentity {
+    pub(crate) fn from_der(cert_der: Vec<u8>, key_der: zeroize::Zeroizing<Vec<u8>>) -> Self {
+        let fingerprint = Fingerprint::of_cert_der(&cert_der);
+        Self {
+            cert_der,
+            key_der,
+            fingerprint,
+        }
+    }
+
+    pub(crate) fn key_der(&self) -> &[u8] {
+        &self.key_der
+    }
+
     /// Generate a stable self-signed cert. Subject CN is `corvux-sync`; the
     /// cert is valid for 20 years (effectively forever — the user manages
     /// trust via fingerprint pinning, not cert validity periods).
@@ -86,7 +99,7 @@ impl TlsIdentity {
             .self_signed(&key_pair)
             .map_err(|e| TransportError::TlsHandshake(e.to_string()))?;
         let cert_der = cert.der().to_vec();
-        let key_der = key_pair.serialize_der();
+        let key_der = zeroize::Zeroizing::new(key_pair.serialize_der());
         let fingerprint = Fingerprint::of_cert_der(&cert_der);
         Ok(Self {
             cert_der,
@@ -188,8 +201,9 @@ impl TcpTlsTransport {
 #[async_trait]
 impl Transport for TcpTlsTransport {
     async fn send(&mut self, msg: &Message) -> Result<(), TransportError> {
-        let bytes =
-            protocol::encode(msg).map_err(|e| TransportError::TlsHandshake(e.to_string()))?;
+        let bytes = zeroize::Zeroizing::new(
+            protocol::encode(msg).map_err(|e| TransportError::TlsHandshake(e.to_string()))?,
+        );
         write_frame(&mut self.writer, PROTOCOL_VERSION, &bytes).await
     }
 
@@ -215,11 +229,11 @@ impl Transport for TcpTlsTransport {
 
 pub fn build_server_config(id: &TlsIdentity) -> Result<Arc<ServerConfig>, TransportError> {
     let cert_chain = vec![CertificateDer::from(id.cert_der.clone())];
-    let key = PrivateKeyDer::try_from(id.key_der.clone())
+    let key = PrivateKeyDer::try_from(id.key_der.as_slice())
         .map_err(|e| TransportError::TlsHandshake(format!("key parse: {e}")))?;
     let config = ServerConfig::builder()
         .with_no_client_auth()
-        .with_single_cert(cert_chain, key)
+        .with_single_cert(cert_chain, key.clone_key())
         .map_err(|e| TransportError::TlsHandshake(e.to_string()))?;
     Ok(Arc::new(config))
 }
@@ -307,7 +321,8 @@ impl ServerCertVerifier for PinnedVerifier {
         // verifier accepts iff the observed cert matches the pin, full
         // stop. Mismatch is a hard reject — caller surfaces this as
         // `FingerprintMismatch` to the user.
-        if self.pinned == fp {
+        use subtle::ConstantTimeEq;
+        if bool::from(self.pinned.0.ct_eq(&fp.0)) {
             Ok(ServerCertVerified::assertion())
         } else {
             Err(rustls::Error::InvalidCertificate(
@@ -444,10 +459,12 @@ mod tests {
 
         // Attacker presents the victim's cert but its own key.
         let cert_chain = vec![CertificateDer::from(victim.cert_der.clone())];
-        let key = PrivateKeyDer::try_from(attacker.key_der.clone()).unwrap();
+        let key = PrivateKeyDer::try_from(attacker.key_der.as_slice())
+            .unwrap()
+            .clone_key();
         let server_cfg = match ServerConfig::builder()
             .with_no_client_auth()
-            .with_single_cert(cert_chain, key)
+            .with_single_cert(cert_chain, key.clone_key())
         {
             Ok(cfg) => Arc::new(cfg),
             // rustls refused the cert/key mismatch at build time — the attack is

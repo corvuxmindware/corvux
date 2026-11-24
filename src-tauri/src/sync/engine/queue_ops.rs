@@ -208,7 +208,7 @@ impl SyncEngine {
         // hatch so the type system still enforces domain separation at
         // the cipher boundary.
         let cipher = EnvelopeCipher::from_raw_key(
-            crate::sync::crypto::pairing::DomainSeparatedKey::from_derived_bytes(pair_key),
+            crate::sync::crypto::pairing::DomainSeparatedKey::from_derived_bytes(*pair_key),
         );
         // M-2 + SYN-M7 + SYN-I11: directional, roost-bound AAD (sender = us +
         // our roost, recipient = peer + the roost we pinned for it) so a queue
@@ -365,7 +365,7 @@ impl SyncEngine {
                 // AUDIT-048: re-wrap persisted derived bytes (see push path).
                 let cipher = EnvelopeCipher::from_raw_key(
                     crate::sync::crypto::pairing::DomainSeparatedKey::from_derived_bytes(
-                        route.pair_key,
+                        *route.pair_key,
                     ),
                 );
                 // SYN-M7 + SYN-I11: open with the directional, roost-bound AAD

@@ -30,6 +30,7 @@ mod perf;
 pub mod roostfs;
 mod secret_store;
 mod secure_file;
+mod sensitive;
 // `pub` so `tools/gen_bindings.rs` (declared as `[[example]]`) can call
 // `specta_bridge::build()` + `exporter()` to regenerate `bindings.ts`
 // without booting the Tauri runtime.
@@ -57,6 +58,8 @@ fn set_windows_aumid() {
     use windows::core::HSTRING;
     use windows::Win32::UI::Shell::SetCurrentProcessExplicitAppUserModelID;
     let aumid = HSTRING::from("com.corvuxmindware.corvux");
+    // SAFETY: `aumid` owns a valid NUL-terminated UTF-16 string for the call;
+    // Windows copies the ID and retains no reference to this buffer.
     let _ = unsafe { SetCurrentProcessExplicitAppUserModelID(&aumid) };
 }
 
@@ -528,6 +531,9 @@ pub fn run() {
                 use objc::rc::autoreleasepool;
                 use objc::runtime::{Object, BOOL, YES};
                 use objc::{class, msg_send, sel, sel_impl};
+                // SAFETY: wry invokes this on the UI thread with a live webview.
+                // Check for null and selector support before Objective-C calls;
+                // temporary Foundation objects remain in the autorelease pool.
                 let _ = _main_window.with_webview(|wv| unsafe {
                     autoreleasepool(|| {
                         let wkwebview = wv.inner() as *mut Object;
@@ -623,7 +629,7 @@ pub fn run() {
             std::fs::create_dir_all(&data_dir).ok();
             let settings_path = data_dir.join("settings.json");
             let mut settings: Settings = if settings_path.exists() {
-                let content = std::fs::read_to_string(&settings_path).unwrap_or_default();
+                let content = zeroize::Zeroizing::new(std::fs::read_to_string(&settings_path).unwrap_or_default());
                 serde_json::from_str(&content).unwrap_or_default()
             } else {
                 Settings::default()

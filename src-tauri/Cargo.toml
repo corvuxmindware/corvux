@@ -3,6 +3,7 @@ name = "corvux"
 version = "0.2.5"
 edition = "2021"
 license = "Apache-2.0"
+rust-version = "1.96"
 description = "AI-Native Second Brain"
 authors = ["Corvux Mindware"]
 # Disambiguate `cargo run` (used by `tauri dev`) when extra binaries like
@@ -47,6 +48,9 @@ path = "src/main.rs"
 # Whitelist just that cfg — real unknown cfgs are still warned about. CI
 # (Linux) never compiles the macOS code, so this only matters locally.
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("cargo-clippy"))'] }
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
@@ -193,7 +197,7 @@ x25519-dalek = "2"
 hmac = "0.12"
 sha2 = "0.10"
 hkdf = "0.12"
-zeroize = { version = "1", features = ["derive"] }
+zeroize = { version = "1", features = ["derive", "serde"] }
 subtle = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
@@ -206,7 +210,10 @@ uuid = { version = "1", features = ["v4", "serde"] }
 # OS keychain (keyring crate); mobile doesn't have that, so we encrypt the
 # key material before writing it to settings.json. The encryption key is
 # derived via HKDF from a random seed stored in app-private storage.
-aes-gcm = "0.10"
+aes-gcm = { version = "0.10", features = ["zeroize"] }
+# Enable wiping of the expanded AES schedule and GHASH state as well.
+aes = { version = "0.8", features = ["zeroize"] }
+ghash = { version = "0.5", features = ["zeroize"] }
 # XChaCha20-Poly1305 for the sync app-layer envelope. Wraps every
 # post-handshake `Message` with a per-pair session subkey (HKDF off the
 # pairing `SessionSecret`). The 24-byte XChaCha nonce lets us pick fresh

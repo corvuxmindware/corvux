@@ -141,7 +141,7 @@ pub struct AuthVerifyRequest {
 pub struct AuthToken {
     /// Opaque 32-byte bearer. Hex-encoded in the `Authorization: Bearer`
     /// header. Random — not derivable from NodeId so logs don't leak.
-    pub token: [u8; 32],
+    pub token: crate::sensitive::SecretBytes,
     /// Token expiry as the **server's** absolute wall clock. Retained for
     /// server-side introspection/logging; clients must NOT convert this to
     /// their own clock (see `expires_in_secs`).

@@ -48,6 +48,7 @@ dependencies = [
  "cfg-if",
  "cipher",
  "cpufeatures 0.2.17",
+ "zeroize",
 ]
 
 [[package]]
@@ -62,6 +63,7 @@ dependencies = [
  "ctr",
  "ghash",
  "subtle",
+ "zeroize",
 ]
 
 [[package]]
@@ -1152,6 +1154,7 @@ dependencies = [
 name = "corvux"
 version = "0.2.5"
 dependencies = [
+ "aes",
  "aes-gcm",
  "async-trait",
  "automerge",
@@ -1167,6 +1170,7 @@ dependencies = [
  "ed25519-dalek 2.2.0",
  "encoding_rs",
  "futures-util",
+ "ghash",
  "hex",
  "hkdf",
  "hmac",
@@ -2635,6 +2639,7 @@ checksum = "f0d8a4362ccb29cb0b265253fb0a2728f592895ee6854fd9bc13f2ffda266ff1"
 dependencies = [
  "opaque-debug",
  "polyval",
+ "zeroize",
 ]
 
 [[package]]
@@ -10075,6 +10080,7 @@ version = "1.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e13c156562582aa81c60cb29407084cdb54c4164760106ab78e6c5b0858cf64e"
 dependencies = [
+ "serde",
  "zeroize_derive",
 ]
 

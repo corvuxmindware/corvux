@@ -31,12 +31,16 @@ use super::tool_translator::gemini::MIGRATION_DUMMY_SIGNATURE;
 
 pub struct GeminiChat {
     client: Arc<Client>,
-    api_key: String,
+    api_key: crate::sensitive::SecretString,
     model: String,
 }
 
 impl GeminiChat {
-    pub fn new(client: Arc<Client>, api_key: String, model: String) -> Self {
+    pub fn new(
+        client: Arc<Client>,
+        api_key: crate::sensitive::SecretString,
+        model: String,
+    ) -> Self {
         Self {
             client,
             api_key,
@@ -305,7 +309,7 @@ async fn stream_chat_impl<R: tauri::Runtime>(
 async fn stream_chat_with_tools_impl<R: tauri::Runtime + 'static>(
     client: Arc<Client>,
     app: tauri::AppHandle<R>,
-    api_key: String,
+    api_key: crate::sensitive::SecretString,
     model: String,
     messages: Vec<ChatMessage>,
     system_context: Option<String>,
@@ -339,7 +343,7 @@ async fn stream_chat_with_tools_impl<R: tauri::Runtime + 'static>(
 
     let response = client
         .post(&url)
-        .header("x-goog-api-key", &api_key)
+        .header("x-goog-api-key", api_key.as_ref())
         .json(&body)
         .send()
         .await

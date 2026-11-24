@@ -45,12 +45,16 @@ const MAX_TOKENS: u32 = 8192;
 
 pub struct AnthropicChat {
     client: Arc<Client>,
-    api_key: String,
+    api_key: crate::sensitive::SecretString,
     model: String,
 }
 
 impl AnthropicChat {
-    pub fn new(client: Arc<Client>, api_key: String, model: String) -> Self {
+    pub fn new(
+        client: Arc<Client>,
+        api_key: crate::sensitive::SecretString,
+        model: String,
+    ) -> Self {
         Self {
             client,
             api_key,
@@ -238,7 +242,7 @@ async fn stream_chat_impl<R: tauri::Runtime>(
 async fn stream_chat_with_tools_impl<R: tauri::Runtime + 'static>(
     client: Arc<Client>,
     app: tauri::AppHandle<R>,
-    api_key: String,
+    api_key: crate::sensitive::SecretString,
     model: String,
     messages: Vec<ChatMessage>,
     system_context: Option<String>,

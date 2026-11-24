@@ -36,7 +36,7 @@ pub trait SecretBackend: Send + Sync {
     /// access denied, unreadable). Callers MUST NOT collapse the two: treating
     /// an error as "absent" turns a transient keychain hiccup into a permanent
     /// credential loss (security audit M-1, 2026-11-07).
-    fn get(&self, key: &str) -> Result<Option<String>, String>;
+    fn get(&self, key: &str) -> Result<Option<crate::sensitive::SecretString>, String>;
     fn set(&self, key: &str, value: &str) -> Result<(), String>;
     fn delete(&self, key: &str) -> Result<(), String>;
 }
@@ -46,7 +46,7 @@ pub trait SecretBackend: Send + Sync {
 pub struct LiveSecretBackend;
 
 impl SecretBackend for LiveSecretBackend {
-    fn get(&self, key: &str) -> Result<Option<String>, String> {
+    fn get(&self, key: &str) -> Result<Option<crate::sensitive::SecretString>, String> {
         secret_store::get(key)
     }
     fn set(&self, key: &str, value: &str) -> Result<(), String> {
@@ -141,8 +141,23 @@ fn fresh_scope() -> [u8; 16] {
     scope
 }
 
+// Reconnect needs addresses plus the resumption credential, never the QR secret.
+fn reconnect_address(addr: String) -> (String, bool) {
+    if addr.starts_with("corvux1:") {
+        let sensitive = crate::sensitive::SecretString::from(addr);
+        if let Ok(peer) = crate::sync::transport::iroh::decode_ticket(&sensitive) {
+            if let Ok(ticket) = crate::sync::transport::iroh::encode_ticket(&peer, None) {
+                let changed = ticket != sensitive;
+                return (ticket.to_string(), changed);
+            }
+        }
+        return (sensitive.to_string(), false);
+    }
+    (addr, false)
+}
+
 fn decode_hex_array<const N: usize>(s: &str) -> Option<[u8; N]> {
-    let bytes = hex::decode(s).ok()?;
+    let bytes = zeroize::Zeroizing::new(hex::decode(s).ok()?);
     <[u8; N]>::try_from(bytes.as_slice()).ok()
 }
 
@@ -183,7 +198,7 @@ pub struct PeerRecord {
     /// replace this with a derived session secret so PIN re-entry is
     /// truly never required; today the PIN handshake runs on every
     /// connection and the saved PIN is how "it just reconnects" works.
-    pub last_known_pin: Option<String>,
+    pub last_known_pin: Option<crate::sensitive::SecretString>,
 
     /// Peer's 32-byte iroh `NodeId` (raw Ed25519 public key). Captured
     /// once we observe the peer over an iroh transport; `None` for legacy
@@ -197,7 +212,7 @@ pub struct PeerRecord {
     /// queue messages without an active handshake. `None` until the
     /// next successful pairing — pre-queue pairings can still sync
     /// live, just can't push offline.
-    pub queue_pair_key: Option<[u8; 32]>,
+    pub queue_pair_key: Option<crate::sensitive::SecretBytes>,
 
     /// AUDIT-015: the roost id this peer advertised at first pair. `None`
     /// for peers paired before the fix landed — first reconnect after
@@ -211,7 +226,7 @@ pub struct PeerRecord {
     /// instead of re-proving the human PIN — so a PIN leaked after pairing is
     /// no longer a permanent roost credential. Keychain-backed (not in the
     /// on-disk record). `None` = never completed a v5 pair → fall back to PIN.
-    pub resumption_token: Option<[u8; 32]>,
+    pub resumption_token: Option<crate::sensitive::SecretBytes>,
 }
 
 impl PeerRecord {
@@ -244,17 +259,17 @@ impl PeerRecord {
     pub fn queue_route(&self) -> Option<QueueRoute> {
         Some(QueueRoute {
             node_id: self.peer_node_id?,
-            pair_key: self.queue_pair_key?,
+            pair_key: self.queue_pair_key.clone()?,
             peer_vault_id: self.peer_vault_id?,
         })
     }
 }
 
 /// See [`PeerRecord::queue_route`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QueueRoute {
     pub node_id: [u8; 32],
-    pub pair_key: [u8; 32],
+    pub pair_key: crate::sensitive::SecretBytes,
     pub peer_vault_id: [u8; 16],
 }
 
@@ -306,7 +321,7 @@ struct PeerRecordV2 {
     paired_at_millis: u64,
     last_seen_millis: u64,
     last_known_addr: Option<String>,
-    last_known_pin: Option<String>,
+    last_known_pin: Option<crate::sensitive::SecretString>,
 }
 
 impl From<PeerRecordV2> for PeerRecord {
@@ -344,9 +359,9 @@ struct PeerRecordV3 {
     paired_at_millis: u64,
     last_seen_millis: u64,
     last_known_addr: Option<String>,
-    last_known_pin: Option<String>,
+    last_known_pin: Option<crate::sensitive::SecretString>,
     peer_node_id: Option<[u8; 32]>,
-    queue_pair_key: Option<[u8; 32]>,
+    queue_pair_key: Option<crate::sensitive::SecretBytes>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -423,7 +438,7 @@ fn hydrate_v4(
     src: SecretSource,
 ) -> Result<PeerRecord, StoreError> {
     let id_hex = hex::encode(v4.device_id);
-    let get = |kind: PeerSecret| -> Result<Option<String>, StoreError> {
+    let get = |kind: PeerSecret| -> Result<Option<crate::sensitive::SecretString>, StoreError> {
         let key = match src {
             SecretSource::Scoped(scope) => kind.scoped_key(scope, &id_hex),
             SecretSource::Legacy => kind.legacy_key(&id_hex),
@@ -441,9 +456,11 @@ fn hydrate_v4(
         last_known_addr: v4.last_known_addr,
         last_known_pin: get(PeerSecret::Pin)?,
         peer_node_id: v4.peer_node_id,
-        queue_pair_key: get(PeerSecret::QueueKey)?.and_then(|s| decode_hex_array(&s)),
+        queue_pair_key: get(PeerSecret::QueueKey)?
+            .and_then(|s| decode_hex_array(&s).map(Into::into)),
         peer_vault_id: get(PeerSecret::PeerVaultId)?.and_then(|s| decode_hex_array(&s)),
-        resumption_token: get(PeerSecret::ResumptionToken)?.and_then(|s| decode_hex_array(&s)),
+        resumption_token: get(PeerSecret::ResumptionToken)?
+            .and_then(|s| decode_hex_array(&s).map(Into::into)),
     })
 }
 
@@ -520,7 +537,7 @@ impl PeerStore {
                 secrets,
             });
         }
-        let bytes = fs::read(&path)?;
+        let bytes = zeroize::Zeroizing::new(fs::read(&path)?);
         // Peek at just the version so we can dispatch to the right
         // decoder. Postcard is length-tagged per field, so reading just a
         // `u16` off the front is safe and cheap.
@@ -532,7 +549,7 @@ impl PeerStore {
             .map_err(|e| StoreError::Decode(format!("peer file header: {e}")))?
             .version;
 
-        let (scope, records): ([u8; 16], Vec<PeerRecord>) = match version {
+        let (scope, mut records): ([u8; 16], Vec<PeerRecord>) = match version {
             5 => {
                 let env: Envelope =
                     postcard::from_bytes(&bytes).map_err(|e| StoreError::Decode(e.to_string()))?;
@@ -585,6 +602,14 @@ impl PeerStore {
             }
         };
 
+        let mut stripped_ticket = false;
+        for record in &mut records {
+            if let Some(addr) = record.last_known_addr.take() {
+                let (addr, changed) = reconnect_address(addr);
+                record.last_known_addr = Some(addr);
+                stripped_ticket |= changed;
+            }
+        }
         let peers = records.into_iter().map(|p| (p.device_id, p)).collect();
         let store = Self {
             path,
@@ -609,6 +634,9 @@ impl PeerStore {
                 );
                 e
             })?;
+        }
+        if version == PEER_FILE_VERSION && stripped_ticket {
+            store.flush()?;
         }
         Ok(store)
     }
@@ -692,11 +720,11 @@ impl PeerStore {
         &mut self,
         device: DeviceId,
         addr: Option<String>,
-        pin: Option<String>,
+        pin: Option<crate::sensitive::SecretString>,
     ) -> Result<(), StoreError> {
         if let Some(existing) = self.peers.get_mut(&device.0) {
             if addr.is_some() {
-                existing.last_known_addr = addr;
+                existing.last_known_addr = addr.map(|addr| reconnect_address(addr).0);
             }
             if pin.is_some() {
                 existing.last_known_pin = pin;
@@ -721,7 +749,7 @@ impl PeerStore {
         &mut self,
         device: DeviceId,
         peer_node_id: Option<[u8; 32]>,
-        queue_pair_key: Option<[u8; 32]>,
+        queue_pair_key: Option<crate::sensitive::SecretBytes>,
     ) -> Result<(), StoreError> {
         if let Some(existing) = self.peers.get_mut(&device.0) {
             if peer_node_id.is_some() {
@@ -778,7 +806,7 @@ impl PeerStore {
     pub fn remember_resumption_token(
         &mut self,
         device: DeviceId,
-        token: Option<[u8; 32]>,
+        token: Option<crate::sensitive::SecretBytes>,
     ) -> Result<(), StoreError> {
         if let (Some(existing), Some(tok)) = (self.peers.get_mut(&device.0), token) {
             existing.resumption_token = Some(tok);
@@ -827,16 +855,22 @@ impl PeerStore {
 
     /// Every secret this registry holds, as `(keychain key, value)` under its
     /// scoped keys.
-    fn scoped_secret_entries(&self) -> Vec<(PeerSecret, String, String)> {
+    fn scoped_secret_entries(&self) -> Vec<(PeerSecret, String, crate::sensitive::SecretString)> {
         let mut out = Vec::new();
         for record in self.peers.values() {
             let id_hex = hex::encode(record.device_id);
             for kind in PeerSecret::ALL {
                 let value = match kind {
                     PeerSecret::Pin => record.last_known_pin.clone(),
-                    PeerSecret::QueueKey => record.queue_pair_key.map(hex::encode),
-                    PeerSecret::ResumptionToken => record.resumption_token.map(hex::encode),
-                    PeerSecret::PeerVaultId => record.peer_vault_id.map(hex::encode),
+                    PeerSecret::QueueKey => record
+                        .queue_pair_key
+                        .as_ref()
+                        .map(|k| hex::encode(k.as_ref()).into()),
+                    PeerSecret::ResumptionToken => record
+                        .resumption_token
+                        .as_ref()
+                        .map(|k| hex::encode(k.as_ref()).into()),
+                    PeerSecret::PeerVaultId => record.peer_vault_id.map(|k| hex::encode(k).into()),
                 };
                 if let Some(value) = value {
                     out.push((kind, kind.scoped_key(&self.scope, &id_hex), value));
@@ -983,11 +1017,11 @@ mod tests {
     }
 
     impl SecretBackend for InMemorySecretBackend {
-        fn get(&self, key: &str) -> Result<Option<String>, String> {
+        fn get(&self, key: &str) -> Result<Option<crate::sensitive::SecretString>, String> {
             if self.fail_get.load(std::sync::atomic::Ordering::SeqCst) {
                 return Err("keychain locked".into());
             }
-            Ok(self.inner.lock().unwrap().get(key).cloned())
+            Ok(self.inner.lock().unwrap().get(key).cloned().map(Into::into))
         }
         fn set(&self, key: &str, value: &str) -> Result<(), String> {
             if self.fail_set.load(std::sync::atomic::Ordering::SeqCst) {
@@ -1015,7 +1049,7 @@ mod tests {
 
     /// Read a secret in an assertion (the test backend only errors when told to).
     fn peek(secrets: &Arc<dyn SecretBackend>, key: &str) -> Option<String> {
-        secrets.get(key).unwrap()
+        secrets.get(key).unwrap().map(|s| s.to_string())
     }
 
     fn file_version(dir: &std::path::Path) -> u16 {
@@ -1168,13 +1202,13 @@ mod tests {
             )
             .unwrap();
         store
-            .remember_queue_pair(DeviceId([1; 16]), Some([0xab; 32]), Some([0xcd; 32]))
+            .remember_queue_pair(DeviceId([1; 16]), Some([0xab; 32]), Some([0xcd; 32].into()))
             .unwrap();
         store
             .remember_peer_vault_id(DeviceId([1; 16]), [0x11; 16])
             .unwrap();
         store
-            .remember_resumption_token(DeviceId([1; 16]), Some([0x77; 32]))
+            .remember_resumption_token(DeviceId([1; 16]), Some([0x77; 32].into()))
             .unwrap();
 
         // Reconnect: the connection path re-records identity (zeroed
@@ -1197,11 +1231,15 @@ mod tests {
             "redial PIN must survive a reconnect"
         );
         assert_eq!(got.peer_node_id, Some([0xab; 32]), "node id preserved");
-        assert_eq!(got.queue_pair_key, Some([0xcd; 32]), "queue key preserved");
+        assert_eq!(
+            got.queue_pair_key,
+            Some([0xcd; 32].into()),
+            "queue key preserved"
+        );
         assert_eq!(got.peer_vault_id, Some([0x11; 16]), "vault id preserved");
         assert_eq!(
             got.resumption_token,
-            Some([0x77; 32]),
+            Some([0x77; 32].into()),
             "SEC-2 resumption token must survive a reconnect"
         );
         assert_eq!(
@@ -1261,12 +1299,12 @@ mod tests {
         let mut store = load(roost.path(), secrets.clone());
         store.upsert(rec(1, "laptop")).unwrap();
         store
-            .remember_queue_pair(DeviceId([1; 16]), Some([0xab; 32]), Some([0xcd; 32]))
+            .remember_queue_pair(DeviceId([1; 16]), Some([0xab; 32]), Some([0xcd; 32].into()))
             .unwrap();
         let reloaded = load(roost.path(), secrets);
         let got = reloaded.get(DeviceId([1; 16])).unwrap();
         assert_eq!(got.peer_node_id, Some([0xab; 32]));
-        assert_eq!(got.queue_pair_key, Some([0xcd; 32]));
+        assert_eq!(got.queue_pair_key, Some([0xcd; 32].into()));
     }
 
     /// B2 (set-once): the per-pair queue key must be written exactly once and
@@ -1286,24 +1324,24 @@ mod tests {
 
         // First pair: empty slot is filled.
         store
-            .remember_queue_pair(DeviceId([1; 16]), Some([0xab; 32]), Some([0xcd; 32]))
+            .remember_queue_pair(DeviceId([1; 16]), Some([0xab; 32]), Some([0xcd; 32].into()))
             .unwrap();
         assert_eq!(
             store.get(DeviceId([1; 16])).unwrap().queue_pair_key,
-            Some([0xcd; 32])
+            Some([0xcd; 32].into())
         );
 
         // Reconnect: a freshly (re-)derived, DIFFERENT key must NOT overwrite —
         // the stored first-pair key is preserved so queued ciphertext stays
         // decryptable. The NodeId, however, still refreshes.
         store
-            .remember_queue_pair(DeviceId([1; 16]), Some([0x11; 32]), Some([0x99; 32]))
+            .remember_queue_pair(DeviceId([1; 16]), Some([0x11; 32]), Some([0x99; 32].into()))
             .unwrap();
         let reloaded = load(roost.path(), secrets);
         let got = reloaded.get(DeviceId([1; 16])).unwrap();
         assert_eq!(
             got.queue_pair_key,
-            Some([0xcd; 32]),
+            Some([0xcd; 32].into()),
             "the queue key must be frozen at its first-pair value, never rotated on reconnect"
         );
         assert_eq!(
@@ -1366,7 +1404,7 @@ mod tests {
                 last_known_addr: Some("corvux1:zzz".into()),
                 last_known_pin: Some("424242".into()),
                 peer_node_id: Some([0xaa; 32]),
-                queue_pair_key: Some([0xbb; 32]),
+                queue_pair_key: Some([0xbb; 32].into()),
             }],
         };
         std::fs::write(&path, postcard::to_allocvec(&v3).unwrap()).unwrap();
@@ -1377,7 +1415,7 @@ mod tests {
         // Reading exposes the migrated secrets via the in-memory record.
         let got = store.get(DeviceId([3; 16])).unwrap();
         assert_eq!(got.last_known_pin.as_deref(), Some("424242"));
-        assert_eq!(got.queue_pair_key, Some([0xbb; 32]));
+        assert_eq!(got.queue_pair_key, Some([0xbb; 32].into()));
 
         // The on-disk file is now v5 and contains NO secrets.
         let bytes = std::fs::read(&path).unwrap();
@@ -1424,14 +1462,14 @@ mod tests {
             .ensure_peer(device, [0u8; 32], format!("peer-{seed}"))
             .unwrap();
         store
-            .remember_connection(device, None, Some(format!("{seed}{seed}{seed}")))
+            .remember_connection(device, None, Some(format!("{seed}{seed}{seed}").into()))
             .unwrap();
         store
-            .remember_queue_pair(device, Some([seed; 32]), Some([seed; 32]))
+            .remember_queue_pair(device, Some([seed; 32]), Some([seed; 32].into()))
             .unwrap();
         store.remember_peer_vault_id(device, [seed; 16]).unwrap();
         store
-            .remember_resumption_token(device, Some([seed; 32]))
+            .remember_resumption_token(device, Some([seed; 32].into()))
             .unwrap();
     }
 
@@ -1441,9 +1479,17 @@ mod tests {
             Some(format!("{seed}{seed}{seed}").as_str()),
             "{ctx}: PIN"
         );
-        assert_eq!(got.queue_pair_key, Some([seed; 32]), "{ctx}: queue key");
+        assert_eq!(
+            got.queue_pair_key,
+            Some([seed; 32].into()),
+            "{ctx}: queue key"
+        );
         assert_eq!(got.peer_vault_id, Some([seed; 16]), "{ctx}: peer vault id");
-        assert_eq!(got.resumption_token, Some([seed; 32]), "{ctx}: token");
+        assert_eq!(
+            got.resumption_token,
+            Some([seed; 32].into()),
+            "{ctx}: token"
+        );
     }
 
     /// SYN-I11 regression: the SAME peer device paired in two roosts (Work↔Work,
@@ -1577,8 +1623,8 @@ mod tests {
         let store = load(roost.path(), secrets.clone());
         let got = store.get(DeviceId(device)).unwrap();
         assert_eq!(got.last_known_pin.as_deref(), Some("424242"));
-        assert_eq!(got.queue_pair_key, Some([0xbb; 32]));
-        assert_eq!(got.resumption_token, Some([0xcc; 32]));
+        assert_eq!(got.queue_pair_key, Some([0xbb; 32].into()));
+        assert_eq!(got.resumption_token, Some([0xcc; 32].into()));
         assert_eq!(got.peer_vault_id, Some([0xdd; 16]));
 
         let bytes = std::fs::read(peers_file(roost.path())).unwrap();
@@ -1596,8 +1642,8 @@ mod tests {
         let reloaded = load(roost.path(), secrets);
         let again = reloaded.get(DeviceId(device)).unwrap();
         assert_eq!(again.last_known_pin.as_deref(), Some("424242"));
-        assert_eq!(again.queue_pair_key, Some([0xbb; 32]));
-        assert_eq!(again.resumption_token, Some([0xcc; 32]));
+        assert_eq!(again.queue_pair_key, Some([0xbb; 32].into()));
+        assert_eq!(again.resumption_token, Some([0xcc; 32].into()));
         assert_eq!(again.peer_vault_id, Some([0xdd; 16]));
     }
 
@@ -1639,14 +1685,14 @@ mod tests {
         let mut r = rec(1, "phone");
         assert_eq!(r.queue_route(), None);
         r.peer_node_id = Some([1; 32]);
-        r.queue_pair_key = Some([2; 32]);
+        r.queue_pair_key = Some([2; 32].into());
         assert_eq!(r.queue_route(), None, "no pinned roost id yet");
         r.peer_vault_id = Some([3; 16]);
         assert_eq!(
             r.queue_route(),
             Some(QueueRoute {
                 node_id: [1; 32],
-                pair_key: [2; 32],
+                pair_key: [2; 32].into(),
                 peer_vault_id: [3; 16],
             })
         );
@@ -1697,8 +1743,8 @@ mod tests {
         let store = load(roost.path(), secrets);
         let got = store.get(DeviceId(device)).unwrap();
         assert_eq!(got.last_known_pin.as_deref(), Some("424242"));
-        assert_eq!(got.queue_pair_key, Some([0xbb; 32]));
-        assert_eq!(got.resumption_token, Some([0xcc; 32]));
+        assert_eq!(got.queue_pair_key, Some([0xbb; 32].into()));
+        assert_eq!(got.resumption_token, Some([0xcc; 32].into()));
         assert_eq!(got.peer_vault_id, Some([0xdd; 16]));
         assert_eq!(file_version(roost.path()), PEER_FILE_VERSION);
     }
@@ -1730,7 +1776,7 @@ mod tests {
         let store = load(roost.path(), secrets);
         assert_eq!(
             store.get(DeviceId(device)).unwrap().resumption_token,
-            Some([0xcc; 32])
+            Some([0xcc; 32].into())
         );
         assert_eq!(file_version(roost.path()), PEER_FILE_VERSION);
     }
@@ -1789,5 +1835,29 @@ mod tests {
         }
         // No registry at all → no-op, no panic.
         purge_registry_secrets_with(&personal.path().join("nope"), secrets.as_ref());
+    }
+}
+
+#[cfg(test)]
+mod reconnect_ticket_tests {
+    use super::*;
+    #[test]
+    fn reconnect_address_strips_one_time_secret_and_keeps_endpoint() {
+        let key = iroh::SecretKey::from_bytes(&[7u8; 32]);
+        let addr = iroh::EndpointAddr::new(key.public());
+        let secret = crate::sync::crypto::pairing::PairingSecret::generate();
+        let ticket = crate::sync::transport::iroh::encode_ticket(&addr, Some(&secret)).unwrap();
+        let (clean, changed) = reconnect_address(ticket.to_string());
+        assert!(changed);
+        assert!(crate::sync::transport::iroh::decode_ticket_secret(&clean).is_none());
+        assert_eq!(
+            crate::sync::transport::iroh::decode_ticket(&clean)
+                .unwrap()
+                .id,
+            addr.id
+        );
+        let (same, changed) = reconnect_address(clean.clone());
+        assert!(!changed);
+        assert_eq!(same, clean);
     }
 }

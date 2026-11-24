@@ -269,13 +269,13 @@ mod no_raw_fs_writes_test {
             ),
             (
                 "sync.rs",
-                "let Ok(bytes) = std::fs::read(&path) else {",
+                "let bytes = match std::fs::read(&path) {",
                 1,
                 "sync preferences in app-data",
             ),
             (
                 "sync.rs",
-                "let bytes = std::fs::read(&path)?;",
+                "let bytes = zeroize::Zeroizing::new(std::fs::read(&path)?);",
                 1,
                 "persisted TLS identity in app-data",
             ),

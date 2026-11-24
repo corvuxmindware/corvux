@@ -51,7 +51,8 @@ pub enum LlmProvider {
 #[derive(Debug, Clone, Serialize, Deserialize, specta::Type)]
 pub struct Settings {
     #[serde(default)]
-    pub gemini_api_key: Option<String>,
+    #[specta(type = Option<String>)]
+    pub gemini_api_key: Option<crate::sensitive::SecretString>,
     #[serde(default = "default_model")]
     pub model: String,
     #[serde(default)]
@@ -71,7 +72,8 @@ pub struct Settings {
     /// can keep both keys configured and switch providers without
     /// re-pasting.
     #[serde(default)]
-    pub openrouter_api_key: Option<String>,
+    #[specta(type = Option<String>)]
+    pub openrouter_api_key: Option<crate::sensitive::SecretString>,
     /// Active OpenRouter model id, in `provider/model-name` form (e.g.
     /// `anthropic/claude-sonnet-4.6`). Treated as opaque text so the
     /// user can paste any model id OpenRouter advertises — we don't
@@ -91,12 +93,14 @@ pub struct Settings {
     /// Optional bearer token for users who front their Ollama server
     /// with an auth proxy. `None` is the common localhost case.
     #[serde(default)]
-    pub ollama_api_key: Option<String>,
+    #[specta(type = Option<String>)]
+    pub ollama_api_key: Option<crate::sensitive::SecretString>,
     /// OpenAI API key (direct provider). Independent from the other
     /// provider keys so users can keep several configured and switch
     /// without re-pasting. Kept in the OS keychain (Locked Decision #10).
     #[serde(default)]
-    pub openai_api_key: Option<String>,
+    #[specta(type = Option<String>)]
+    pub openai_api_key: Option<crate::sensitive::SecretString>,
     /// Active OpenAI model id (e.g. `gpt-5.5`, `gpt-5.4-nano`). Opaque
     /// text — we don't hardcode an allowlist so the user can paste any
     /// model their key can reach.
@@ -105,7 +109,8 @@ pub struct Settings {
     /// Anthropic (Claude) API key (direct provider). Independent from the
     /// other provider keys; stored in the OS keychain.
     #[serde(default)]
-    pub anthropic_api_key: Option<String>,
+    #[specta(type = Option<String>)]
+    pub anthropic_api_key: Option<crate::sensitive::SecretString>,
     /// Active Claude model id (e.g. `claude-sonnet-5`, `claude-opus-4-8`).
     /// Opaque text — no hardcoded allowlist.
     #[serde(default = "default_anthropic_model")]

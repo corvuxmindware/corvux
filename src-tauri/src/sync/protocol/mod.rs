@@ -246,8 +246,8 @@ pub enum Message {
         /// after a restart, instead of reconnect being one-directional (only
         /// the original scanner could redial). `None` on redials and on legacy
         /// peers that predate this field.
-        dialer_ticket: Option<String>,
-        dialer_pin: Option<String>,
+        dialer_ticket: Option<crate::sensitive::SecretString>,
+        dialer_pin: Option<crate::sensitive::SecretString>,
         /// Client's ephemeral X25519 public key for this handshake (H-2/H-3).
         /// The server combines it with its own ephemeral key to derive a
         /// per-handshake ECDH secret mixed into the session key, giving

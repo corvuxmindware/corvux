@@ -180,11 +180,14 @@ pub struct ClientHandshake {
     pin: Pin,
     /// Symmetric pairing: our own (ticket, hosting-pin) offered to the host so
     /// it can dial us back. `None` = don't offer (redials / legacy).
-    reconnect_offer: Option<(String, String)>,
+    reconnect_offer: Option<(
+        crate::sensitive::SecretString,
+        crate::sensitive::SecretString,
+    )>,
     /// SEC-2: if set, authenticate by proving THIS resumption token instead of
     /// the human PIN (reconnect to an already-paired peer). `None` = first pair
     /// → prove the PIN.
-    resumption_token: Option<[u8; 32]>,
+    resumption_token: Option<crate::sensitive::SecretBytes>,
     /// SRX layer 3: the one-time pairing secret we extracted from the scanned/
     /// pasted ticket. When set, the first-pair proof/session key is derived from
     /// PIN + secret, so a peer that never obtained the ticket can't forge it.
@@ -249,15 +252,22 @@ impl ClientHandshake {
     /// SEC-2: authenticate this handshake with a stored resumption token
     /// (reconnect) instead of the human PIN. Set only when we already have a
     /// token for this peer from a prior pairing.
-    pub fn with_resumption_token(mut self, token: [u8; 32]) -> Self {
-        self.resumption_token = Some(token);
+    pub fn with_resumption_token(
+        mut self,
+        token: impl Into<crate::sensitive::SecretBytes>,
+    ) -> Self {
+        self.resumption_token = Some(token.into());
         self
     }
 
     /// Offer our own redial credentials (dialable ticket + our hosting PIN) in
     /// the Hello, so the host can dial us back after a restart. Used only on
     /// the initial pair; redials don't re-offer (the host already stored them).
-    pub fn with_reconnect_offer(mut self, ticket: String, pin: String) -> Self {
+    pub fn with_reconnect_offer(
+        mut self,
+        ticket: crate::sensitive::SecretString,
+        pin: crate::sensitive::SecretString,
+    ) -> Self {
         self.reconnect_offer = Some((ticket, pin));
         self
     }
@@ -351,8 +361,8 @@ impl ClientHandshake {
                 // stays consistent.
                 let (proof, session) = match &self.resumption_token {
                     Some(tok) => (
-                        proof_from_key(tok, &nonce, &transcript)?,
-                        derive_session_from_key(tok, &nonce, &ecdh)?,
+                        proof_from_key(tok.as_ref(), &nonce, &transcript)?,
+                        derive_session_from_key(tok.as_ref(), &nonce, &ecdh)?,
                     ),
                     None => {
                         // SRX layer 3: first-pair key = PIN folded with the
@@ -421,7 +431,7 @@ pub enum ServerState {
         peer_vault_id: [u8; 16],
         /// SEC-2: `Some(token)` if we're authenticating this connection by a
         /// stored resumption token (reconnect); `None` = verify the PIN.
-        auth_token: Option<[u8; 32]>,
+        auth_token: Option<crate::sensitive::SecretBytes>,
         /// H-1/H-2: the channel-binding transcript (see `build_transcript`) the
         /// proof is bound to. Stored so the proof can be verified against the
         /// exact transcript we issued the challenge under.
@@ -462,12 +472,15 @@ pub struct ServerHandshake {
     /// its `Hello`. The caller (`run_handshake` → accept path) reads this via
     /// [`Self::peer_reconnect`] after a successful handshake and stores it so
     /// WE can dial the dialer back. `None` if the dialer didn't offer.
-    peer_reconnect: Option<(String, String)>,
+    peer_reconnect: Option<(
+        crate::sensitive::SecretString,
+        crate::sensitive::SecretString,
+    )>,
     /// SEC-2: resumption tokens we hold, keyed by device id. When an incoming
     /// `Hello` names a device we have a token for, we authenticate that
     /// connection by verifying the token (reconnect) instead of the human PIN.
     /// Pre-loaded by the accept path from the peer store.
-    resumption_tokens: HashMap<DeviceId, [u8; 32]>,
+    resumption_tokens: HashMap<DeviceId, crate::sensitive::SecretBytes>,
     /// M-11: the source key (remote IP) this connection is rate-limited under.
     /// The shared limiter tracks backoff per key, so one abusive source can't
     /// lock out pairing for everyone. Empty string = ungrouped (tests / the
@@ -568,7 +581,10 @@ impl ServerHandshake {
     /// SEC-2: supply the resumption tokens we hold (keyed by device id) so an
     /// incoming reconnect from a known peer authenticates by proving its token
     /// rather than re-proving the human PIN.
-    pub fn with_resumption_tokens(mut self, tokens: HashMap<DeviceId, [u8; 32]>) -> Self {
+    pub fn with_resumption_tokens(
+        mut self,
+        tokens: HashMap<DeviceId, crate::sensitive::SecretBytes>,
+    ) -> Self {
         self.resumption_tokens = tokens;
         self
     }
@@ -585,7 +601,12 @@ impl ServerHandshake {
 
     /// The dialer's redial credentials captured from its `Hello`, if it offered
     /// them (symmetric pairing). Valid only after a successful handshake.
-    pub fn peer_reconnect(&self) -> Option<(String, String)> {
+    pub fn peer_reconnect(
+        &self,
+    ) -> Option<(
+        crate::sensitive::SecretString,
+        crate::sensitive::SecretString,
+    )> {
         self.peer_reconnect.clone()
     }
 
@@ -765,9 +786,9 @@ impl ServerHandshake {
                 // SEC-2: if we hold a resumption token for this device, this is
                 // a reconnect — authenticate + derive the session from the
                 // token. Otherwise it's a first pair — use the human PIN.
-                let auth_token = self.resumption_tokens.get(&DeviceId(device_id)).copied();
+                let auth_token = self.resumption_tokens.get(&DeviceId(device_id)).cloned();
                 let session = match &auth_token {
-                    Some(tok) => derive_session_from_key(tok, &nonce, &ecdh)?,
+                    Some(tok) => derive_session_from_key(tok.as_ref(), &nonce, &ecdh)?,
                     None => {
                         // SRX layer 3: first-pair key = PIN folded with the
                         // secret we minted + embedded in the ticket. A caller
@@ -802,14 +823,14 @@ impl ServerHandshake {
                 Message::PairingProof { proof },
             ) => {
                 let nonce = *nonce;
-                let auth_token = *auth_token;
+                let auth_token = auth_token.clone();
                 let transcript = transcript.clone();
                 let claimed = Proof(proof);
                 // Verify against the resumption token (reconnect) or the PIN
                 // (first pair) — whichever we chose when issuing the challenge —
                 // channel-bound to the ephemeral-DH transcript (H-1/H-2).
                 let verified = match &auth_token {
-                    Some(tok) => verify_proof_with_key(tok, &nonce, &transcript, &claimed),
+                    Some(tok) => verify_proof_with_key(tok.as_ref(), &nonce, &transcript, &claimed),
                     None => {
                         // SRX layer 3: verify against PIN + ticket secret (the
                         // same combined key the challenge's session derived).
@@ -1159,7 +1180,7 @@ mod tests {
             vid(2),
             Pin::parse("222222").unwrap(),
         )
-        .with_resumption_tokens(HashMap::from([(dev(1), tok)]));
+        .with_resumption_tokens(HashMap::from([(dev(1), tok.into())]));
         let hello = client.start();
         let Outcome::Send(challenge) = server.step(hello).unwrap() else {
             panic!("expected challenge")
@@ -1178,7 +1199,7 @@ mod tests {
         let mut client = ClientHandshake::new(dev(1), "l".into(), "roost".into(), vid(1), pin())
             .with_resumption_token([0xAA; 32]);
         let mut server = ServerHandshake::new(dev(2), "p".into(), "roost".into(), vid(2), pin())
-            .with_resumption_tokens(HashMap::from([(dev(1), [0xBB; 32])]));
+            .with_resumption_tokens(HashMap::from([(dev(1), [0xBB; 32].into())]));
         let hello = client.start();
         let Outcome::Send(challenge) = server.step(hello).unwrap() else {
             panic!("expected challenge")
@@ -1259,7 +1280,7 @@ mod tests {
         let _ = server.step(hello).unwrap();
         assert_eq!(
             server.peer_reconnect(),
-            Some(("corvux1:xyz".to_string(), "654321".to_string())),
+            Some(("corvux1:xyz".into(), "654321".into())),
             "server must capture the dialer's redial offer for symmetric reconnect"
         );
     }
@@ -1716,7 +1737,7 @@ mod tests {
             .with_resumption_token(tok);
         let mut server = ServerHandshake::new(dev(2), "p".into(), "roost".into(), vid(2), pin())
             .with_enrollment_window(window)
-            .with_resumption_tokens(HashMap::from([(dev(1), tok)]));
+            .with_resumption_tokens(HashMap::from([(dev(1), tok.into())]));
         assert!(
             matches!(
                 server.step(client.start()).unwrap(),
