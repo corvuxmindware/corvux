@@ -54,7 +54,7 @@ targets:
           - UIInterfaceOrientationLandscapeLeft
           - UIInterfaceOrientationLandscapeRight
         CFBundleShortVersionString: 0.2.5
-        CFBundleVersion: "25"
+        CFBundleVersion: "26"
         # Keys below also live in corvux_iOS/Info.plist. They are repeated here
         # because xcodegen REWRITES that plist from these properties on any
         # regen, which would silently drop them (guarded by

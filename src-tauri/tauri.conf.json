@@ -43,7 +43,7 @@
       "entitlements": "./Entitlements.plist"
     },
     "iOS": {
-      "bundleVersion": "25",
+      "bundleVersion": "26",
       "minimumSystemVersion": "15.0"
     }
   },
