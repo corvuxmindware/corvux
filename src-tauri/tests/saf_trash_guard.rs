@@ -495,15 +495,35 @@ fn remove_original_has_exactly_the_gated_callers() {
         "saf.rs: only `impl RawTree for SafFs` may define remove_original; nothing may call it"
     );
     for dir in ["src/commands", "src/sync", "src/ai"] {
-        let out = std::process::Command::new("grep")
-            .args(["-rl", "remove_original(", dir])
-            .current_dir(env!("CARGO_MANIFEST_DIR"))
-            .output()
-            .expect("grep");
+        // Pure-Rust equivalent of `grep -rl "remove_original(" <dir>`:
+        // the external binary does not exist on Windows hosts, and this
+        // guard must run on every host that can run the gate.
+        fn files_mentioning(needle: &str, dir: &std::path::Path) -> Vec<String> {
+            let mut hits = Vec::new();
+            let mut stack = vec![dir.to_path_buf()];
+            while let Some(current) = stack.pop() {
+                for entry in std::fs::read_dir(&current).expect("read_dir") {
+                    let entry = entry.expect("read_dir entry");
+                    let path = entry.path();
+                    if path.is_dir() {
+                        stack.push(path);
+                    } else if path.extension().is_some_and(|e| e == "rs") {
+                        let src = std::fs::read_to_string(&path).expect("read source file");
+                        if src.contains(needle) {
+                            hits.push(path.display().to_string());
+                        }
+                    }
+                }
+            }
+            hits
+        }
+        let hits = files_mentioning(
+            "remove_original(",
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(dir),
+        );
         assert!(
-            out.stdout.is_empty(),
-            "{dir} must not call remove_original: {}",
-            String::from_utf8_lossy(&out.stdout)
+            hits.is_empty(),
+            "{dir} must not call remove_original: {hits:?}"
         );
     }
 }

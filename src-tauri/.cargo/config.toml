@@ -45,3 +45,20 @@ CFLAGS_aarch64-linux-android = { value = "-DSQLITE_ENABLE_FTS5=1", force = true 
 CFLAGS_armv7-linux-androideabi = { value = "-DSQLITE_ENABLE_FTS5=1", force = true }
 CFLAGS_i686-linux-android = { value = "-DSQLITE_ENABLE_FTS5=1", force = true }
 CFLAGS_x86_64-linux-android = { value = "-DSQLITE_ENABLE_FTS5=1", force = true }
+
+# Windows (MSVC) — the lib's dialog dependency (`rfd` → TaskDialogIndirect)
+# statically imports `comctl32!TaskDialogIndirect`, which exists ONLY in
+# common-controls v6 (a side-by-side assembly). Without a manifest
+# dependency the loader binds the v5 comctl32 from System32 and the
+# process dies at load with STATUS_ENTRYPOINT_NOT_FOUND (0xC0000139) —
+# before `main`, so even `cargo test --lib -- --list` prints nothing.
+# Real GUI processes get this dependency from an embedded app manifest;
+# cargo-generated test binaries get no manifest at all unless the linker
+# is told. This arg makes the linker record the v6 assembly dependency in
+# the (default, embedded) manifest of every MSVC-linked binary, including
+# test exes. Harmless for binaries that never touch comctl32.
+[target.x86_64-pc-windows-msvc]
+rustflags = [
+    "-C",
+    "link-arg=/MANIFESTDEPENDENCY:type='win32' name='Microsoft.Windows.Common-Controls' version='6.0.0.0' publicKeyToken='6595b64144ccf1df' language='*' processorArchitecture='*'",
+]
