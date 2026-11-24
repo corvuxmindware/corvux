@@ -122,7 +122,7 @@ impl NativeFs {
     /// an error — matches the async method, avoids leaking existence).
     pub(crate) fn exists_blocking(&self, rel: &str) -> Result<bool, RoostError> {
         match resolve_within(&self.root, &self.canonical_root, rel) {
-            Ok(p) => Ok(p.exists()),
+            Ok(p) => exists_checked(&p),
             Err(RoostError::OutsideRoost(_)) => Ok(false),
             Err(e) => Err(e),
         }
@@ -237,6 +237,27 @@ fn resolve_within(root: &Path, canonical_root: &Path, rel: &str) -> Result<PathB
     Ok(final_path)
 }
 
+/// Existence that tells "absent" from "could not tell". `Path::exists()` is
+/// `false` for EACCES, EIO, or an expired iOS folder grant, and callers read
+/// `false` as "not there" — then create or replace a file that is. Only
+/// `NotFound` and `NotADirectory` (a path component is a file) mean absent;
+/// any other failure is an error. Same class as the Android SAF lookup that
+/// reported a provider failure as "not found" (data-safety plan, Batch 1).
+fn exists_checked(p: &Path) -> Result<bool, RoostError> {
+    match std::fs::metadata(p) {
+        Ok(_) => Ok(true),
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+            ) =>
+        {
+            Ok(false)
+        }
+        Err(e) => Err(RoostError::from(e)),
+    }
+}
+
 #[async_trait]
 impl RoostFs for NativeFs {
     async fn list(&self, rel_dir: &str) -> Result<Vec<Entry>, RoostError> {
@@ -321,7 +342,9 @@ impl RoostFs for NativeFs {
 
     async fn create(&self, rel: &str, initial: &[u8]) -> Result<(), RoostError> {
         let target = self.safe_resolve(rel).await?;
-        if target.exists() {
+        // `create` promises "fails if it already exists", so an existence check
+        // that could not be made must fail the create, not allow it.
+        if exists_checked(&target)? {
             return Err(RoostError::AlreadyExists(rel.to_string()));
         }
         self.write_atomic(rel, initial).await
@@ -363,7 +386,9 @@ impl RoostFs for NativeFs {
         if !from.exists() {
             return Err(RoostError::NotFound(from_rel.to_string()));
         }
-        if to.exists() {
+        // `fs::rename` REPLACES an existing target, so "could not tell" must
+        // not read as "free".
+        if exists_checked(&to)? {
             return Err(RoostError::AlreadyExists(to_rel.to_string()));
         }
         if let Some(parent) = to.parent() {
@@ -403,7 +428,7 @@ impl RoostFs for NativeFs {
         // would otherwise let exists() probe outside the roost and leak
         // file existence info via the IPC return value.
         match self.safe_resolve(rel).await {
-            Ok(p) => Ok(p.exists()),
+            Ok(p) => exists_checked(&p),
             Err(RoostError::OutsideRoost(_)) => Ok(false),
             Err(e) => Err(e),
         }
@@ -935,6 +960,65 @@ mod tests {
             "exists() must not confirm files outside the roost via a symlink"
         );
         let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    /// `Path::exists()` is false for EACCES/EIO, and callers read false as
+    /// "not there" — then recreate or replace a file that is. The helper must
+    /// report a stat that FAILED as an error. Tested on the helper directly:
+    /// `safe_resolve` already errors for an unreadable ANCESTOR, so only the
+    /// final stat (EIO, a lost iOS grant, ...) reaches the swallowed branch
+    /// in `exists`/`create`/`rename`. (Fails if the helper reverts to
+    /// `Path::exists()`.)
+    #[cfg(unix)]
+    #[test]
+    fn exists_checked_reports_a_failed_stat_as_an_error_not_absence() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new().unwrap();
+        let locked = dir.path().join("locked");
+        std::fs::create_dir(&locked).unwrap();
+        std::fs::write(locked.join("a.md"), b"mine").unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let probe = locked.join("a.md");
+        // Root ignores mode bits, so this test cannot observe anything there
+        // (it returns silently): it only has teeth when run as a normal user.
+        let is_root = std::fs::metadata(&probe).is_ok();
+
+        let checked = exists_checked(&probe);
+        let std_says = probe.exists();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        if is_root {
+            return;
+        }
+
+        assert!(
+            !std_says,
+            "premise: Path::exists() reads the failed stat as absent"
+        );
+        assert!(
+            checked.is_err(),
+            "a failed stat is not absence, got {checked:?}"
+        );
+        assert_eq!(std::fs::read(&probe).unwrap(), b"mine");
+    }
+
+    #[test]
+    fn exists_checked_keeps_the_ordinary_answers() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("a.md"), b"x").unwrap();
+        assert!(exists_checked(&dir.path().join("a.md")).unwrap());
+        assert!(!exists_checked(&dir.path().join("nope.md")).unwrap());
+        // A path component that is a FILE (ENOTDIR) cannot exist either.
+        assert!(!exists_checked(&dir.path().join("a.md").join("b.md")).unwrap());
+    }
+
+    /// The checked helper must not turn ordinary absence into an error.
+    #[tokio::test]
+    async fn exists_still_reports_a_plainly_missing_file_as_absent() {
+        let (_d, fs) = fresh();
+        fs.write_atomic("a.md", b"x").await.unwrap();
+        assert!(!fs.exists("nope.md").await.unwrap());
+        assert!(!fs.exists("missing-dir/nope.md").await.unwrap());
+        assert!(fs.exists("a.md").await.unwrap());
     }
 
     #[tokio::test]

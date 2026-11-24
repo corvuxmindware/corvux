@@ -2,6 +2,7 @@ package app.tauri.saf
 
 import android.app.Activity
 import android.content.Intent
+import android.database.Cursor
 import android.net.Uri
 import android.provider.DocumentsContract
 import android.util.Base64
@@ -16,6 +17,7 @@ import app.tauri.plugin.Invoke
 import app.tauri.plugin.JSArray
 import app.tauri.plugin.JSObject
 import app.tauri.plugin.Plugin
+import java.io.IOException
 import java.util.concurrent.Executors
 
 @InvokeArg
@@ -90,6 +92,212 @@ class SafPlugin(private val activity: Activity) : Plugin(activity) {
                 invoke.reject(ex.message ?: "saf op failed: ${ex.javaClass.simpleName}")
             }
         }
+    }
+
+    /**
+     * THE only place a directory's children are queried. Returns a cursor
+     * whose rows are the COMPLETE listing, or throws an [IOException] that
+     * starts with [INCOMPLETE_LISTING_PREFIX] (surfaced to Rust as an error,
+     * never as an empty/partial success). Callers `.use { }` the result.
+     *
+     * Before this existed `query(...)?.use { ... }` read a null cursor
+     * (provider returned null or died), a provider error, and a provider
+     * still loading as "this directory is empty/partial" — and the result
+     * was cached as the tree and trusted by the SAF trash copy-then-delete
+     * fallback. Per the DocumentsContract docs a loading provider "must send
+     * a content changed notification when loading is finished"; we re-query
+     * a bounded number of times instead of registering an observer, then
+     * give up with an explicit error.
+     *
+     * Runs on the IO executor (see [runIO]), so the back-off sleep never
+     * blocks the UI thread.
+     */
+    private fun queryChildrenChecked(
+        childrenUri: Uri,
+        projection: Array<String>,
+        rel: String,
+    ): Cursor {
+        val where = rel.ifEmpty { "/" }
+        var attempt = 1
+        while (true) {
+            // The query ITSELF can throw (provider process died, lost grant ->
+            // SecurityException, ...). Keep that an incomplete-listing error so
+            // Rust never maps the exception's own wording (which may contain
+            // "not found") to NotFound, i.e. "it isn't there".
+            val cursor = try {
+                activity.contentResolver.query(childrenUri, projection, null, null, null)
+            } catch (e: Exception) {
+                Log.w(TAG, "listing '$where': query threw ${e.javaClass.simpleName}")
+                throw IOException("$INCOMPLETE_LISTING_PREFIX: provider failed while listing '$where'")
+            }
+            // `extras` is a remote call on a cross-process cursor and can throw
+            // when the provider dies mid-call. Never leave the cursor open on
+            // that path, and keep the rejection an incomplete-listing error.
+            val state = try {
+                val extras = cursor?.extras
+                classifyDirCursor(
+                    cursorPresent = cursor != null,
+                    loading = extras?.getBoolean(DocumentsContract.EXTRA_LOADING, false) ?: false,
+                    error = extras?.getString(DocumentsContract.EXTRA_ERROR),
+                )
+            } catch (e: Exception) {
+                cursor?.close()
+                Log.w(TAG, "listing '$where': reading cursor extras failed: ${e.javaClass.simpleName}")
+                throw IOException("$INCOMPLETE_LISTING_PREFIX: provider failed while listing '$where'")
+            }
+            when (state) {
+                DirCursorState.Complete -> return requireNotNull(cursor)
+                DirCursorState.Loading -> {
+                    cursor?.close()
+                    if (attempt >= LOADING_MAX_ATTEMPTS) {
+                        throw IOException("$INCOMPLETE_LISTING_PREFIX: provider still loading '$where'")
+                    }
+                    try {
+                        Thread.sleep(LOADING_BACKOFF_MS * attempt)
+                    } catch (e: InterruptedException) {
+                        Thread.currentThread().interrupt()
+                        throw IOException("$INCOMPLETE_LISTING_PREFIX: interrupted while loading '$where'")
+                    }
+                    attempt += 1
+                }
+                is DirCursorState.Failed -> {
+                    cursor?.close()
+                    // The provider's own text can carry an absolute path
+                    // (`/storage/...`): logcat only, never the user-facing error.
+                    Log.w(TAG, "listing '$where' failed: ${state.reason}")
+                    throw IOException("$INCOMPLETE_LISTING_PREFIX: provider could not list '$where'")
+                }
+            }
+        }
+    }
+
+    /**
+     * THE only child-by-name lookup. `DocumentFile.findFile` returns null both
+     * when the child does not exist AND when the provider failed (androidx
+     * `DocumentsContractApi21.listFiles` catches every exception and returns
+     * an empty array), and every caller read null as "absent": `statDocument`
+     * answered `exists: false`, and Rust's startup `recover_missing_files` then
+     * overwrote a note that was there. So a null from `findFile` is re-checked
+     * with the checked children query: an incomplete listing THROWS (rejected
+     * to Rust as an error, never as "not found"); a complete listing without
+     * the name is a genuine absence (null); a name that IS listed although
+     * `findFile` missed it is retried once and otherwise fails closed.
+     *
+     * The common case (found) costs nothing extra; the extra query happens only
+     * for a name that is not there (creating a note, probing a free trash name).
+     */
+    private fun findChildVerified(parent: DocumentFile, name: String): DocumentFile? {
+        parent.findFile(name)?.let { return it }
+        if (!childListedChecked(parent, name)) return null
+        return parent.findFile(name)
+            ?: throw IOException("$INCOMPLETE_LISTING_PREFIX: '$name' is listed but could not be resolved")
+    }
+
+    /** True iff a COMPLETE listing of `parent` contains a child called `name`. */
+    private fun childListedChecked(parent: DocumentFile, name: String): Boolean {
+        val parentDocId = DocumentsContract.getDocumentId(parent.uri)
+        val childrenUri = DocumentsContract.buildChildDocumentsUriUsingTree(parent.uri, parentDocId)
+        val projection = arrayOf(DocumentsContract.Document.COLUMN_DISPLAY_NAME)
+        queryChildrenChecked(childrenUri, projection, name).use { cursor ->
+            val nameIdx = cursor.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_DISPLAY_NAME)
+            while (cursor.moveToNext()) {
+                if (cursor.getString(nameIdx) == name) return true
+            }
+        }
+        return false
+    }
+
+    /**
+     * Providers do not FAIL a create on a name clash: they quietly store the new
+     * document as "name (1).ext". That happens on case-insensitive storage (a
+     * note `ideas.md` on disk, `Ideas.md` requested) and when another writer
+     * wins the race between our lookup and the create. Unchecked, startup
+     * recovery made `Ideas (1).md`, `Ideas (2).md`, ... on every launch and sync
+     * spread each copy to every peer.
+     *
+     * So BEFORE creating, take a checked listing of the parent: refuse (as
+     * "Already exists", which Rust maps to AlreadyExists, so recovery leaves
+     * things alone) if any child's name equals the wanted name ignoring case —
+     * nothing is created and nothing is deleted on that path — and keep the set
+     * of existing document ids for [settleCreated]. The cost is one extra
+     * checked listing per create. It also refuses a case-variant on a
+     * case-SENSITIVE provider, which is the safe direction.
+     */
+    private fun snapshotBeforeCreate(parent: DocumentFile, name: String): Set<String> {
+        val parentDocId = DocumentsContract.getDocumentId(parent.uri)
+        val childrenUri = DocumentsContract.buildChildDocumentsUriUsingTree(parent.uri, parentDocId)
+        val projection = arrayOf(
+            DocumentsContract.Document.COLUMN_DOCUMENT_ID,
+            DocumentsContract.Document.COLUMN_DISPLAY_NAME,
+        )
+        val ids = HashSet<String>()
+        queryChildrenChecked(childrenUri, projection, name).use { cursor ->
+            val idIdx = cursor.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_DOCUMENT_ID)
+            val nameIdx = cursor.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_DISPLAY_NAME)
+            while (cursor.moveToNext()) {
+                val id = cursor.getString(idIdx)
+                    ?: throw IOException("$INCOMPLETE_LISTING_PREFIX: row without an id while preparing a create")
+                ids.add(id)
+                val childName = cursor.getString(nameIdx)
+                if (childName != null && childName.equals(name, ignoreCase = true)) {
+                    throw IOException(
+                        "Already exists: a document whose name differs at most by letter case is already there",
+                    )
+                }
+            }
+        }
+        return ids
+    }
+
+    /**
+     * After a create: if the provider stored the document under a different name
+     * than requested (a racing writer, a normalised name), reject with
+     * "Already exists". Remove the document ONLY if it is provably the one this
+     * call just made: its id was NOT in [snapshotBeforeCreate]'s listing (a
+     * provider that breaks the contract can return an EXISTING document, e.g. the
+     * existing folder on a case clash, and deleting that would destroy user
+     * data) AND it is empty (a file of length 0, a folder with no children).
+     * Anything else is left untouched and logged. A name that cannot be read
+     * (`null`) means "cannot tell": proceed.
+     */
+    private fun settleCreated(created: DocumentFile, wanted: String, before: Set<String>, isDir: Boolean) {
+        val got = created.name ?: return
+        if (got == wanted) return
+        val id = DocumentsContract.getDocumentId(created.uri)
+        val ours = id !in before && (if (isDir) hasNoChildrenChecked(created) else created.length() == 0L)
+        if (ours) {
+            if (!created.delete()) Log.w(TAG, "could not remove the renamed stray document")
+        } else {
+            Log.w(TAG, "provider returned an existing or non-empty document for a create; left untouched")
+        }
+        throw IOException(
+            "Already exists: the storage provider keeps a differently-named document, " +
+                "so '$wanted' was not created",
+        )
+    }
+
+    /** True iff a COMPLETE listing of `dir` has no children. */
+    private fun hasNoChildrenChecked(dir: DocumentFile): Boolean {
+        val docId = DocumentsContract.getDocumentId(dir.uri)
+        val childrenUri = DocumentsContract.buildChildDocumentsUriUsingTree(dir.uri, docId)
+        val projection = arrayOf(DocumentsContract.Document.COLUMN_DOCUMENT_ID)
+        queryChildrenChecked(childrenUri, projection, "new folder").use { cursor ->
+            return !cursor.moveToNext()
+        }
+    }
+
+    private fun createFileChecked(parent: DocumentFile, mime: String, name: String): DocumentFile? {
+        val before = snapshotBeforeCreate(parent, name)
+        val created = parent.createFile(mime, name) ?: return null
+        settleCreated(created, name, before, isDir = false)
+        return created
+    }
+
+    private fun createDirectoryChecked(parent: DocumentFile, name: String): DocumentFile? {
+        val before = snapshotBeforeCreate(parent, name)
+        val created = parent.createDirectory(name) ?: return null
+        settleCreated(created, name, before, isDir = true)
+        return created
     }
 
     /**
@@ -278,13 +486,17 @@ class SafPlugin(private val activity: Activity) : Plugin(activity) {
                 DocumentsContract.Document.COLUMN_DISPLAY_NAME,
                 DocumentsContract.Document.COLUMN_MIME_TYPE,
             )
-            activity.contentResolver.query(childrenUri, projection, null, null, null)?.use { cursor ->
+            queryChildrenChecked(childrenUri, projection, args.relDir).use { cursor ->
                 val idIdx = cursor.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_DOCUMENT_ID)
                 val nameIdx = cursor.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_DISPLAY_NAME)
                 val mimeIdx = cursor.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_MIME_TYPE)
                 while (cursor.moveToNext()) {
-                    val name = cursor.getString(nameIdx) ?: continue
-                    val childDocId = cursor.getString(idIdx) ?: continue
+                    // A row we cannot name or address is a child we cannot list:
+                    // skipping it would make this listing silently incomplete.
+                    val name = cursor.getString(nameIdx)
+                        ?: throw IOException("$INCOMPLETE_LISTING_PREFIX: unnamed row in '${args.relDir.ifEmpty { "/" }}'")
+                    val childDocId = cursor.getString(idIdx)
+                        ?: throw IOException("$INCOMPLETE_LISTING_PREFIX: row without an id in '${args.relDir.ifEmpty { "/" }}'")
                     val mime = cursor.getString(mimeIdx)
                     val isDir = mime == DocumentsContract.Document.MIME_TYPE_DIR
                     val childRel = joinRel(args.relDir, name)
@@ -370,16 +582,16 @@ class SafPlugin(private val activity: Activity) : Plugin(activity) {
             for (seg in dirSegments) {
                 if (seg == ".") continue
                 if (seg == "..") return@runIO invoke.reject("Path traversal blocked")
-                parent = parent.findFile(seg)
-                    ?: parent.createDirectory(seg)
+                parent = findChildVerified(parent, seg)
+                    ?: createDirectoryChecked(parent, seg)
                     ?: return@runIO invoke.reject("Cannot create directory: $seg")
             }
 
-            val existing = parent.findFile(name)
+            val existing = findChildVerified(parent, name)
             if (args.createNew && existing != null) {
                 return@runIO invoke.reject("Already exists: ${args.rel}")
             }
-            val target = existing ?: (parent.createFile(mimeFor(name), name)
+            val target = existing ?: (createFileChecked(parent, mimeFor(name), name)
                 ?: return@runIO invoke.reject("createFile failed: $name"))
 
             val bytes = Base64.decode(args.base64, Base64.DEFAULT)
@@ -403,9 +615,11 @@ class SafPlugin(private val activity: Activity) : Plugin(activity) {
     /**
      * Delete `rel` permanently (a folder with everything inside it).
      * Note and folder deletes from the app do NOT come here directly: the
-     * Rust trash first moves them into `.corvux-trash/` (see
-     * `moveDocument`) and only calls this to remove the original after a
-     * fallback copy has fully succeeded.
+     * Rust trash moves them into `.corvux-trash/` (see `moveDocument`). The
+     * copy-then-delete fallback that used to call this to remove an original
+     * is DISABLED (`COPY_THEN_DELETE_ENABLED` in `roostfs/trash.rs`): a write
+     * landing after its final check would be lost. Nothing in Rust should
+     * reach this command for a user delete until that is re-validated.
      */
     @Command
     fun deleteDocument(invoke: Invoke) {
@@ -471,8 +685,9 @@ class SafPlugin(private val activity: Activity) : Plugin(activity) {
      *
      * Used by the Rust trash to put deleted notes into `.corvux-trash/`.
      * The destination folder must already exist and the name must be free.
-     * Rejects with "Move not supported" when the provider can't move; the
-     * Rust side then falls back to copy + delete. If the move works but the
+     * Rejects with "Move not supported" when the provider can't move. The
+     * Rust copy-then-delete fallback for that case is currently DISABLED, so
+     * the delete fails and the original stays. If the move works but the
      * follow-up rename fails, the document is already safe inside the
      * destination folder under its old name, so this still resolves.
      */
@@ -509,10 +724,11 @@ class SafPlugin(private val activity: Activity) : Plugin(activity) {
             // The provider moves under the OLD name, then we rename. If that
             // in-between name is already taken (e.g. a stray
             // `.corvux-trash/a.md` from a failed rename), the provider would
-            // refuse — report it as unsupported so Rust copies to the final
-            // name instead of retrying forever.
+            // refuse. Report it under its OWN marker (not "Move not supported":
+            // that now means the provider cannot move, which is a permanent
+            // refusal) so Rust can move the stray aside and retry once.
             if (oldName != newName && resolveRelative(root, joinRel(toParentRel, oldName)) != null) {
-                return@runIO invoke.reject("Move not supported: $oldName already in $toParentRel")
+                return@runIO invoke.reject("$STAGING_NAME_TAKEN_PREFIX: '$oldName' is already in '$toParentRel'")
             }
 
             val resolver = activity.contentResolver
@@ -557,7 +773,7 @@ class SafPlugin(private val activity: Activity) : Plugin(activity) {
             val parts = cleaned.split('/').filter { it.isNotEmpty() }
             var parent: DocumentFile = root
             for ((i, seg) in parts.withIndex()) {
-                val existing = parent.findFile(seg)
+                val existing = findChildVerified(parent, seg)
                 if (existing != null) {
                     if (i == parts.lastIndex) {
                         return@runIO invoke.reject("Already exists: ${args.rel}")
@@ -567,7 +783,7 @@ class SafPlugin(private val activity: Activity) : Plugin(activity) {
                     }
                     parent = existing
                 } else {
-                    parent = parent.createDirectory(seg)
+                    parent = createDirectoryChecked(parent, seg)
                         ?: return@runIO invoke.reject("Cannot create directory: $seg")
                 }
             }
@@ -644,23 +860,40 @@ class SafPlugin(private val activity: Activity) : Plugin(activity) {
         out: JSArray,
     ) {
         val childrenUri = DocumentsContract.buildChildDocumentsUriUsingTree(treeUriParsed, docId)
+        // SIZE and LAST_MODIFIED ride along so the SAF trash fallback can tell
+        // that a file was edited IN PLACE between two walks (same name, same
+        // kind): the Rust side compares them before it removes the original.
+        // Both are optional columns; a provider that omits one just yields no
+        // field, which Rust reads as "unknown" on both walks.
         val projection = arrayOf(
             DocumentsContract.Document.COLUMN_DOCUMENT_ID,
             DocumentsContract.Document.COLUMN_DISPLAY_NAME,
             DocumentsContract.Document.COLUMN_MIME_TYPE,
+            DocumentsContract.Document.COLUMN_SIZE,
+            DocumentsContract.Document.COLUMN_LAST_MODIFIED,
         )
         // Sub-paths and their doc-ids collected during the cursor pass —
         // we recurse only after the cursor is closed because some content
         // providers misbehave when nested queries are open against the
         // same authority.
         val subdirs = mutableListOf<Triple<String, String, String>>() // (childDocId, childRel, displayName)
-        activity.contentResolver.query(childrenUri, projection, null, null, null)?.use { cursor ->
+        // A nested failure aborts the WHOLE walk (the exception propagates out
+        // of every recursion level to `runIO`, which rejects): `out` is never
+        // returned half-filled, so Rust sees an error, not a smaller tree.
+        queryChildrenChecked(childrenUri, projection, rel).use { cursor ->
             val idIdx = cursor.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_DOCUMENT_ID)
             val nameIdx = cursor.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_DISPLAY_NAME)
             val mimeIdx = cursor.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_MIME_TYPE)
+            val sizeIdx = cursor.getColumnIndex(DocumentsContract.Document.COLUMN_SIZE)
+            val modIdx = cursor.getColumnIndex(DocumentsContract.Document.COLUMN_LAST_MODIFIED)
             while (cursor.moveToNext()) {
-                val name = cursor.getString(nameIdx) ?: continue
-                val childDocId = cursor.getString(idIdx) ?: continue
+                // A row we cannot name or address is a child we cannot list:
+                // skipping it would make the walk silently incomplete (and
+                // let the trash fallback delete it with its parent).
+                val name = cursor.getString(nameIdx)
+                    ?: throw IOException("$INCOMPLETE_LISTING_PREFIX: unnamed row in '${rel.ifEmpty { "/" }}'")
+                val childDocId = cursor.getString(idIdx)
+                    ?: throw IOException("$INCOMPLETE_LISTING_PREFIX: row without an id in '${rel.ifEmpty { "/" }}'")
                 val mime = cursor.getString(mimeIdx)
                 val isDir = mime == DocumentsContract.Document.MIME_TYPE_DIR
                 val childRel = joinRel(rel, name)
@@ -668,6 +901,10 @@ class SafPlugin(private val activity: Activity) : Plugin(activity) {
                 obj.put("name", name)
                 obj.put("relPath", childRel)
                 obj.put("isDir", isDir)
+                if (!isDir) {
+                    if (sizeIdx >= 0 && !cursor.isNull(sizeIdx)) obj.put("size", cursor.getLong(sizeIdx))
+                    if (modIdx >= 0 && !cursor.isNull(modIdx)) obj.put("modified", cursor.getLong(modIdx))
+                }
                 out.put(obj)
 
                 // Warm-load the resolve cache with a SingleDocumentFile for
@@ -754,7 +991,7 @@ class SafPlugin(private val activity: Activity) : Plugin(activity) {
         for (segment in cleaned.split('/', '\\')) {
             if (segment.isEmpty() || segment == ".") continue
             if (segment == "..") return null
-            cur = cur.findFile(segment) ?: return null
+            cur = findChildVerified(cur, segment) ?: return null
         }
         return cur
     }

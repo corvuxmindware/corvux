@@ -99,7 +99,7 @@ export const commands = {
 	 *  deleting a folder removed the notes locally but left them alive on every
 	 *  paired device, which then resurrected them on the next sync (the engine
 	 *  only ever saw the folder's own remove event, and `is_watchable` drops
-	 *  that because a directory has no `.md` extension). `collect_markdown_paths`
+	 *  that because a directory has no `.md` extension). `collect_markdown_rel_paths`
 	 *  walks the tree BEFORE the trash move, so the list is complete even though
 	 *  the files are gone by the time the tombstones flush.
 	 */

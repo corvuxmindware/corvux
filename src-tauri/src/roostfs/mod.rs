@@ -109,6 +109,18 @@ pub trait RoostFs: Send + Sync {
     /// [`trash::unique_trash_rel`] (`<unix-secs>.<name>`, numbered on clash).
     async fn trash(&self, rel: &str) -> Result<(), RoostError>;
 
+    /// [`trash`](Self::trash) for a folder whose notes the caller has ALREADY
+    /// enumerated: `expected` lists them (roost-relative). A backend that moves
+    /// the folder as one atomic unit (desktop rename, a provider-side move)
+    /// needs no cross-check and ignores it. A backend that has to COPY then
+    /// delete (the SAF fallback) must refuse to remove the original unless
+    /// every expected note is in its verified copy — including when the copy is
+    /// unexpectedly empty — because its own listing is the very thing that may
+    /// be wrong.
+    async fn trash_expecting(&self, rel: &str, _expected: &[String]) -> Result<(), RoostError> {
+        self.trash(rel).await
+    }
+
     async fn rename(&self, from_rel: &str, to_rel: &str) -> Result<(), RoostError>;
 
     async fn mkdir(&self, rel_dir: &str) -> Result<(), RoostError>;
@@ -180,6 +192,33 @@ pub(crate) fn hidden_below(rel_dir: &str, rel_path: &str) -> bool {
     below.split('/').any(|seg| seg.starts_with('.'))
 }
 
+/// Prefix of every SAF plugin rejection that means "these rows are NOT the
+/// whole directory" (null cursor, provider error, provider still loading).
+/// Spelled identically in `DirectoryListing.kt` (`INCOMPLETE_LISTING_PREFIX`);
+/// `tests/saf_trash_guard.rs` keeps the two in lockstep.
+// Only the Android SAF backend calls this outside tests.
+#[cfg_attr(not(target_os = "android"), allow(dead_code))]
+pub(crate) const INCOMPLETE_LISTING_PREFIX: &str = "Directory listing incomplete";
+
+/// Prefix of `moveDocument`'s own rejection when the in-between name (a stray
+/// `.corvux-trash/<name>`) is taken. Spelled identically in
+/// `DirectoryListing.kt` (`STAGING_NAME_TAKEN_PREFIX`); `tests/saf_trash_guard.rs`
+/// keeps the two in lockstep. A marker rather than a text pattern: a note's own
+/// name or a provider's exception text can contain any phrase.
+// Only the Android SAF backend calls this outside tests.
+#[cfg_attr(not(target_os = "android"), allow(dead_code))]
+pub(crate) const STAGING_NAME_TAKEN_PREFIX: &str = "Staging name taken";
+
+/// True when a plugin error message says a directory listing was incomplete.
+/// Checked BEFORE any substring guess ("not found", ...): a provider's own
+/// wording must never turn an incomplete listing into [`RoostError::NotFound`],
+/// which callers read as "it isn't there".
+// Only the Android SAF backend calls this outside tests.
+#[cfg_attr(not(target_os = "android"), allow(dead_code))]
+pub(crate) fn is_incomplete_listing(message: &str) -> bool {
+    message.contains(INCOMPLETE_LISTING_PREFIX)
+}
+
 /// Validate a roost-relative path. Rejects `..`, absolute paths, Windows
 /// drive prefixes, and verbatim/device prefixes. Returns the cleaned
 /// (forward-slash) form.
@@ -248,6 +287,39 @@ mod hidden_below_tests {
 }
 
 #[cfg(test)]
+mod incomplete_listing_tests {
+    use super::*;
+
+    #[test]
+    fn recognizes_the_plugin_rejection_even_when_wrapped() {
+        let raw = format!("{INCOMPLETE_LISTING_PREFIX}: provider returned no cursor ('Daily')");
+        assert!(is_incomplete_listing(&raw));
+        // The plugin layer may prefix its own text.
+        assert!(is_incomplete_listing(&format!(
+            "plugin invoke error: {raw}"
+        )));
+    }
+
+    #[test]
+    fn provider_wording_cannot_masquerade_as_absence() {
+        // A provider error that says "not found" is still an incomplete
+        // listing, which `map_plugin_err_str` must classify before guessing
+        // `NotFound` from the substring.
+        let msg = format!("{INCOMPLETE_LISTING_PREFIX}: document not found ('Work')");
+        assert!(is_incomplete_listing(&msg));
+    }
+
+    #[test]
+    fn ordinary_errors_are_not_incomplete_listings() {
+        assert!(!is_incomplete_listing("Not found: a.md"));
+        assert!(!is_incomplete_listing("Folder not found: Work"));
+        assert!(!is_incomplete_listing(
+            "Already exists: .corvux-trash/1.a.md"
+        ));
+    }
+}
+
+#[cfg(test)]
 mod validate_rel_tests {
     use super::*;
 
@@ -304,5 +376,218 @@ mod validate_rel_tests {
         // Multi-byte UTF-8 names — fine.
         assert_eq!(validate_rel("资料/笔记.md").unwrap(), "资料/笔记.md");
         assert_eq!(validate_rel("🦀.md").unwrap(), "🦀.md");
+    }
+}
+
+/// Fault-injecting backend for tests: a real [`native::NativeFs`] that can fail
+/// or silently truncate directory listings and mutate the tree mid-operation,
+/// the way an Android storage provider does (null cursor, provider error,
+/// concurrent write). Lets host tests reproduce the failure modes behind the
+/// SAF trash fallback and the folder-delete enumeration without a device.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use std::collections::HashSet;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
+
+    use async_trait::async_trait;
+
+    use super::native::NativeFs;
+    use super::trash::{RawEntry, RawTree};
+    use super::{Entry, RoostError, RoostFs, INCOMPLETE_LISTING_PREFIX};
+
+    pub(crate) struct FaultyFs {
+        inner: NativeFs,
+        root: PathBuf,
+        /// `list(dir)` fails with an incomplete-listing error for this dir.
+        pub fail_list_dir: Option<String>,
+        /// The first `raw_descendants` call fails outright.
+        pub fail_first_raw: bool,
+        /// The first `raw_descendants` call silently omits everything BELOW
+        /// this directory (the directory entry itself stays listed) — what
+        /// `query(...)?.use { }` did for a null cursor in one nested folder.
+        pub omit_children_of_on_first_raw: Option<String>,
+        /// Right before the second `raw_descendants` call lists, create this
+        /// file: a concurrent write landing mid-trash.
+        pub write_before_second_raw: Option<(String, Vec<u8>)>,
+        /// EVERY `raw_descendants` call omits everything below this directory:
+        /// a provider that is consistently wrong, so the two walks agree.
+        pub omit_children_of_always: Option<String>,
+        /// EVERY `raw_descendants` call returns no rows at all (an empty
+        /// listing reported as complete).
+        pub omit_all_raw: bool,
+        /// `exists(path)` fails ONCE for each path in the set (a transient
+        /// provider failure that is now reported as an error).
+        pub exists_err_once: Mutex<HashSet<String>>,
+        /// `exists(path)` answers `Ok(false)` ONCE for each path in the set
+        /// even though the file is there (what the swallowed `findFile`
+        /// failure used to look like). Shared-state knobs, so a test can flip
+        /// them after the engine has taken its `Arc`.
+        pub exists_lie_missing_once: Mutex<HashSet<String>>,
+        /// The `expected` list the last `trash_expecting` call received.
+        pub trash_expected_seen: Mutex<Option<Vec<String>>>,
+        raw_calls: AtomicUsize,
+    }
+
+    impl FaultyFs {
+        pub(crate) fn new(root: &Path) -> Self {
+            Self {
+                inner: NativeFs::new(root),
+                root: root.to_path_buf(),
+                fail_list_dir: None,
+                fail_first_raw: false,
+                omit_children_of_on_first_raw: None,
+                write_before_second_raw: None,
+                omit_children_of_always: None,
+                omit_all_raw: false,
+                exists_err_once: Mutex::new(HashSet::new()),
+                exists_lie_missing_once: Mutex::new(HashSet::new()),
+                trash_expected_seen: Mutex::new(None),
+                raw_calls: AtomicUsize::new(0),
+            }
+        }
+
+        pub(crate) fn raw_calls(&self) -> usize {
+            self.raw_calls.load(Ordering::SeqCst)
+        }
+    }
+
+    fn walk(root: &Path, rel: &str, out: &mut Vec<RawEntry>) {
+        for e in std::fs::read_dir(root.join(rel)).unwrap().flatten() {
+            let name = e.file_name().to_string_lossy().into_owned();
+            let child = format!("{rel}/{name}");
+            let is_dir = e.file_type().unwrap().is_dir();
+            // Like the SAF plugin: size / modified only for files.
+            let (size, modified) = if is_dir {
+                (None, None)
+            } else {
+                let md = e.metadata().unwrap();
+                let ms = md
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_millis() as i64);
+                (Some(md.len() as i64), ms)
+            };
+            out.push(RawEntry {
+                entry: Entry {
+                    name,
+                    rel_path: child.clone(),
+                    is_dir,
+                },
+                size,
+                modified,
+            });
+            if is_dir {
+                walk(root, &child, out);
+            }
+        }
+    }
+
+    #[async_trait]
+    impl RoostFs for FaultyFs {
+        async fn list(&self, rel_dir: &str) -> Result<Vec<Entry>, RoostError> {
+            if self.fail_list_dir.as_deref() == Some(rel_dir.trim_matches('/')) {
+                return Err(RoostError::Io(format!(
+                    "{INCOMPLETE_LISTING_PREFIX}: injected ('{rel_dir}')"
+                )));
+            }
+            self.inner.list(rel_dir).await
+        }
+        async fn read(&self, rel: &str) -> Result<Vec<u8>, RoostError> {
+            self.inner.read(rel).await
+        }
+        async fn write_atomic(&self, rel: &str, bytes: &[u8]) -> Result<(), RoostError> {
+            self.inner.write_atomic(rel, bytes).await
+        }
+        async fn create(&self, rel: &str, initial: &[u8]) -> Result<(), RoostError> {
+            self.inner.create(rel, initial).await
+        }
+        async fn trash(&self, rel: &str) -> Result<(), RoostError> {
+            self.inner.trash(rel).await
+        }
+        async fn trash_expecting(&self, rel: &str, expected: &[String]) -> Result<(), RoostError> {
+            *self.trash_expected_seen.lock().unwrap() = Some(expected.to_vec());
+            self.inner.trash(rel).await
+        }
+        async fn rename(&self, from_rel: &str, to_rel: &str) -> Result<(), RoostError> {
+            self.inner.rename(from_rel, to_rel).await
+        }
+        async fn mkdir(&self, rel_dir: &str) -> Result<(), RoostError> {
+            self.inner.mkdir(rel_dir).await
+        }
+        async fn rmdir(&self, rel_dir: &str) -> Result<(), RoostError> {
+            self.inner.rmdir(rel_dir).await
+        }
+        async fn exists(&self, rel: &str) -> Result<bool, RoostError> {
+            let key = rel.trim_matches('/').to_string();
+            if self.exists_err_once.lock().unwrap().remove(&key) {
+                return Err(RoostError::Io(format!(
+                    "{INCOMPLETE_LISTING_PREFIX}: injected stat failure ('{rel}')"
+                )));
+            }
+            if self.exists_lie_missing_once.lock().unwrap().remove(&key) {
+                return Ok(false);
+            }
+            self.inner.exists(rel).await
+        }
+        fn display_root(&self) -> &str {
+            self.inner.display_root()
+        }
+        fn root_id(&self) -> String {
+            self.inner.root_id()
+        }
+    }
+
+    #[async_trait]
+    impl RawTree for FaultyFs {
+        async fn raw_descendants(&self, rel: &str) -> Result<Vec<RawEntry>, RoostError> {
+            let call = self.raw_calls.fetch_add(1, Ordering::SeqCst) + 1;
+            if call == 1 && self.fail_first_raw {
+                return Err(RoostError::Io(format!(
+                    "{INCOMPLETE_LISTING_PREFIX}: injected ('{rel}')"
+                )));
+            }
+            if call == 2 {
+                if let Some((path, bytes)) = &self.write_before_second_raw {
+                    self.inner.write_atomic(path, bytes).await?;
+                }
+            }
+            let mut out = Vec::new();
+            walk(&self.root, rel, &mut out);
+            let omit = self.omit_children_of_always.as_deref().or(if call == 1 {
+                self.omit_children_of_on_first_raw.as_deref()
+            } else {
+                None
+            });
+            if let Some(dir) = omit {
+                let below = format!("{}/", dir.trim_end_matches('/'));
+                out.retain(|r| !r.entry.rel_path.starts_with(&below));
+            }
+            if self.omit_all_raw {
+                out.clear();
+            }
+            Ok(out)
+        }
+
+        async fn remove_original(&self, rel: &str) -> Result<(), RoostError> {
+            let p = self.root.join(rel);
+            let r = if p.is_dir() {
+                std::fs::remove_dir_all(&p)
+            } else {
+                std::fs::remove_file(&p)
+            };
+            r.map_err(RoostError::from)
+        }
+
+        async fn remove_partial_copy(&self, rel: &str) {
+            let p = self.root.join(rel);
+            let _ = if p.is_dir() {
+                std::fs::remove_dir_all(&p)
+            } else {
+                std::fs::remove_file(&p)
+            };
+        }
     }
 }

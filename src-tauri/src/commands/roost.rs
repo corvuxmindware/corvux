@@ -498,9 +498,9 @@ async fn stop_sync_for_roost_switch(
 /// a large roost the walk can pin the IPC dispatcher for many seconds,
 /// stalling auto-save round-trips during startup.
 async fn scan_directory_blocking(dir: PathBuf) -> Result<Vec<FileEntry>, String> {
-    tokio::task::spawn_blocking(move || scan_directory(&dir))
+    tokio::task::spawn_blocking(move || scan_roost_root(&dir))
         .await
-        .map_err(|e| format!("roost scan task failed: {e}"))
+        .map_err(|e| format!("roost scan task failed: {e}"))?
 }
 
 /// MR-B4: native roost open with the warm-cache fast path SAF already uses —
@@ -557,10 +557,14 @@ fn spawn_native_tree_revalidation(
 ) {
     tauri::async_runtime::spawn(async move {
         let started = std::time::Instant::now();
-        match tokio::task::spawn_blocking(move || scan_directory(&dir)).await {
-            Ok(fresh) => super::roost_tree_cache::apply_if_changed(
+        match tokio::task::spawn_blocking(move || scan_roost_root(&dir)).await {
+            Ok(Ok(fresh)) => super::roost_tree_cache::apply_if_changed(
                 &app, &roost_key, generation, &cached, fresh, started,
             ),
+            // An unreadable root keeps the last good cached tree.
+            Ok(Err(e)) => {
+                tracing::warn!(error = %e, "roost: native tree revalidate skipped, root unreadable")
+            }
             Err(e) => tracing::warn!(error = %e, "roost: native tree revalidate scan failed"),
         }
     });
@@ -768,11 +772,25 @@ pub fn delete_roost_index(app: tauri::AppHandle, roost_path: String) -> Result<(
 /// Recursively scan a native filesystem directory into `FileEntry`. Hidden
 /// files and our trash folder are filtered. Folders first, alphabetically.
 fn scan_directory(dir: &Path) -> Vec<FileEntry> {
-    let mut entries: Vec<FileEntry> = Vec::new();
+    match fs::read_dir(dir) {
+        Ok(read_dir) => scan_read_dir(read_dir),
+        // A NESTED folder we cannot read is skipped (display only). The roost
+        // ROOT must go through `scan_roost_root`, which reports the failure.
+        Err(_) => Vec::new(),
+    }
+}
 
-    let Ok(read_dir) = fs::read_dir(dir) else {
-        return entries;
-    };
+/// Scan the roost ROOT. An unreadable root (expired iOS folder grant,
+/// unmounted volume, changed permissions) is an ERROR, never an empty tree:
+/// an empty result would be written to the tree cache and shown as "the roost
+/// is empty", replacing the last good view (data-safety plan, Batch 1).
+fn scan_roost_root(dir: &Path) -> Result<Vec<FileEntry>, String> {
+    let read_dir = fs::read_dir(dir).map_err(|e| format!("cannot read the roost folder: {e}"))?;
+    Ok(scan_read_dir(read_dir))
+}
+
+fn scan_read_dir(read_dir: fs::ReadDir) -> Vec<FileEntry> {
+    let mut entries: Vec<FileEntry> = Vec::new();
 
     for entry in read_dir.flatten() {
         let path = entry.path();
@@ -1144,5 +1162,96 @@ mod same_roost_root_tests {
             "/Users/Me/Roost",
             Path::new("/users/me/roost")
         ));
+    }
+}
+
+/// Data-safety plan, Batch 1 (tree cache). `open_roost` writes the cache only
+/// after `scan_roost_backend(..)?` succeeds and `roost_tree_cache::revalidate`
+/// returns early when the walk errors, so a failed walk can never replace the
+/// last good cached tree. Both rest on the property pinned here: a listing
+/// failure anywhere in the tree surfaces as an ERROR, never as a smaller tree.
+///
+/// These are CHARACTERIZATION tests: `scan_roost_backend` was not changed, so
+/// they pass on the pre-fix code too. The fix that makes the property true on
+/// Android is the Kotlin `queryChildrenChecked` (guarded by
+/// `tests/saf_trash_guard.rs`); these tests stop a Rust-side regression from
+/// re-swallowing the error it now delivers.
+#[cfg(test)]
+mod scan_failure_tests {
+    use super::{scan_roost_backend, scan_roost_root};
+    use crate::roostfs::test_support::FaultyFs;
+    use tempfile::TempDir;
+
+    fn seed(dir: &TempDir) {
+        std::fs::create_dir_all(dir.path().join("Work/deep")).unwrap();
+        std::fs::write(dir.path().join("top.md"), "t").unwrap();
+        std::fs::write(dir.path().join("Work/a.md"), "a").unwrap();
+        std::fs::write(dir.path().join("Work/deep/b.md"), "b").unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_nested_listing_failure_is_an_error_not_a_smaller_tree() {
+        let dir = TempDir::new().unwrap();
+        seed(&dir);
+        let mut fs = FaultyFs::new(dir.path());
+        fs.fail_list_dir = Some("Work/deep".into());
+
+        let err = scan_roost_backend(&fs, "", "/roost").await.unwrap_err();
+
+        assert!(
+            err.contains("Directory listing incomplete"),
+            "the scan must fail with the incomplete-listing error, got {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_root_listing_failure_is_an_error_not_an_empty_tree() {
+        let dir = TempDir::new().unwrap();
+        seed(&dir);
+        let mut fs = FaultyFs::new(dir.path());
+        fs.fail_list_dir = Some(String::new());
+
+        assert!(scan_roost_backend(&fs, "", "/roost").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn a_readable_tree_still_scans_completely() {
+        let dir = TempDir::new().unwrap();
+        seed(&dir);
+        let fs = FaultyFs::new(dir.path());
+
+        let tree = scan_roost_backend(&fs, "", "/roost").await.unwrap();
+
+        let names: Vec<&str> = tree.iter().map(|e| e.name.as_str()).collect();
+        assert!(
+            names.contains(&"top.md") && names.contains(&"Work"),
+            "{names:?}"
+        );
+        let work = tree.iter().find(|e| e.name == "Work").unwrap();
+        assert!(work.children.iter().any(|c| c.name == "deep"));
+    }
+
+    /// Native roost: an unreadable ROOT (expired grant, unmounted volume) used
+    /// to scan as an empty tree, which `apply_if_changed` then cached and
+    /// emitted as "the roost is empty". It must be an error so the last good
+    /// view stays. (Regression test: fails on the pre-fix `scan_directory`.)
+    #[test]
+    fn an_unreadable_native_root_is_an_error_not_an_empty_tree() {
+        let dir = TempDir::new().unwrap();
+        let gone = dir.path().join("not-there");
+        let err = scan_roost_root(&gone).unwrap_err();
+        assert!(err.contains("cannot read the roost folder"), "got {err}");
+    }
+
+    #[test]
+    fn a_readable_native_root_still_scans() {
+        let dir = TempDir::new().unwrap();
+        seed(&dir);
+        let tree = scan_roost_root(dir.path()).unwrap();
+        let names: Vec<&str> = tree.iter().map(|e| e.name.as_str()).collect();
+        assert!(
+            names.contains(&"top.md") && names.contains(&"Work"),
+            "{names:?}"
+        );
     }
 }

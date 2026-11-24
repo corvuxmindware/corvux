@@ -1224,7 +1224,7 @@ pub async fn create_folder(
 /// deleting a folder removed the notes locally but left them alive on every
 /// paired device, which then resurrected them on the next sync (the engine
 /// only ever saw the folder's own remove event, and `is_watchable` drops
-/// that because a directory has no `.md` extension). `collect_markdown_paths`
+/// that because a directory has no `.md` extension). `collect_markdown_rel_paths`
 /// walks the tree BEFORE the trash move, so the list is complete even though
 /// the files are gone by the time the tombstones flush.
 #[tauri::command]
@@ -1247,12 +1247,9 @@ pub async fn delete_folder(
     // Walk the folder before moving it so we can (a) purge each note's id
     // from the graph and (b) tombstone each note for sync. After the move
     // the source path is gone and both would be impossible to enumerate.
-    let nested_md = collect_markdown_paths(&backend, &rel).await;
-
-    backend
-        .trash(&rel)
-        .await
-        .map_err(|e| format!("Failed to delete folder: {e}"))?;
+    // If ANY subfolder cannot be read completely the walk fails and nothing
+    // is moved — an incomplete walk must never be a smaller delete.
+    let nested_md = trash_folder_checked(&backend, &rel).await?;
     super::roost_tree_cache::invalidate(&app, backend.display_root());
 
     // Emit a CRDT tombstone for every nested note so the deletes converge
@@ -1280,7 +1277,7 @@ pub async fn delete_folder(
 }
 
 /// Map collected absolute markdown paths (as produced by
-/// [`collect_markdown_paths`]) to roost-relative [`NotePath`]s for sync
+/// [`collect_markdown_rel_paths`]) to roost-relative [`NotePath`]s for sync
 /// tombstoning. Mirrors the single-file delete's NotePath construction:
 /// strip the roost root via [`to_rel`], then normalize `\` → `/`. Paths
 /// that don't resolve under `root` are skipped rather than panicking — a
@@ -1293,34 +1290,66 @@ fn nested_note_paths(abs_paths: &[String], root: &str) -> Vec<crate::sync::proto
         .collect()
 }
 
-/// Recursively walk `rel_dir` and collect absolute paths of every `.md`
-/// file inside. Used by `delete_folder` to purge graph rows before the
-/// folder is moved to trash.
-async fn collect_markdown_paths(
+/// Enumerate the folder's markdown notes, THEN move it to the trash; returns
+/// the enumerated notes for graph/search/alarm/sync cleanup.
+///
+/// Fails — before the folder moves — if any subfolder could not be listed:
+/// the provider may have returned an error, a lost grant, or (Android SAF) a
+/// listing that is not the whole folder. Moving anyway would trash content
+/// the cleanup never saw, so the delete is refused and the original is left
+/// exactly as it was. The error names a relative folder, never an absolute path.
+async fn trash_folder_checked(
+    backend: &std::sync::Arc<dyn crate::roostfs::RoostFs>,
+    rel: &str,
+) -> Result<Vec<String>, String> {
+    let notes = collect_markdown_rel_paths(backend, rel)
+        .await
+        .map_err(|e| {
+            format!(
+                "Folder not deleted: could not read everything inside it ({e}). Nothing was moved."
+            )
+        })?;
+    // Hand the discovered notes to the backend: one that has to COPY the
+    // folder (it cannot move it) refuses to remove the original unless every
+    // one of them is in its verified copy, so a provider whose own listing is
+    // wrong cannot talk the delete into losing a note it never reported.
+    backend
+        .trash_expecting(rel, &notes)
+        .await
+        .map_err(|e| format!("Failed to delete folder: {e}"))?;
+    let root = backend.display_root().trim_end_matches('/');
+    Ok(notes.iter().map(|r| format!("{root}/{r}")).collect())
+}
+
+/// Recursively walk `rel_dir` and collect the roost-relative path of every
+/// markdown note inside (forward slashes, no leading `/`) — the form the
+/// backend cross-check uses. `delete_folder` purges graph/search/alarm rows
+/// and tombstones sync from this list.
+///
+/// A directory that cannot be listed is an ERROR, not an empty directory: the
+/// old `Err(_) => continue` made an unreadable subfolder invisible to the
+/// caller, which then went ahead and deleted it.
+async fn collect_markdown_rel_paths(
     backend: &std::sync::Arc<dyn crate::roostfs::RoostFs>,
     rel_dir: &str,
-) -> Vec<String> {
+) -> Result<Vec<String>, String> {
     let mut out = Vec::new();
     let mut stack = vec![rel_dir.to_string()];
     while let Some(dir) = stack.pop() {
-        let entries = match backend.list(&dir).await {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
+        let entries = backend
+            .list(&dir)
+            .await
+            .map_err(|e| format!("{}: {e}", if dir.is_empty() { "/" } else { dir.as_str() }))?;
         for e in entries {
             if e.is_dir {
                 stack.push(e.rel_path);
             } else if crate::roostfs::walk::is_markdown_name(&e.name) {
                 // NEW-S1: shared case-insensitive predicate.
-                out.push(format!(
-                    "{}/{}",
-                    backend.display_root().trim_end_matches('/'),
-                    e.rel_path.trim_start_matches('/')
-                ));
+                out.push(e.rel_path.trim_start_matches('/').to_string());
             }
         }
     }
-    out
+    Ok(out)
 }
 
 #[tauri::command]
@@ -1415,7 +1444,7 @@ mod tests {
     //! themselves require a managed Tauri State stack to call directly,
     //! which Tauri V2 doesn't have a clean test fixture for. We instead
     //! cover the helpers each command relies on (`to_rel`,
-    //! `collect_markdown_paths`) so a regression in path resolution or
+    //! `collect_markdown_rel_paths`) so a regression in path resolution or
     //! pre-delete graph cleanup gets caught here, not in production.
     use super::*;
     use crate::roostfs::native::NativeFs;
@@ -1549,7 +1578,7 @@ mod tests {
         std::fs::write(root.join("sub").join("deep").join("buried.md"), "z").unwrap();
 
         let backend: Arc<dyn crate::roostfs::RoostFs> = Arc::new(NativeFs::new(root));
-        let mut paths = collect_markdown_paths(&backend, "").await;
+        let mut paths = collect_markdown_rel_paths(&backend, "").await.unwrap();
         paths.sort();
 
         // All three .md files should be found, the .txt skipped.
@@ -1567,8 +1596,97 @@ mod tests {
     async fn collect_markdown_paths_empty_dir_returns_empty() {
         let dir = TempDir::new().unwrap();
         let backend: Arc<dyn crate::roostfs::RoostFs> = Arc::new(NativeFs::new(dir.path()));
-        let paths = collect_markdown_paths(&backend, "").await;
+        let paths = collect_markdown_rel_paths(&backend, "").await.unwrap();
         assert!(paths.is_empty());
+    }
+
+    /// An unreadable subfolder must fail the walk. It used to be skipped
+    /// (`Err(_) => continue`), so the walk "succeeded" with fewer notes and
+    /// the folder delete went ahead.
+    #[tokio::test]
+    async fn collect_markdown_paths_fails_when_a_subfolder_cannot_be_listed() {
+        use crate::roostfs::test_support::FaultyFs;
+        let dir = TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join("Proj/sub")).unwrap();
+        std::fs::write(dir.path().join("Proj/a.md"), "a").unwrap();
+        std::fs::write(dir.path().join("Proj/sub/b.md"), "b").unwrap();
+        let mut faulty = FaultyFs::new(dir.path());
+        faulty.fail_list_dir = Some("Proj/sub".into());
+        let backend: Arc<dyn crate::roostfs::RoostFs> = Arc::new(faulty);
+
+        let err = collect_markdown_rel_paths(&backend, "Proj")
+            .await
+            .unwrap_err();
+        assert!(err.contains("Proj/sub"), "names the folder, got {err}");
+    }
+
+    /// Exit-gate regression: a partial scan cannot move (or delete) the
+    /// original folder. Both notes — the readable one and the one under the
+    /// unreadable subfolder — must survive and nothing may land in the trash.
+    #[tokio::test]
+    async fn folder_delete_is_refused_when_enumeration_is_incomplete() {
+        use crate::roostfs::test_support::FaultyFs;
+        let dir = TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join("Proj/sub")).unwrap();
+        std::fs::write(dir.path().join("Proj/a.md"), "a").unwrap();
+        std::fs::write(dir.path().join("Proj/sub/b.md"), "b").unwrap();
+        let mut faulty = FaultyFs::new(dir.path());
+        faulty.fail_list_dir = Some("Proj/sub".into());
+        let backend: Arc<dyn crate::roostfs::RoostFs> = Arc::new(faulty);
+
+        let err = trash_folder_checked(&backend, "Proj").await.unwrap_err();
+
+        assert!(err.contains("Nothing was moved"), "got {err}");
+        assert_eq!(std::fs::read(dir.path().join("Proj/a.md")).unwrap(), b"a");
+        assert_eq!(
+            std::fs::read(dir.path().join("Proj/sub/b.md")).unwrap(),
+            b"b"
+        );
+        assert!(
+            !dir.path().join(".corvux-trash").exists(),
+            "nothing may be moved to the trash"
+        );
+    }
+
+    /// The notes enumerated before the delete must reach the backend, so a
+    /// backend that copies can refuse when its own listing lacks one of them.
+    #[tokio::test]
+    async fn folder_delete_hands_the_discovered_notes_to_the_backend() {
+        use crate::roostfs::test_support::FaultyFs;
+        let dir = TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join("Proj/sub")).unwrap();
+        std::fs::write(dir.path().join("Proj/a.md"), "a").unwrap();
+        std::fs::write(dir.path().join("Proj/sub/b.md"), "b").unwrap();
+        std::fs::write(dir.path().join("Proj/skip.txt"), "t").unwrap();
+        let faulty = Arc::new(FaultyFs::new(dir.path()));
+        let backend: Arc<dyn crate::roostfs::RoostFs> = faulty.clone();
+
+        trash_folder_checked(&backend, "Proj").await.unwrap();
+
+        let mut seen = faulty.trash_expected_seen.lock().unwrap().clone().unwrap();
+        seen.sort();
+        assert_eq!(seen, vec!["Proj/a.md", "Proj/sub/b.md"]);
+    }
+
+    #[tokio::test]
+    async fn folder_delete_moves_the_folder_and_returns_its_notes() {
+        let dir = TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join("Proj/sub")).unwrap();
+        std::fs::write(dir.path().join("Proj/a.md"), "a").unwrap();
+        std::fs::write(dir.path().join("Proj/sub/b.md"), "b").unwrap();
+        let backend: Arc<dyn crate::roostfs::RoostFs> = Arc::new(NativeFs::new(dir.path()));
+
+        let mut notes = trash_folder_checked(&backend, "Proj").await.unwrap();
+        notes.sort();
+
+        assert_eq!(notes.len(), 2, "got {notes:?}");
+        assert!(notes[0].ends_with("Proj/a.md") && notes[1].ends_with("Proj/sub/b.md"));
+        assert!(!dir.path().join("Proj").exists());
+        let trashed: Vec<_> = std::fs::read_dir(dir.path().join(".corvux-trash"))
+            .unwrap()
+            .flatten()
+            .collect();
+        assert_eq!(trashed.len(), 1, "the folder landed in the trash");
     }
 
     #[tokio::test]
@@ -1578,7 +1696,7 @@ mod tests {
         std::fs::write(dir.path().join("modern.md"), "y").unwrap();
 
         let backend: Arc<dyn crate::roostfs::RoostFs> = Arc::new(NativeFs::new(dir.path()));
-        let paths = collect_markdown_paths(&backend, "").await;
+        let paths = collect_markdown_rel_paths(&backend, "").await.unwrap();
         assert_eq!(paths.len(), 2);
     }
 

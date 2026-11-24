@@ -16,6 +16,17 @@ use super::peer::PeerHandle;
 use super::state::SyncEvent;
 use super::util::clone_handle;
 
+/// What [`SyncEngine::create_recovered_note`] did.
+pub(super) enum RecoverOutcome {
+    /// The file did not exist and was created.
+    Created,
+    /// Something was already at the path (the existence probe was wrong, or it
+    /// reappeared): left untouched.
+    AlreadyThere,
+    /// The write policy refused the path; nothing was written.
+    Skipped,
+}
+
 impl SyncEngine {
     /// Walk every markdown file in the roost and seed the Automerge
     /// DocStore with its current content. Needed to bootstrap
@@ -321,9 +332,22 @@ impl SyncEngine {
                 info!(note = %note, "recover_missing_files: restoring legitimately-empty note to disk");
             }
 
-            if let Err(e) = self.write_recovered_note(&note, &text).await {
-                warn!(note = %note, error = %e, "recover_missing_files: write failed — skipping");
-                continue;
+            // CREATE-ONLY. "Missing" came from an existence probe that can be
+            // wrong (on Android a swallowed provider failure used to read as
+            // "absent"); overwriting then replaced a real note — and any edit
+            // made in another app, which never reaches this stored copy — with
+            // the stale CRDT render. If anything is there now, leave it.
+            match self.create_recovered_note(&note, &text).await {
+                Ok(RecoverOutcome::Created) => {}
+                Ok(RecoverOutcome::AlreadyThere) => {
+                    info!(note = %note, "recover_missing_files: a file is there after all (the existence probe was wrong, or it reappeared) — not overwriting");
+                    continue;
+                }
+                Ok(RecoverOutcome::Skipped) => continue,
+                Err(e) => {
+                    warn!(note = %note, error = %e, "recover_missing_files: write failed — skipping");
+                    continue;
+                }
             }
             restored += 1;
             let _ = self.inner.events.send(SyncEvent::NoteWritten {
@@ -346,14 +370,41 @@ impl SyncEngine {
             .map_err(|e| SyncError::Io(std::io::Error::other(e.to_string())))
     }
 
-    /// Write `text` to the roost at the relative path the note represents.
-    /// Mirrors what `peer::render_to_roost` does on the receive path —
-    /// `mkdir` parents, then `write_atomic` (or temp+rename on
-    /// `std::fs`). Kept narrow on purpose: this path doesn't carry the
-    /// `md_hash` divergence-guard from the sync receive path because
-    /// recovery only fires when the file *doesn't exist*, so there's no
-    /// existing-content invariant to protect.
+    /// Write `text` to the roost at the relative path the note represents,
+    /// REPLACING whatever is there. For callers whose job is to reconcile disk
+    /// with the merged CRDT state: `restore_note`'s idempotent re-write and
+    /// `apply_queue_full_doc`'s render of an adopted doc. Recovering a note
+    /// that is MISSING from disk must NOT use this — use
+    /// [`Self::create_recovered_note`]: "missing" comes from an existence
+    /// probe that can be wrong, and an overwrite then destroys a real note.
     pub(super) async fn write_recovered_note(&self, note: &NotePath, text: &str) -> SyncResult<()> {
+        self.write_recovered_inner(note, text, false)
+            .await
+            .map(|_| ())
+    }
+
+    /// Materialize a note that is missing from disk, CREATE-ONLY: if anything
+    /// is at the path by the time we write, it is left alone
+    /// ([`RecoverOutcome::AlreadyThere`]). `recover_missing_files` decides
+    /// "missing" from `RoostFs::exists`, which on Android could answer `false`
+    /// for a note that was there (a swallowed provider failure) and then
+    /// `write_atomic` the stored sync copy over it, losing any edit made in
+    /// another app. `create` closes that independently of the probe.
+    pub(super) async fn create_recovered_note(
+        &self,
+        note: &NotePath,
+        text: &str,
+    ) -> SyncResult<RecoverOutcome> {
+        self.write_recovered_inner(note, text, true).await
+    }
+
+    /// Shared body: the SYN-B1 policy gate, parent `mkdir`, then the write.
+    async fn write_recovered_inner(
+        &self,
+        note: &NotePath,
+        text: &str,
+        create_only: bool,
+    ) -> SyncResult<RecoverOutcome> {
         // SYN-B1 (twin of render_to_roost): recover_missing_files (auto-fired at
         // startup) and restore_note materialize DocStore paths that were NOT
         // vetted at adopt time on a migration-poisoned store — a pre-fix
@@ -363,7 +414,7 @@ impl SyncEngine {
         // can't abort recovery of the rest.
         if super::policy::vet_remote_rel(note).is_err() {
             warn!(path = %note, "write_recovered_note: path rejected by write policy — skipping (not materialized)");
-            return Ok(());
+            return Ok(RecoverOutcome::Skipped);
         }
         let rel = &note.0;
         // One guarded path (resolve_fs → backend or on-demand NativeFs); the
@@ -382,9 +433,18 @@ impl SyncEngine {
                 }
             }
         }
-        fs.write_atomic(rel, text.as_bytes())
-            .await
-            .map_err(|e| SyncError::Io(std::io::Error::other(e.to_string())))
+        let written = if create_only {
+            fs.create(rel, text.as_bytes()).await
+        } else {
+            fs.write_atomic(rel, text.as_bytes()).await
+        };
+        match written {
+            Ok(()) => Ok(RecoverOutcome::Created),
+            Err(crate::roostfs::RoostError::AlreadyExists(_)) if create_only => {
+                Ok(RecoverOutcome::AlreadyThere)
+            }
+            Err(e) => Err(SyncError::Io(std::io::Error::other(e.to_string()))),
+        }
     }
 
     /// Trash a note's markdown (recoverable) when a tombstone arrives via a

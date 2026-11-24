@@ -21,6 +21,14 @@ pub struct SafEntry {
     pub name: String,
     pub rel_path: String,
     pub is_dir: bool,
+    /// File size in bytes. Only `listTree` fills it (and only for files, when
+    /// the provider reports `COLUMN_SIZE`); absent means "unknown". The trash
+    /// fallback compares it across two walks to catch an in-place edit.
+    #[serde(default)]
+    pub size: Option<i64>,
+    /// `COLUMN_LAST_MODIFIED` (ms since epoch), same rules as `size`.
+    #[serde(default)]
+    pub modified: Option<i64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

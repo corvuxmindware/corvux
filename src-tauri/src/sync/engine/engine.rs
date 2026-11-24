@@ -1604,6 +1604,37 @@ mod tests {
         (engine, roost, app_data)
     }
 
+    /// Like [`setup_engine`], but the roost is a fault-injecting backend the
+    /// test can steer after the engine has taken its `Arc` (transient
+    /// existence-probe failures, a provider that wrongly reports "missing").
+    #[allow(clippy::type_complexity)]
+    fn setup_engine_faulty() -> (
+        SyncEngine,
+        Arc<crate::roostfs::test_support::FaultyFs>,
+        tempfile::TempDir,
+        tempfile::TempDir,
+    ) {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let roost = tempdir().unwrap();
+        let roost_root = roost.path().join("test-roost");
+        std::fs::create_dir_all(&roost_root).unwrap();
+        let app_data = tempdir().unwrap();
+        let identity = Arc::new(Identity::load_or_create(app_data.path()).unwrap());
+        let tls = Arc::new(TlsIdentity::generate().unwrap());
+        let faulty = Arc::new(crate::roostfs::test_support::FaultyFs::new(&roost_root));
+        let backend: Arc<dyn crate::roostfs::RoostFs> = faulty.clone();
+        let engine = SyncEngine::new(
+            roost_root,
+            app_data.path().join("sync-state"),
+            Some(backend),
+            identity,
+            tls,
+            "test-device".into(),
+        )
+        .unwrap();
+        (engine, faulty, roost, app_data)
+    }
+
     /// Poll until `engine.outbox_pending_total()` reaches `expected`, or panic
     /// after ~5s. Replaces fixed `sleep(400ms)` + assert pairs: the outbox
     /// intent is recorded by a *spawned* delivery task, so a flat sleep raced
@@ -3007,6 +3038,117 @@ mod tests {
         assert!(
             engine.note_exists_on_disk(&note).await.unwrap(),
             "a legitimately-empty note must be recovered to disk, not dropped"
+        );
+    }
+
+    /// Data-safety plan, audit finding 5. On Android a transient provider
+    /// failure used to read as "the file does not exist", and the startup
+    /// recovery then wrote the stored CRDT copy over a note that was there —
+    /// losing any edit made in another app, which never reaches that copy. A
+    /// failed existence probe must leave the file alone.
+    ///
+    /// CONTRACT test, not a regression test: the skip-on-error branch in
+    /// `recover_missing_files` predates the fix, so this passes on the old code
+    /// too, and the fault is injected below `SafFs`. What the fix changed is
+    /// that `SafFs::exists` now REPORTS the error instead of `Ok(false)`; that
+    /// is pinned by the guard `saf_exists_propagates_provider_errors` and
+    /// proved only on a device (runbook rows A7/A8).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn recover_never_overwrites_a_note_when_the_existence_check_fails() {
+        let (engine, faulty, roost, _d) = setup_engine_faulty();
+        let note = NotePath("note.md".into());
+        engine
+            .notify_local_write(note.clone(), "stored crdt copy".into())
+            .await;
+        let on_disk = roost.path().join("test-roost").join("note.md");
+        // An edit made in ANOTHER app: on disk, never seen by the CRDT.
+        std::fs::write(&on_disk, "edited in another app").unwrap();
+        faulty
+            .exists_err_once
+            .lock()
+            .unwrap()
+            .insert("note.md".into());
+
+        let restored = engine.recover_missing_files().await.unwrap();
+
+        assert_eq!(restored, 0, "nothing was missing");
+        assert_eq!(
+            std::fs::read_to_string(&on_disk).unwrap(),
+            "edited in another app",
+            "a failed existence probe must not overwrite the external edit"
+        );
+    }
+
+    /// The independent protection: even if the probe LIES and says "missing"
+    /// for a file that is there (the old swallowed-failure behaviour),
+    /// recovery is create-only, so it cannot overwrite. (Regression test: it
+    /// used to `write_atomic` the stale CRDT copy over the external edit.)
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn recover_never_overwrites_when_the_provider_wrongly_reports_missing() {
+        let (engine, faulty, roost, _d) = setup_engine_faulty();
+        let note = NotePath("note.md".into());
+        engine
+            .notify_local_write(note.clone(), "stored crdt copy".into())
+            .await;
+        let on_disk = roost.path().join("test-roost").join("note.md");
+        std::fs::write(&on_disk, "edited in another app").unwrap();
+        faulty
+            .exists_lie_missing_once
+            .lock()
+            .unwrap()
+            .insert("note.md".into());
+
+        let restored = engine.recover_missing_files().await.unwrap();
+
+        assert_eq!(restored, 0, "an existing file is not a recovery");
+        assert_eq!(
+            std::fs::read_to_string(&on_disk).unwrap(),
+            "edited in another app",
+            "create-only recovery must never replace an existing note"
+        );
+    }
+
+    /// Create-only must not break the case recovery exists for: a note that is
+    /// really gone from disk comes back, with its content.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn recover_still_restores_a_note_that_is_really_missing() {
+        let (engine, _faulty, roost, _d) = setup_engine_faulty();
+        let note = NotePath("sub/keep.md".into());
+        engine
+            .notify_local_write(note.clone(), "keep me".into())
+            .await;
+        let on_disk = roost.path().join("test-roost/sub/keep.md");
+        std::fs::remove_file(&on_disk).unwrap();
+
+        let restored = engine.recover_missing_files().await.unwrap();
+
+        assert_eq!(restored, 1);
+        assert_eq!(std::fs::read_to_string(&on_disk).unwrap(), "keep me");
+    }
+
+    /// After the transient failure clears, the next pass sees the file and
+    /// still does nothing: the edit survives repeated recovery.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn recover_keeps_the_external_edit_across_repeated_passes() {
+        let (engine, faulty, roost, _d) = setup_engine_faulty();
+        let note = NotePath("note.md".into());
+        engine
+            .notify_local_write(note.clone(), "stored crdt copy".into())
+            .await;
+        let on_disk = roost.path().join("test-roost").join("note.md");
+        std::fs::write(&on_disk, "edited in another app").unwrap();
+        faulty
+            .exists_err_once
+            .lock()
+            .unwrap()
+            .insert("note.md".into());
+
+        engine.recover_missing_files().await.unwrap();
+        engine.recover_missing_files().await.unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(&on_disk).unwrap(),
+            "edited in another app"
         );
     }
 
