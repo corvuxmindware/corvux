@@ -20,6 +20,7 @@ import {
   isRoostOpenDeclined,
 } from "./roosts";
 import { startupStore } from "./startup";
+import { startupRoostErrorMessage } from "../lib/startup-roost-error";
 import { saveRoostNote } from "../lib/save";
 import { newNoteDestDir } from "../lib/new-note-dest";
 
@@ -600,7 +601,14 @@ This note itself has the tags #welcome and #getting-started — they show as col
         // locked because another Corvux instance has it open") leave the
         // breadcrumb intact so the user can retry once the conflict is
         // resolved.
-        if (isDeadPathError(e)) clearStaleLastRoost(last);
+        const removed = isDeadPathError(e) && clearStaleLastRoost(last);
+        // openRoost ran silent (it already logged), so this is the only
+        // place the user can learn the roost did not open. Without it a
+        // failed start looks like an ordinary empty welcome screen (A1).
+        toastStore.showError(startupRoostErrorMessage(lastName, e, removed), e, {
+          code: "ROOST_RESTORE_FAIL",
+          module: "stores.roost.restoreLastRoost",
+        });
       }
     }
   }
@@ -623,7 +631,8 @@ This note itself has the tags #welcome and #getting-started — they show as col
   }
 
   /// Drop every stored reference to a roost path that no longer opens.
-  function clearStaleLastRoost(path: string) {
+  /// Returns whether a roost-list entry was removed.
+  function clearStaleLastRoost(path: string): boolean {
     lsRemove("corvux:lastVault");
     lsRemove("corvux:lastVaultName");
     lsRemove("corvux:lastVaultBookmark");
@@ -631,6 +640,7 @@ This note itself has the tags #welcome and #getting-started — they show as col
       .roosts()
       .find((v) => v.path === path);
     if (entry) roostRegistry.remove(entry.id);
+    return entry !== undefined;
   }
 
   /**

@@ -2,6 +2,7 @@ import { For, Show, createSignal, onCleanup, onMount } from "solid-js";
 import { Portal } from "solid-js/web";
 import { roostRegistry, type RoostEntry } from "../../stores/roosts";
 import { roostStore } from "../../stores/roost";
+import { isRoostEntryOpen } from "../../lib/roost-entry-open";
 import { appInvoke as invoke, isTauri, setBrowserRoost, commands, unwrap } from "../../lib/invoke";
 import { errMsg, isSecurityCancel } from "../../lib/error";
 import { confirmDialog } from "../../lib/confirm";
@@ -187,7 +188,7 @@ export default function ManageRoostsModal(props: ManageRoostsModalProps) {
               <For each={roostRegistry.roosts()}>
                 {(entry) => {
                   const isActive = () =>
-                    roostRegistry.activeId() === entry.id;
+                    isRoostEntryOpen(entry, roostRegistry.activeId(), roostStore.roostPath());
                   return (
                     <li class="flex items-center gap-3 px-4 py-3 hover:bg-bg-hover">
                       <div class="shrink-0 text-text-muted">

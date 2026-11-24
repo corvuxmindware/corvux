@@ -1,3 +1,18 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <!-- Package visibility (Android 11+). A roost picked from a third-party
+         documents provider (a cloud or file-manager app) is reached through
+         that app's ContentProvider. The picker grants Corvux only *implicit*
+         visibility of that app, and Android drops implicit visibility when
+         Corvux is updated (AppsFilter.removePackage on replace) and on every
+         reboot. The persisted URI grant survives, but the provider lookup then
+         fails ("Failed to find provider info") and the roost will not open.
+         Declaring the DOCUMENTS_PROVIDER intent makes every documents provider
+         visible permanently. It is not QUERY_ALL_PACKAGES, so it needs no
+         Play declaration. Guarded by tests/saf_provider_visibility_guard.rs. -->
+    <queries>
+        <intent>
+            <action android:name="android.content.action.DOCUMENTS_PROVIDER" />
+        </intent>
+    </queries>
 </manifest>

@@ -1,6 +1,7 @@
 import { For, Show, createSignal, onCleanup, onMount } from "solid-js";
 import { roostStore } from "../../stores/roost";
 import { roostRegistry, type RoostEntry } from "../../stores/roosts";
+import { isRoostEntryOpen } from "../../lib/roost-entry-open";
 
 interface RoostSwitcherProps {
   onOpenManage: () => void;
@@ -22,9 +23,16 @@ export default function RoostSwitcher(props: RoostSwitcherProps) {
     onCleanup(() => document.removeEventListener("mousedown", handleDocClick));
   });
 
+  /** Only an entry that is actually open counts as current; tapping any
+   *  other entry (including a failed "active" one) runs a real open, which is
+   *  the user's in-app retry (A1). */
+  function isOpenEntry(entry: RoostEntry): boolean {
+    return isRoostEntryOpen(entry, roostRegistry.activeId(), roostStore.roostPath());
+  }
+
   async function handleSwitch(entry: RoostEntry) {
     setOpen(false);
-    if (entry.id === roostRegistry.activeId()) return;
+    if (isOpenEntry(entry)) return;
     // Pass the stored bookmark — iOS scoped roosts need it to re-acquire
     // security-scoped access; without it open_roost hits EPERM.
     await roostStore.openRoost(entry.path, entry.displayName, entry.bookmark);
@@ -43,6 +51,9 @@ export default function RoostSwitcher(props: RoostSwitcherProps) {
   }
 
   function currentLabel(): string {
+    // A failed open leaves the registry's active entry set; don't present a
+    // roost that isn't open as the current one.
+    if (roostStore.roostPath() === null) return "No Roost";
     const active = roostRegistry.activeRoost();
     if (active) return active.displayName;
     return roostStore.roostDisplayName() ?? "No Roost";
@@ -103,14 +114,14 @@ export default function RoostSwitcher(props: RoostSwitcherProps) {
         >
           <For each={sortedRoosts()}>
             {(entry) => {
-              const isActive = entry.id === roostRegistry.activeId();
+              const isActive = () => isOpenEntry(entry);
               return (
                 <button
                   onClick={() => handleSwitch(entry)}
                   class="w-full flex items-center gap-2 px-3 py-2 hover:bg-bg-hover transition-colors text-left"
                 >
                   <span class="w-4 text-accent text-[13px] shrink-0">
-                    <Show when={isActive}>✓</Show>
+                    <Show when={isActive()}>✓</Show>
                   </span>
                   <div class="flex-1 min-w-0">
                     <div class="text-[13px] text-text-primary truncate">
